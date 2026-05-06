@@ -4,32 +4,27 @@ declare(strict_types=1);
 
 require_once __DIR__ . '/vendor/autoload.php';
 
-use McpServer\McpServer;
+use McpServer\Web\Router;
+use McpServer\Web\SsoController;
 
-$server = new McpServer();
+$router     = new Router();
+$controller = new SsoController();
 
-// Auto-register tools from the Tools directory automatically!
-$server->registerToolsFromDirectory(__DIR__ . '/src/Tools', 'McpServer\\Tools\\');
+// SSO Web UI
+$router->get('/',           fn() => $controller->dashboard());
+$router->get('/login',      fn() => $controller->loginForm());
+$router->post('/login',     fn() => $controller->loginPost());
+$router->get('/logout',     fn() => $controller->logout());
+$router->get('/authorize',  fn() => $controller->authorizeGet());
+$router->post('/authorize', fn() => $controller->authorizePost());
+$router->get('/clients',    fn() => $controller->clients());
+$router->post('/clients',   fn() => $controller->clientsPost());
+$router->get('/users',      fn() => $controller->users());
+$router->post('/users',     fn() => $controller->usersPost());
+$router->get('/docs',       fn() => $controller->docs());
 
-if (php_sapi_name() === 'cli') {
-    $in = fopen('php://stdin', 'r');
-    while (($line = fgets($in)) !== false) {
-        // Assignment inside condition simplifies control flow
-        if ($response = $server->handleRequest(trim($line))) {
-            echo $response . "\n";
-        }
-    }
-    fclose($in);
-} else {
-    header('Content-Type: application/json');
+// OAuth2 API endpoints (no auth required — they validate credentials internally)
+$router->post('/token',     fn() => $controller->token());
+$router->post('/revoke',    fn() => $controller->revoke());
 
-    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
-        http_response_code(405);
-        echo json_encode(['error' => 'Method Not Allowed. Use POST.']);
-        exit;
-    }
-
-    if ($response = $server->handleRequest(file_get_contents('php://input'))) {
-        echo $response;
-    }
-}
+$router->dispatch();
