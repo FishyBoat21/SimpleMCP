@@ -54,4 +54,28 @@ readonly class CalculatorTool {
             ]
         ];
     }
+
+    #[McpFunction(
+        name: 'divide_numbers',
+        description: 'Performs basic division on two numbers.',
+        schema: [
+            'type' => 'object',
+            'properties' => [
+                'a' => ['type' => 'number', 'description' => 'First number'],
+                'b' => ['type' => 'number', 'description' => 'Second number']
+            ],
+            'required' => ['a', 'b']
+        ]
+    )]
+    public function divide(array $arguments): array {
+        $a = $arguments['a'] ?? 0;
+        $b = $arguments['b'] ?? 0;
+        
+        return [
+            [
+                'type' => 'text',
+                'text' => "The result of $a / $b is " . (round($a / $b,2))
+            ]
+        ];
+    }
 }
