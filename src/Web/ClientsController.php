@@ -9,7 +9,7 @@ class ClientsController extends BaseController
 {
     public function clients(): void
     {
-        $this->requireLogin();
+        $this->requireAdmin();
         $e = View::e(...);
         $csrf = View::csrf();
         $msg = '';
@@ -83,7 +83,7 @@ HTML;
 
     public function clientsPost(): void
     {
-        $this->requireLogin();
+        $this->requireAdmin();
         View::verifyCsrf();
         $name  = trim($_POST['name'] ?? '');
         $uris  = array_map('trim', explode(',', $_POST['redirect_uris'] ?? 'http://localhost/callback'));

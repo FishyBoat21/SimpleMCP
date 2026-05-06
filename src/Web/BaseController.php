@@ -25,6 +25,16 @@ abstract class BaseController
         }
     }
 
+    protected function requireAdmin(): void
+    {
+        $this->requireLogin();
+        if (($_SESSION['sso_user_role'] ?? 'user') !== 'admin') {
+            http_response_code(403);
+            echo "403 Forbidden - Admin access required.";
+            exit;
+        }
+    }
+
     protected function redirect(string $path): never
     {
         // If $path is already an absolute URL (e.g. the OAuth redirect_uri),

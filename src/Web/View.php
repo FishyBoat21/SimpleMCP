@@ -21,6 +21,23 @@ class View {
 
     public static function layout(string $title, string $content, string $bodyClass = ''): string {
         $base = self::baseUrl();
+        if (session_status() === PHP_SESSION_NONE) session_start();
+        $isLoggedIn = !empty($_SESSION['sso_user_id']);
+        $isAdmin = ($_SESSION['sso_user_role'] ?? 'user') === 'admin';
+        
+        $navLinks = '';
+        if ($isLoggedIn) {
+            $navLinks .= "<a href=\"{$base}/\">" . ($isAdmin ? "Dashboard" : "Home") . "</a>\n";
+            if ($isAdmin) {
+                $navLinks .= "            <a href=\"{$base}/clients\">Clients</a>\n";
+                $navLinks .= "            <a href=\"{$base}/users\">Users</a>\n";
+            }
+            $navLinks .= "            <a href=\"{$base}/docs\">API Docs</a>\n";
+            $navLinks .= "            <a href=\"{$base}/logout\" class=\"btn-sm\">Sign Out</a>";
+        } else {
+            $navLinks .= "<a href=\"{$base}/docs\">API Docs</a>\n";
+        }
+
         return <<<HTML
 <!DOCTYPE html>
 <html lang="en">
@@ -258,11 +275,7 @@ class View {
             SimpleMCP SSO
         </a>
         <div class="navbar-nav">
-            <a href="{$base}/">Dashboard</a>
-            <a href="{$base}/clients">Clients</a>
-            <a href="{$base}/users">Users</a>
-            <a href="{$base}/docs">API Docs</a>
-            <a href="{$base}/logout" class="btn-sm">Sign Out</a>
+            {$navLinks}
         </div>
     </nav>
 

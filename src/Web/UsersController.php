@@ -9,7 +9,7 @@ class UsersController extends BaseController
 {
     public function users(): void
     {
-        $this->requireLogin();
+        $this->requireAdmin();
         $e = View::e(...);
         $csrf = View::csrf();
         $msg = '';
@@ -24,8 +24,9 @@ class UsersController extends BaseController
         foreach ($users as $u) {
             $un = $e($u['username']);
             $em = $e($u['email'] ?? '');
+            $role = $e($u['role'] ?? 'user');
             $dt = date('Y-m-d', (int) $u['created_at']);
-            $rows .= "<tr><td><strong>{$un}</strong></td><td class='text-muted'>{$em}</td><td class='text-muted text-sm'>{$dt}</td></tr>";
+            $rows .= "<tr><td><strong>{$un}</strong></td><td class='text-muted'>{$em}</td><td><span class='badge badge-accent'>{$role}</span></td><td class='text-muted text-sm'>{$dt}</td></tr>";
         }
 
         $content = <<<HTML
@@ -53,14 +54,21 @@ class UsersController extends BaseController
                         <label class="form-label">Password</label>
                         <input class="form-control" name="password" type="password" required>
                     </div>
+                    <div class="form-group">
+                        <label class="form-label">Role</label>
+                        <select class="form-control" name="role">
+                            <option value="user">User</option>
+                            <option value="admin">Admin</option>
+                        </select>
+                    </div>
                 </div>
-                <button class="btn btn-primary" type="submit">Create User</button>
+                <button class="btn btn-primary mt-3" type="submit">Create User</button>
             </form>
         </div>
     </div>
     <div class="table-wrap">
         <table>
-            <thead><tr><th>Username</th><th>Email</th><th>Created</th></tr></thead>
+            <thead><tr><th>Username</th><th>Email</th><th>Role</th><th>Created</th></tr></thead>
             <tbody>{$rows}</tbody>
         </table>
     </div>
@@ -71,12 +79,13 @@ HTML;
 
     public function usersPost(): void
     {
-        $this->requireLogin();
+        $this->requireAdmin();
         View::verifyCsrf();
         $ok = $this->oauth->createUser(
             trim($_POST['username'] ?? ''),
             $_POST['password'] ?? '',
-            trim($_POST['email'] ?? '')
+            trim($_POST['email'] ?? ''),
+            $_POST['role'] ?? 'user'
         );
         $_SESSION['flash'] = $ok ? "User created." : "Username already exists.";
         $this->redirect('/users');

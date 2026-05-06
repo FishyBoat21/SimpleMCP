@@ -277,7 +277,7 @@ class OAuthServer {
     }
 
     public function listUsers(): array {
-        return $this->db->query("SELECT id, username, email, created_at FROM users ORDER BY id")->fetchAll();
+        return $this->db->query("SELECT id, username, email, role, created_at FROM users ORDER BY id")->fetchAll();
     }
 
     public function createClient(string $name, array $redirectUris, string $scopes): array {
@@ -291,11 +291,11 @@ class OAuthServer {
         return ['client_id' => $clientId, 'client_secret' => $clientSecret];
     }
 
-    public function createUser(string $username, string $password, string $email = ''): bool {
+    public function createUser(string $username, string $password, string $email = '', string $role = 'user'): bool {
         $hash = password_hash($password, PASSWORD_BCRYPT);
         try {
-            $this->db->prepare("INSERT INTO users (username, password, email) VALUES (?, ?, ?)")
-                ->execute([$username, $hash, $email]);
+            $this->db->prepare("INSERT INTO users (username, password, email, role) VALUES (?, ?, ?, ?)")
+                ->execute([$username, $hash, $email, $role]);
             return true;
         } catch (\Exception) {
             return false;

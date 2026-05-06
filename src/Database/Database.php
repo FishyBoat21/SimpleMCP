@@ -40,6 +40,7 @@ class Database {
                 username    TEXT NOT NULL UNIQUE,
                 password    TEXT NOT NULL,
                 email       TEXT,
+                role        TEXT NOT NULL DEFAULT 'user',
                 created_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
             );
         ");
@@ -99,12 +100,20 @@ class Database {
             );
         ");
 
+        // Add role column for existing databases
+        try {
+            $pdo->exec("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'");
+            $pdo->exec("UPDATE users SET role = 'admin' WHERE id = 1");
+        } catch (PDOException $e) {
+            // Column might already exist
+        }
+
         // Seed a default admin user if none exist
         $count = (int) $pdo->query("SELECT COUNT(*) FROM users")->fetchColumn();
         if ($count === 0) {
             $hash = password_hash('admin', PASSWORD_BCRYPT);
-            $pdo->prepare("INSERT INTO users (username, password, email) VALUES (?, ?, ?)")
-                ->execute(['admin', $hash, 'admin@localhost']);
+            $pdo->prepare("INSERT INTO users (username, password, email, role) VALUES (?, ?, ?, ?)")
+                ->execute(['admin', $hash, 'admin@localhost', 'admin']);
         }
 
         // Seed a default MCP client if none exist

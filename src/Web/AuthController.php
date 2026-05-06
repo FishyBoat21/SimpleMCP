@@ -65,6 +65,7 @@ HTML;
         if ($user) {
             $_SESSION['sso_user_id']   = $user['id'];
             $_SESSION['sso_username']  = $user['username'];
+            $_SESSION['sso_user_role'] = $user['role'] ?? 'user';
             $redirect = $_POST['redirect'] ?? '/';
             $this->redirect($redirect);
         }

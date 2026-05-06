@@ -10,6 +10,21 @@ class DashboardController extends BaseController
     public function dashboard(): void
     {
         $this->requireLogin();
+
+        if (($_SESSION['sso_user_role'] ?? 'user') !== 'admin') {
+            $e = View::e(...);
+            $username = $e($_SESSION['sso_username'] ?? '');
+            $content = <<<HTML
+<div class="container" style="position:relative;z-index:1;text-align:center;padding-top:4rem">
+    <div style="width:64px;height:64px;background:linear-gradient(135deg,var(--accent),var(--accent2));border-radius:18px;display:flex;align-items:center;justify-content:center;font-size:1.8rem;font-weight:800;color:#fff;margin:0 auto 1.5rem" class="fade-up">M</div>
+    <h1 style="font-size:2rem;font-weight:700" class="fade-up" style="animation-delay:.1s">Welcome, {$username}</h1>
+    <p class="text-muted mt-2 fade-up" style="animation-delay:.2s">You are logged in. You can now close this window or continue to authorize applications.</p>
+</div>
+HTML;
+            View::render('Welcome', $content);
+            return;
+        }
+
         $stats   = $this->oauth->getActiveTokenStats();
         $clients = $this->oauth->listClients();
         $users   = $this->oauth->listUsers();
