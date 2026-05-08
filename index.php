@@ -4,7 +4,14 @@ declare(strict_types=1);
 
 require_once __DIR__ . '/vendor/autoload.php';
 
+use McpServer\Database\DatabaseX;
 use McpServer\McpServer;
+
+$pdo = new PDO("sqlite:database.sqlite");
+$pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+$pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+
+DatabaseX::Boot($pdo);
 
 $server = new McpServer();
 
