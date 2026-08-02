@@ -15,6 +15,15 @@ use McpServer\UserContext;
  * that was provisioned for them (it is not editable).
  */
 final class UserStore {
+    /**
+     * Reserved username bound to OAuth tokens issued through the "continue
+     * anonymously" action on the login page. It never maps to a real account:
+     * onboarding rejects it, and OAuthServer::resolveUser() turns it into
+     * UserContext::anonymous() (public tools only). Must not collide with any
+     * config-seeded username.
+     */
+    public const ANONYMOUS_USERNAME = '__anonymous__';
+
     public function __construct(private readonly Database $db) {}
 
     /** @return array<string, mixed>|null */
@@ -76,7 +85,7 @@ final class UserStore {
 
         // Brand-new user (public onboarding) chooses their own username.
         $username = $this->normalizeUsername($username);
-        if ($username === '') {
+        if ($username === '' || $username === self::ANONYMOUS_USERNAME) {
             return null;
         }
         if (!$this->usernameAvailable($username, null)) {
