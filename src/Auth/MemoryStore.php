@@ -389,13 +389,32 @@ final class MemoryStore {
      * observations, plus all directed relations. By default only facts valid at
      * `asOf` are returned; pass `includeInvalid` to include historical state.
      *
+     * When `root` is given, the read is scoped to the subgraph reachable from
+     * that entity (matched by name first, then id) through at most `depth`
+     * undirected relation hops — `depth` 0 returns just the root. Each returned
+     * entity carries its `distance` from the root, and only relations whose both
+     * endpoints are in the subgraph are returned. `depth` is ignored when `root`
+     * is absent (full-graph read, as before).
+     *
      * @param string $username owner of the graph
      * @param mixed $asOf Unix timestamp or ISO-8601 datetime (null = now)
      * @param bool $includeInvalid also return facts that have been invalidated
-     * @return array{entities: list<array<string, mixed>>, relations: list<array<string, mixed>>}
+     * @param string|null $root optional root entity id or name to scope the read
+     * @param int $depth max relation hops from the root (clamped 0..8)
+     * @return array<string, mixed>
      */
-    public function readGraph(string $username, mixed $asOf = null, bool $includeInvalid = false): array {
+    public function readGraph(
+        string $username,
+        mixed $asOf = null,
+        bool $includeInvalid = false,
+        ?string $root = null,
+        int $depth = 0,
+    ): array {
         $t = $this->toTimestamp($asOf) ?? time();
+
+        if ($root !== null && $root !== '') {
+            return $this->readSubgraph($username, $root, $depth, $t, $includeInvalid);
+        }
 
         $entities = [];
         foreach ($this->fetchEntities($username) as $entity) {
@@ -438,6 +457,94 @@ final class MemoryStore {
         }
 
         return ['entities' => $entities, 'relations' => $relations];
+    }
+
+    /**
+     * The subgraph around a root entity: the root plus every entity reachable
+     * through at most `depth` undirected relation hops, and the relations among
+     * them. Entities carry their BFS `distance` from the root. Traversal and the
+     * root itself respect `includeInvalid` (validity ignored when set); a root
+     * that is missing, or invalid at the snapshot when `includeInvalid` is off,
+     * yields an `error` instead of a partial result.
+     *
+     * @return array<string, mixed>
+     */
+    private function readSubgraph(string $username, string $rootNameOrId, int $depth, int $t, bool $includeInvalid): array {
+        $depth = max(0, min(8, $depth));
+
+        $root = $this->findEntityFull($username, $rootNameOrId);
+        if ($root === null) {
+            return [
+                'root' => $rootNameOrId,
+                'depth' => $depth,
+                'entities' => [],
+                'relations' => [],
+                'error' => "Root entity '$rootNameOrId' not found in this user's graph.",
+            ];
+        }
+        if (!$includeInvalid && !$this->isValidAt($root, $t)) {
+            return [
+                'root' => $rootNameOrId,
+                'depth' => $depth,
+                'entities' => [],
+                'relations' => [],
+                'error' => "Root entity '$rootNameOrId' is not valid at the requested time.",
+            ];
+        }
+
+        $distances = $this->subgraphDistances($username, [$root['id']], $depth, $t, $includeInvalid);
+        $ids = array_keys($distances);
+
+        $entities = [];
+        foreach ($this->fullEntitiesById($username, $ids) as $entity) {
+            $entities[] = [
+                'id' => $entity['id'],
+                'name' => $entity['name'],
+                'entityType' => $entity['entity_type'],
+                'observations' => $this->decodeObservations($entity['observations']),
+                'distance' => $distances[$entity['id']],
+                'createdAt' => $this->formatTime($entity['created_at']),
+                'updatedAt' => $this->formatTime($entity['updated_at']),
+                'validFrom' => $this->formatTime($entity['valid_from']),
+                'validTo' => $this->formatTime($entity['valid_to']),
+            ];
+        }
+
+        // The induced subgraph: relations whose both endpoints made the cut.
+        $included = array_fill_keys($ids, true);
+        $stmt = $this->pdo->prepare(
+            'SELECT from_entity, to_entity, relation_type, created_at, updated_at, valid_from, valid_to
+             FROM memory_relations
+             WHERE username = :username
+             ORDER BY created_at'
+        );
+        $stmt->execute([':username' => $username]);
+        $relations = [];
+        foreach ($stmt->fetchAll() as $row) {
+            if (!isset($included[$row['from_entity']], $included[$row['to_entity']])) {
+                continue;
+            }
+            if (!$includeInvalid && !$this->isValidAt($row, $t)) {
+                continue;
+            }
+            $relations[] = [
+                'from' => $row['from_entity'],
+                'to' => $row['to_entity'],
+                'relationType' => $row['relation_type'],
+                'createdAt' => $this->formatTime($row['created_at']),
+                'updatedAt' => $this->formatTime($row['updated_at']),
+                'validFrom' => $this->formatTime($row['valid_from']),
+                'validTo' => $this->formatTime($row['valid_to']),
+            ];
+        }
+
+        return [
+            'root' => $rootNameOrId,
+            'rootId' => $root['id'],
+            'depth' => $depth,
+            'entities' => $entities,
+            'relations' => $relations,
+        ];
     }
 
     /**
@@ -702,18 +809,52 @@ final class MemoryStore {
             return [];
         }
 
+        $distance = $this->subgraphDistances($username, $seeds, $hops, $asOf, false);
+        uksort($distance, function (string $a, string $b) use ($distance): int {
+            return $distance[$a] <=> $distance[$b] ?: strcmp($a, $b);
+        });
+        return array_keys($distance);
+    }
+
+    /**
+     * Distance of every valid entity reachable from the seeds via at most
+     * `maxDepth` undirected relation hops (the seeds themselves are distance 0).
+     * This is the shared BFS core behind both search_graph's `hops` expansion
+     * and read_graph's scoped root/depth read. When `includeInvalid` is set,
+     * validity is ignored so the traversal also reaches historical facts.
+     *
+     * @param string $username owner of the graph
+     * @param string[] $seeds starting entity ids
+     * @param int $maxDepth maximum hops from a seed (0 = seeds only)
+     * @param int $asOf snapshot timestamp used when not including invalid facts
+     * @param bool $includeInvalid traverse regardless of validity
+     * @return array<string, int> id => distance, nearest first
+     */
+    private function subgraphDistances(string $username, array $seeds, int $maxDepth, int $asOf, bool $includeInvalid): array {
+        if ($seeds === [] || $maxDepth < 0) {
+            return [];
+        }
+
         $valid = $this->pdo->prepare(
-            'SELECT id FROM memory_entities
-             WHERE username = :username AND valid_from <= :asof AND (valid_to IS NULL OR valid_to > :asof)'
+            $includeInvalid
+                ? 'SELECT id FROM memory_entities WHERE username = :username'
+                : 'SELECT id FROM memory_entities
+                   WHERE username = :username AND valid_from <= :asof AND (valid_to IS NULL OR valid_to > :asof)'
         );
-        $valid->execute([':username' => $username, ':asof' => $asOf]);
+        $valid->execute($includeInvalid
+            ? [':username' => $username]
+            : [':username' => $username, ':asof' => $asOf]);
         $validIds = array_fill_keys(array_column($valid->fetchAll(), 'id'), true);
 
         $rels = $this->pdo->prepare(
-            'SELECT from_entity, to_entity FROM memory_relations
-             WHERE username = :username AND valid_from <= :asof AND (valid_to IS NULL OR valid_to > :asof)'
+            $includeInvalid
+                ? 'SELECT from_entity, to_entity FROM memory_relations WHERE username = :username'
+                : 'SELECT from_entity, to_entity FROM memory_relations
+                   WHERE username = :username AND valid_from <= :asof AND (valid_to IS NULL OR valid_to > :asof)'
         );
-        $rels->execute([':username' => $username, ':asof' => $asOf]);
+        $rels->execute($includeInvalid
+            ? [':username' => $username]
+            : [':username' => $username, ':asof' => $asOf]);
         $adjacency = [];
         foreach ($rels->fetchAll() as $row) {
             $adjacency[$row['from_entity']][] = $row['to_entity'];
@@ -732,7 +873,7 @@ final class MemoryStore {
         while (!$queue->isEmpty()) {
             $node = $queue->dequeue();
             $d = $distance[$node];
-            if ($d >= $hops) {
+            if ($d >= $maxDepth) {
                 continue;
             }
             foreach ($adjacency[$node] ?? [] as $neighbor) {
@@ -744,10 +885,7 @@ final class MemoryStore {
             }
         }
 
-        uksort($distance, function (string $a, string $b) use ($distance): int {
-            return $distance[$a] <=> $distance[$b] ?: strcmp($a, $b);
-        });
-        return array_keys($distance);
+        return $distance;
     }
 
     /**
@@ -834,6 +972,29 @@ final class MemoryStore {
         return $out;
     }
 
+    /**
+     * Same as entitiesById but with the full row (creation/validity timestamps),
+     * used by the scoped subgraph read.
+     *
+     * @param string[] $ids @return array<string, array<string, mixed>> id => full raw entity row
+     */
+    private function fullEntitiesById(string $username, array $ids): array {
+        $out = [];
+        if ($ids === []) {
+            return $out;
+        }
+        $placeholders = implode(',', array_fill(0, count($ids), '?'));
+        $stmt = $this->pdo->prepare(
+            "SELECT id, name, entity_type, observations, created_at, updated_at, valid_from, valid_to
+             FROM memory_entities WHERE username = ? AND id IN ($placeholders)"
+        );
+        $stmt->execute([$username, ...$ids]);
+        foreach ($stmt->fetchAll() as $row) {
+            $out[$row['id']] = $row;
+        }
+        return $out;
+    }
+
     /** @return array<int, array<string, mixed>> */
     private function fetchEntities(string $username): array {
         $stmt = $this->pdo->prepare(
@@ -859,6 +1020,26 @@ final class MemoryStore {
 
         $byId = $this->pdo->prepare(
             'SELECT id, observations FROM memory_entities WHERE username = :username AND id = :key LIMIT 1'
+        );
+        $byId->execute([':username' => $username, ':key' => $nameOrId]);
+        $entity = $byId->fetch();
+        return $entity !== false ? $entity : null;
+    }
+
+    /** @return array<string, mixed>|null full entity row, matched by name first, then id */
+    private function findEntityFull(string $username, string $nameOrId): ?array {
+        $columns = 'id, name, entity_type, observations, created_at, updated_at, valid_from, valid_to';
+        $byName = $this->pdo->prepare(
+            "SELECT $columns FROM memory_entities WHERE username = :username AND name = :key LIMIT 1"
+        );
+        $byName->execute([':username' => $username, ':key' => $nameOrId]);
+        $entity = $byName->fetch();
+        if ($entity !== false) {
+            return $entity;
+        }
+
+        $byId = $this->pdo->prepare(
+            "SELECT $columns FROM memory_entities WHERE username = :username AND id = :key LIMIT 1"
         );
         $byId->execute([':username' => $username, ':key' => $nameOrId]);
         $entity = $byId->fetch();
