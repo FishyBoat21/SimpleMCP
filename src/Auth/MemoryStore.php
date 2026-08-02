@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace McpServer\Auth;
 
 use PDO;
+use SplQueue;
 
 /**
  * SQLite-backed knowledge graph backing the memory MCP tool.
@@ -15,6 +16,17 @@ use PDO;
  * Every row is scoped to a username, so each user gets an isolated subgraph:
  * memory created under one account is never listed, linked, or mutated by
  * another. In stdio mode the injected user is the trusted `local` user.
+ *
+ * Temporal model: every fact carries a transaction timeline (created_at /
+ * updated_at — when the fact was recorded) and a validity timeline
+ * (valid_from / valid_to — when the fact holds). A NULL valid_to means the
+ * fact is currently valid; invalidating marks valid_to instead of deleting,
+ * so historical state stays queryable via `as_of`.
+ *
+ * Entities are additionally mirrored into an FTS5 table (memory_entities_fts)
+ * for zero-dependency BM25 keyword search, and search_graph fuses that with a
+ * character n-gram similarity pass (a dependency-free stand-in for embeddings)
+ * and breadth-first graph traversal using Reciprocal Rank Fusion.
  */
 final class MemoryStore {
     private PDO $pdo;
@@ -44,6 +56,8 @@ final class MemoryStore {
                 observations TEXT NOT NULL DEFAULT '[]',
                 created_at   INTEGER NOT NULL,
                 updated_at   INTEGER NOT NULL,
+                valid_from   INTEGER,
+                valid_to     INTEGER,
                 PRIMARY KEY (username, id)
             );
 
@@ -55,16 +69,76 @@ final class MemoryStore {
                 to_entity     TEXT NOT NULL,
                 relation_type TEXT NOT NULL,
                 created_at    INTEGER NOT NULL,
+                updated_at    INTEGER,
+                valid_from    INTEGER,
+                valid_to      INTEGER,
                 PRIMARY KEY (username, from_entity, to_entity, relation_type)
             );
 
             CREATE INDEX IF NOT EXISTS idx_memory_relations_username ON memory_relations(username);
             SQL);
+
+        $this->migrateColumns();
+        $this->createFtsTable();
+    }
+
+    /**
+     * Add columns that post-date the originally shipped schema, for databases
+     * created before the temporal/FTS model existed. Runs as part of the
+     * idempotent bootstrap, so it is a no-op on fresh databases.
+     */
+    private function migrateColumns(): void {
+        $entityCols = array_column($this->pdo->query('PRAGMA table_info(memory_entities)')->fetchAll(), 'name');
+        foreach (['valid_from', 'valid_to'] as $column) {
+            if (!in_array($column, $entityCols, true)) {
+                $this->pdo->exec("ALTER TABLE memory_entities ADD COLUMN $column INTEGER");
+            }
+        }
+
+        $relationCols = array_column($this->pdo->query('PRAGMA table_info(memory_relations)')->fetchAll(), 'name');
+        foreach (['updated_at', 'valid_from', 'valid_to'] as $column) {
+            if (!in_array($column, $relationCols, true)) {
+                $this->pdo->exec("ALTER TABLE memory_relations ADD COLUMN $column INTEGER");
+            }
+        }
+
+        // Rows written before these columns existed are valid from creation onward.
+        $this->pdo->exec('UPDATE memory_entities SET valid_from = created_at WHERE valid_from IS NULL');
+        $this->pdo->exec('UPDATE memory_relations SET valid_from = created_at WHERE valid_from IS NULL');
+        $this->pdo->exec('UPDATE memory_relations SET updated_at = created_at WHERE updated_at IS NULL');
+    }
+
+    private function createFtsTable(): void {
+        $this->pdo->exec(<<<'SQL'
+            CREATE VIRTUAL TABLE IF NOT EXISTS memory_entities_fts USING fts5(
+                username     UNINDEXED,
+                entity_id    UNINDEXED,
+                name,
+                entity_type,
+                observations
+            );
+            SQL);
+
+        // A database created before the FTS index existed has rows but no
+        // index entries: rebuild once so keyword search covers pre-existing data.
+        $indexed = (int) $this->pdo->query('SELECT COUNT(*) FROM memory_entities_fts')->fetchColumn();
+        $entities = (int) $this->pdo->query('SELECT COUNT(*) FROM memory_entities')->fetchColumn();
+        if ($indexed === 0 && $entities > 0) {
+            $this->rebuildFts();
+        }
+    }
+
+    private function rebuildFts(): void {
+        $rows = $this->pdo->query('SELECT username, id FROM memory_entities')->fetchAll();
+        foreach ($rows as $row) {
+            $this->syncFtsRow($row['username'], $row['id']);
+        }
     }
 
     /**
      * Insert or update entities, upserting on (username, id). Re-creating an
-     * existing id replaces name, type, and observations entirely.
+     * existing id replaces name, type, and observations entirely and makes the
+     * entity valid again.
      *
      * @param string $username owner of the new entities
      * @param array<int, array<string, mixed>> $entities
@@ -73,12 +147,14 @@ final class MemoryStore {
     public function createEntities(string $username, array $entities): array {
         $now = time();
         $stmt = $this->pdo->prepare(
-            'INSERT INTO memory_entities (id, username, name, entity_type, observations, created_at, updated_at)
-             VALUES (:id, :username, :name, :entity_type, :observations, :created_at, :updated_at)
+            'INSERT INTO memory_entities (id, username, name, entity_type, observations, created_at, updated_at, valid_from)
+             VALUES (:id, :username, :name, :entity_type, :observations, :created_at, :updated_at, :valid_from)
              ON CONFLICT (username, id) DO UPDATE SET
                  name = excluded.name,
                  entity_type = excluded.entity_type,
                  observations = excluded.observations,
+                 valid_from = excluded.valid_from,
+                 valid_to = NULL,
                  updated_at = excluded.updated_at'
         );
 
@@ -90,6 +166,7 @@ final class MemoryStore {
                 continue;
             }
 
+            $validFrom = $this->toTimestamp($entity['validFrom'] ?? null) ?? $now;
             $stmt->execute([
                 ':id' => $id,
                 ':username' => $username,
@@ -98,15 +175,17 @@ final class MemoryStore {
                 ':observations' => json_encode($this->stringList($entity['observations'] ?? []), JSON_UNESCAPED_SLASHES),
                 ':created_at' => $now,
                 ':updated_at' => $now,
+                ':valid_from' => $validFrom,
             ]);
+            $this->syncFtsRow($username, $id);
             $ids[] = $id;
         }
         return $ids;
     }
 
     /**
-     * Create directed relations between existing entities. Relations that
-     * already exist (same from/to/type) are left untouched.
+     * Create directed relations between existing entities. An active duplicate
+     * (same from/to/type) is left untouched; an invalidated one is re-activated.
      *
      * @param string $username owner of the graph
      * @param array<int, array<string, mixed>> $relations
@@ -120,9 +199,17 @@ final class MemoryStore {
 
         $now = time();
         $stmt = $this->pdo->prepare(
-            'INSERT INTO memory_relations (username, from_entity, to_entity, relation_type, created_at)
-             VALUES (:username, :from, :to, :relation_type, :created_at)
-             ON CONFLICT (username, from_entity, to_entity, relation_type) DO NOTHING'
+            'INSERT INTO memory_relations (username, from_entity, to_entity, relation_type, created_at, updated_at, valid_from)
+             VALUES (:username, :from, :to, :relation_type, :created_at, :updated_at, :valid_from)'
+        );
+        $lookup = $this->pdo->prepare(
+            'SELECT valid_to FROM memory_relations
+             WHERE username = :username AND from_entity = :from AND to_entity = :to AND relation_type = :relation_type'
+        );
+        $reactivate = $this->pdo->prepare(
+            'UPDATE memory_relations
+             SET valid_to = NULL, valid_from = :valid_from, updated_at = :updated_at
+             WHERE username = :username AND from_entity = :from AND to_entity = :to AND relation_type = :relation_type'
         );
 
         $created = [];
@@ -141,12 +228,34 @@ final class MemoryStore {
                 continue;
             }
 
+            $validFrom = $this->toTimestamp($relation['validFrom'] ?? null) ?? $now;
+
+            $lookup->execute([':username' => $username, ':from' => $from, ':to' => $to, ':relation_type' => $type]);
+            $existing = $lookup->fetch();
+            if ($existing !== false) {
+                if ($existing['valid_to'] === null) {
+                    continue; // duplicate of an active relation — ignored, as before
+                }
+                $reactivate->execute([
+                    ':valid_from' => $validFrom,
+                    ':updated_at' => $now,
+                    ':username' => $username,
+                    ':from' => $from,
+                    ':to' => $to,
+                    ':relation_type' => $type,
+                ]);
+                $created[] = "$from -> $to ($type) (re-activated)";
+                continue;
+            }
+
             $stmt->execute([
                 ':username' => $username,
                 ':from' => $from,
                 ':to' => $to,
                 ':relation_type' => $type,
                 ':created_at' => $now,
+                ':updated_at' => $now,
+                ':valid_from' => $validFrom,
             ]);
             $created[] = "$from -> $to ($type)";
         }
@@ -222,6 +331,9 @@ final class MemoryStore {
             $stmt->execute([':username' => $username, ':id' => $id]);
             $relationsRemoved += $stmt->rowCount();
 
+            // Drop the FTS mirror before the source row, then the source row.
+            $this->pdo->prepare('DELETE FROM memory_entities_fts WHERE username = :username AND entity_id = :id')
+                ->execute([':username' => $username, ':id' => $id]);
             $this->pdo->prepare('DELETE FROM memory_entities WHERE username = :username AND id = :id')
                 ->execute([':username' => $username, ':id' => $id]);
             $deleted[] = $id;
@@ -273,47 +385,459 @@ final class MemoryStore {
     }
 
     /**
-     * The full graph for a user: every entity with its observations, plus all
-     * directed relations.
+     * The graph for a user as of a point in time: every entity with its
+     * observations, plus all directed relations. By default only facts valid at
+     * `asOf` are returned; pass `includeInvalid` to include historical state.
      *
      * @param string $username owner of the graph
-     * @return array{entities: list<array{id: string, name: string, entityType: string, observations: string[]}>, relations: list<array{from: string, to: string, relationType: string}>}
+     * @param mixed $asOf Unix timestamp or ISO-8601 datetime (null = now)
+     * @param bool $includeInvalid also return facts that have been invalidated
+     * @return array{entities: list<array<string, mixed>>, relations: list<array<string, mixed>>}
      */
-    public function readGraph(string $username): array {
+    public function readGraph(string $username, mixed $asOf = null, bool $includeInvalid = false): array {
+        $t = $this->toTimestamp($asOf) ?? time();
+
         $entities = [];
         foreach ($this->fetchEntities($username) as $entity) {
-            $observations = json_decode((string) ($entity['observations'] ?? '[]'), true);
+            if (!$includeInvalid && !$this->isValidAt($entity, $t)) {
+                continue;
+            }
             $entities[] = [
                 'id' => $entity['id'],
                 'name' => $entity['name'],
                 'entityType' => $entity['entity_type'],
-                'observations' => is_array($observations) ? $observations : [],
+                'observations' => $this->decodeObservations($entity['observations']),
+                'createdAt' => $this->formatTime($entity['created_at']),
+                'updatedAt' => $this->formatTime($entity['updated_at']),
+                'validFrom' => $this->formatTime($entity['valid_from']),
+                'validTo' => $this->formatTime($entity['valid_to']),
             ];
         }
 
         $stmt = $this->pdo->prepare(
-            'SELECT from_entity, to_entity, relation_type
+            'SELECT from_entity, to_entity, relation_type, created_at, updated_at, valid_from, valid_to
              FROM memory_relations
              WHERE username = :username
              ORDER BY created_at'
         );
         $stmt->execute([':username' => $username]);
-        $relations = array_map(
-            static fn(array $row): array => [
+        $relations = [];
+        foreach ($stmt->fetchAll() as $row) {
+            if (!$includeInvalid && !$this->isValidAt($row, $t)) {
+                continue;
+            }
+            $relations[] = [
                 'from' => $row['from_entity'],
                 'to' => $row['to_entity'],
                 'relationType' => $row['relation_type'],
-            ],
-            $stmt->fetchAll()
-        );
+                'createdAt' => $this->formatTime($row['created_at']),
+                'updatedAt' => $this->formatTime($row['updated_at']),
+                'validFrom' => $this->formatTime($row['valid_from']),
+                'validTo' => $this->formatTime($row['valid_to']),
+            ];
+        }
 
         return ['entities' => $entities, 'relations' => $relations];
     }
 
-    /** @return array<int, array<string, string>> */
-    private function fetchEntities(string $username): array {
+    /**
+     * Search the graph. Retrieval strategies:
+     *   - keyword:  BM25 over the FTS5 index (exact tokens, prefix-tolerant)
+     *   - semantic: character n-gram (Dice) similarity — a zero-dependency
+     *               stand-in for embeddings; resilient to typos and CJK text
+     *   - hybrid:   Reciprocal Rank Fusion of keyword + semantic + graph lists
+     * When `hops` > 0, breadth-first traversal expands the candidates through
+     * up to `hops` relation hops and is fused into the ranking. Only facts
+     * valid at `asOf` are searchable.
+     *
+     * @param string $username owner of the graph
+     * @param string $query search text
+     * @param string $searchType keyword|semantic|hybrid
+     * @param int $topK max results (clamped 1..100)
+     * @param int $hops BFS depth (clamped 0..4)
+     * @param mixed $asOf Unix timestamp or ISO-8601 datetime (null = now)
+     * @return array<string, mixed>
+     */
+    public function searchGraph(
+        string $username,
+        string $query,
+        string $searchType = 'keyword',
+        int $topK = 10,
+        int $hops = 1,
+        mixed $asOf = null,
+    ): array {
+        $topK = max(1, min(100, $topK));
+        $hops = max(0, min(4, $hops));
+        $query = trim($query);
+
+        if ($query === '') {
+            return ['query' => $query, 'searchType' => $searchType, 'total' => 0, 'results' => []];
+        }
+        if (!in_array($searchType, ['keyword', 'semantic', 'hybrid'], true)) {
+            $searchType = 'keyword';
+        }
+        $t = $this->toTimestamp($asOf) ?? time();
+
+        $keywordIds = $this->keywordSearch($username, $query, $t);
+        $semanticIds = $this->semanticSearch($username, $query, $t);
+
+        $lists = [];
+        if ($searchType === 'keyword' || $searchType === 'hybrid') {
+            $lists['keyword'] = $keywordIds;
+        }
+        if ($searchType === 'semantic' || $searchType === 'hybrid') {
+            $lists['semantic'] = $semanticIds;
+        }
+        if ($hops > 0) {
+            $seeds = array_values(array_unique(array_merge($keywordIds, $semanticIds)));
+            $graphIds = $this->bfsExpand($username, $seeds, $hops, $t);
+            if ($graphIds !== []) {
+                $lists['graph'] = $graphIds;
+            }
+        }
+
+        $ranked = $this->rrf($lists);
+        $resultIds = array_slice(array_keys($ranked), 0, $topK);
+        $byId = $this->entitiesById($username, $resultIds);
+
+        $results = [];
+        foreach ($resultIds as $id) {
+            if (!isset($byId[$id])) {
+                continue;
+            }
+            $row = $byId[$id];
+            $results[] = [
+                'id' => $id,
+                'name' => $row['name'],
+                'entityType' => $row['entity_type'],
+                'observations' => $this->decodeObservations($row['observations']),
+                'score' => round($ranked[$id], 4),
+                'matchedOn' => $this->matchedOn($row, $query),
+            ];
+        }
+
+        return [
+            'query' => $query,
+            'searchType' => $searchType,
+            'topK' => $topK,
+            'hops' => $hops,
+            'total' => count($results),
+            'results' => $results,
+        ];
+    }
+
+    /**
+     * Mark an entity (matched by name, then id) as invalid from a point in
+     * time, preserving history instead of deleting it. Any relation touching
+     * the entity is invalidated at the same instant, so the graph stays
+     * consistent at every `as_of` snapshot.
+     *
+     * @return array{invalidated: bool, error?: string, id?: string, validTo?: ?string, relationsInvalidated?: int}
+     */
+    public function invalidateEntity(string $username, string $identifier, mixed $invalidAt = null): array {
+        $entity = $this->findEntity($username, $identifier);
+        if ($entity === null) {
+            return ['invalidated' => false, 'error' => "Entity '$identifier' not found in this user's graph."];
+        }
+
+        $t = $this->toTimestamp($invalidAt) ?? time();
+
+        $rels = $this->pdo->prepare(
+            'UPDATE memory_relations SET valid_to = :t, updated_at = :t
+             WHERE username = :username AND (from_entity = :id OR to_entity = :id)'
+        );
+        $rels->execute([':t' => $t, ':username' => $username, ':id' => $entity['id']]);
+
+        $this->pdo->prepare(
+            'UPDATE memory_entities SET valid_to = :t, updated_at = :t WHERE username = :username AND id = :id'
+        )->execute([':t' => $t, ':username' => $username, ':id' => $entity['id']]);
+
+        return [
+            'invalidated' => true,
+            'id' => $entity['id'],
+            'validTo' => $this->formatTime($t),
+            'relationsInvalidated' => $rels->rowCount(),
+        ];
+    }
+
+    /**
+     * Mark a directed relation as invalid from a point in time, preserving
+     * history instead of deleting it.
+     *
+     * @return array{invalidated: bool, error?: string, from?: string, to?: string, relationType?: string, validTo?: ?string}
+     */
+    public function invalidateRelation(string $username, string $from, string $to, string $relationType, mixed $invalidAt = null): array {
+        $exists = $this->pdo->prepare(
+            'SELECT 1 FROM memory_relations
+             WHERE username = :username AND from_entity = :from AND to_entity = :to AND relation_type = :relation_type'
+        );
+        $exists->execute([':username' => $username, ':from' => $from, ':to' => $to, ':relation_type' => $relationType]);
+        if ($exists->fetch() === false) {
+            return ['invalidated' => false, 'error' => "Relation '$from -> $to ($relationType)' not found."];
+        }
+
+        $t = $this->toTimestamp($invalidAt) ?? time();
+        $this->pdo->prepare(
+            'UPDATE memory_relations SET valid_to = :t, updated_at = :t
+             WHERE username = :username AND from_entity = :from AND to_entity = :to AND relation_type = :relation_type'
+        )->execute([':t' => $t, ':username' => $username, ':from' => $from, ':to' => $to, ':relation_type' => $relationType]);
+
+        return [
+            'invalidated' => true,
+            'from' => $from,
+            'to' => $to,
+            'relationType' => $relationType,
+            'validTo' => $this->formatTime($t),
+        ];
+    }
+
+    /** @return string[] ids of valid entities matching the FTS5 query, best first */
+    private function keywordSearch(string $username, string $query, int $asOf): array {
+        $match = $this->ftsMatchQuery($query);
+        if ($match === '') {
+            return [];
+        }
+
+        $stmt = $this->pdo->prepare(
+            'SELECT entity_id AS id
+             FROM memory_entities_fts
+             WHERE username = :username AND memory_entities_fts MATCH :match
+             ORDER BY rank DESC
+             LIMIT :limit'
+        );
+        $stmt->bindValue(':username', $username);
+        $stmt->bindValue(':match', $match);
+        $stmt->bindValue(':limit', 200, PDO::PARAM_INT);
+        $stmt->execute();
+        $ids = array_column($stmt->fetchAll(), 'id');
+
+        // FTS knows nothing about validity: keep only entities still valid at the snapshot.
+        $valid = $this->pdo->prepare(
+            'SELECT id FROM memory_entities
+             WHERE username = :username AND valid_from <= :asof AND (valid_to IS NULL OR valid_to > :asof)'
+        );
+        $valid->execute([':username' => $username, ':asof' => $asOf]);
+        $validIds = array_fill_keys(array_column($valid->fetchAll(), 'id'), true);
+
+        return array_values(array_filter($ids, static fn(string $id): bool => isset($validIds[$id])));
+    }
+
+    /**
+     * @return string[] ids of valid entities by semantic similarity, best first
+     *
+     * A zero-dependency stand-in for embeddings: scores each entity with the
+     * query coverage of shared character trigrams, weighted by inverse document
+     * frequency across the user's own corpus. Weighting matters — generic
+     * trigrams like "ing"/"thi" occur everywhere and would otherwise match any
+     * entity at random, while distinctive grams (and every CJK character,
+     * which is exactly one UTF-8 trigram) dominate the score. The 0.25 floor
+     * drops trigram-coincidence noise (a nonsense query scores ~0.1) while
+     * genuine fuzzy matches stay well above it.
+     */
+    private function semanticSearch(string $username, string $query, int $asOf): array {
+        $qGrams = $this->nGramSet($query);
+        if ($qGrams === []) {
+            return [];
+        }
+
         $stmt = $this->pdo->prepare(
             'SELECT id, name, entity_type, observations
+             FROM memory_entities
+             WHERE username = :username AND valid_from <= :asof AND (valid_to IS NULL OR valid_to > :asof)'
+        );
+        $stmt->execute([':username' => $username, ':asof' => $asOf]);
+
+        // Document frequency per gram (an entity is a document). Each entity's
+        // gram set is the union over its name, type, and observations, so a
+        // match inside a short observation is not diluted by long text elsewhere.
+        $docs = [];
+        $df = [];
+        foreach ($stmt->fetchAll() as $row) {
+            $grams = $this->nGramSet((string) $row['name'])
+                + $this->nGramSet((string) $row['entity_type']);
+            foreach ($this->decodeObservations($row['observations']) as $observation) {
+                $grams += $this->nGramSet($observation);
+            }
+            if ($grams === []) {
+                continue;
+            }
+            $docs[$row['id']] = $grams;
+            foreach ($grams as $gram => $_) {
+                $df[$gram] = ($df[$gram] ?? 0) + 1;
+            }
+        }
+        $n = max(1, count($docs));
+
+        $scored = [];
+        foreach ($docs as $id => $docGrams) {
+            $numerator = 0.0;
+            $denominator = 0.0;
+            foreach ($qGrams as $gram => $_) {
+                $idf = log(($n + 1) / (($df[$gram] ?? 0) + 1)) + 1;
+                $denominator += $idf;
+                if (isset($docGrams[$gram])) {
+                    $numerator += $idf;
+                }
+            }
+            $score = $denominator > 0.0 ? $numerator / $denominator : 0.0;
+            if ($score >= 0.25) {
+                $scored[] = ['id' => $id, 'score' => $score];
+            }
+        }
+        usort($scored, static fn(array $a, array $b): int => $b['score'] <=> $a['score'] ?: strcmp($a['id'], $b['id']));
+        return array_map(static fn(array $row): string => $row['id'], $scored);
+    }
+
+    /**
+     * Breadth-first traversal over valid relations from the seed entity ids,
+     * collecting reachable valid entities up to `hops` hops away. Returns ids
+     * ordered by distance then id so RRF weights nearer neighbors higher.
+     *
+     * @param string $username owner of the graph
+     * @param string[] $seeds starting entity ids
+     * @return string[] reachable entity ids
+     */
+    private function bfsExpand(string $username, array $seeds, int $hops, int $asOf): array {
+        if ($seeds === [] || $hops <= 0) {
+            return [];
+        }
+
+        $valid = $this->pdo->prepare(
+            'SELECT id FROM memory_entities
+             WHERE username = :username AND valid_from <= :asof AND (valid_to IS NULL OR valid_to > :asof)'
+        );
+        $valid->execute([':username' => $username, ':asof' => $asOf]);
+        $validIds = array_fill_keys(array_column($valid->fetchAll(), 'id'), true);
+
+        $rels = $this->pdo->prepare(
+            'SELECT from_entity, to_entity FROM memory_relations
+             WHERE username = :username AND valid_from <= :asof AND (valid_to IS NULL OR valid_to > :asof)'
+        );
+        $rels->execute([':username' => $username, ':asof' => $asOf]);
+        $adjacency = [];
+        foreach ($rels->fetchAll() as $row) {
+            $adjacency[$row['from_entity']][] = $row['to_entity'];
+            $adjacency[$row['to_entity']][] = $row['from_entity']; // traversed undirected
+        }
+
+        $distance = [];
+        $queue = new SplQueue();
+        foreach ($seeds as $seed) {
+            if (!isset($validIds[$seed]) || isset($distance[$seed])) {
+                continue;
+            }
+            $distance[$seed] = 0;
+            $queue->enqueue($seed);
+        }
+        while (!$queue->isEmpty()) {
+            $node = $queue->dequeue();
+            $d = $distance[$node];
+            if ($d >= $hops) {
+                continue;
+            }
+            foreach ($adjacency[$node] ?? [] as $neighbor) {
+                if (isset($distance[$neighbor]) || !isset($validIds[$neighbor])) {
+                    continue;
+                }
+                $distance[$neighbor] = $d + 1;
+                $queue->enqueue($neighbor);
+            }
+        }
+
+        uksort($distance, function (string $a, string $b) use ($distance): int {
+            return $distance[$a] <=> $distance[$b] ?: strcmp($a, $b);
+        });
+        return array_keys($distance);
+    }
+
+    /**
+     * Reciprocal Rank Fusion over ranked id lists. Every candidate's score is
+     * the sum of 1/(k + rank) over the lists it appears in (k = 60), so a
+     * candidate ranked highly in several strategies outranks one ranked highly
+     * in only one.
+     *
+     * @param array<string, string[]> $lists strategy name => ranked ids
+     * @return array<string, float> id => RRF score, best first
+     */
+    private function rrf(array $lists): array {
+        $scores = [];
+        foreach ($lists as $list) {
+            foreach (array_values($list) as $position => $id) {
+                $scores[$id] = ($scores[$id] ?? 0.0) + 1.0 / (60.0 + $position);
+            }
+        }
+        arsort($scores, SORT_NUMERIC);
+        return $scores;
+    }
+
+    /**
+     * Turn a user query into an FTS5 MATCH expression: each alphanumeric run is
+     * quoted and given a prefix `*`, joined with OR, so "alice acme" matches
+     * any entity mentioning either token.
+     */
+    private function ftsMatchQuery(string $query): string {
+        $tokens = preg_split('/[^\p{L}\p{N}]+/u', strtolower($query), -1, PREG_SPLIT_NO_EMPTY) ?? [];
+        $terms = [];
+        foreach ($tokens as $token) {
+            $terms[] = '"' . str_replace('"', '', $token) . '"*';
+        }
+        return implode(' OR ', $terms);
+    }
+
+    /**
+     * Character trigrams (byte-level, case-folded) used as features. Trigrams
+     * are more distinctive than bigrams (which over-match on noise like "in"),
+     * and one CJK character is exactly one UTF-8 trigram, so this also works
+     * for Chinese/Japanese text that FTS5's unicode61 tokenizer cannot split.
+     * @return array<string, true>
+     */
+    private function nGramSet(string $text): array {
+        $text = strtolower($text);
+        $set = [];
+        $length = strlen($text);
+        for ($i = 0; $i + 3 <= $length; $i++) {
+            $set[substr($text, $i, 3)] = true;
+        }
+        return $set;
+    }
+
+    /** Which searchable field(s) contain the query verbatim. @return string[] */
+    private function matchedOn(array $row, string $query): array {
+        $fields = [
+            'name' => (string) $row['name'],
+            'entityType' => (string) $row['entity_type'],
+            'observations' => (string) $row['observations'],
+        ];
+        $hits = [];
+        foreach ($fields as $field => $text) {
+            if ($text !== '' && stripos($text, $query) !== false) {
+                $hits[] = $field;
+            }
+        }
+        return $hits === [] ? ['name'] : $hits;
+    }
+
+    /** @param string[] $ids @return array<string, array<string, mixed>> id => raw entity row */
+    private function entitiesById(string $username, array $ids): array {
+        $out = [];
+        if ($ids === []) {
+            return $out;
+        }
+        $placeholders = implode(',', array_fill(0, count($ids), '?'));
+        $stmt = $this->pdo->prepare(
+            "SELECT id, name, entity_type, observations FROM memory_entities WHERE username = ? AND id IN ($placeholders)"
+        );
+        $stmt->execute([$username, ...$ids]);
+        foreach ($stmt->fetchAll() as $row) {
+            $out[$row['id']] = $row;
+        }
+        return $out;
+    }
+
+    /** @return array<int, array<string, mixed>> */
+    private function fetchEntities(string $username): array {
+        $stmt = $this->pdo->prepare(
+            'SELECT id, name, entity_type, observations, created_at, updated_at, valid_from, valid_to
              FROM memory_entities
              WHERE username = :username
              ORDER BY created_at'
@@ -353,6 +877,72 @@ final class MemoryStore {
             ':username' => $username,
             ':id' => $id,
         ]);
+        $this->syncFtsRow($username, $id);
+    }
+
+    /** Refresh the FTS mirror for one entity, keeping it in lockstep with the source row. */
+    private function syncFtsRow(string $username, string $id): void {
+        $stmt = $this->pdo->prepare(
+            'SELECT name, entity_type, observations FROM memory_entities WHERE username = :username AND id = :id'
+        );
+        $stmt->execute([':username' => $username, ':id' => $id]);
+        $row = $stmt->fetch();
+        if ($row === false) {
+            return;
+        }
+
+        $this->pdo->prepare('DELETE FROM memory_entities_fts WHERE username = :username AND entity_id = :id')
+            ->execute([':username' => $username, ':id' => $id]);
+        $this->pdo->prepare(
+            'INSERT INTO memory_entities_fts (username, entity_id, name, entity_type, observations)
+             VALUES (:username, :id, :name, :entity_type, :observations)'
+        )->execute([
+            ':username' => $username,
+            ':id' => $id,
+            ':name' => $row['name'],
+            ':entity_type' => $row['entity_type'],
+            ':observations' => $row['observations'],
+        ]);
+    }
+
+    /** @param array<string, mixed> $row */
+    private function isValidAt(array $row, int $t): bool {
+        $from = (int) ($row['valid_from'] ?? 0);
+        $to = $row['valid_to'] ?? null;
+        return $from <= $t && ($to === null || (int) $to > $t);
+    }
+
+    /** @return string[] */
+    private function decodeObservations(string $json): array {
+        $observations = json_decode($json, true);
+        return is_array($observations) ? $observations : [];
+    }
+
+    /**
+     * Normalize a value to a Unix timestamp. Accepts an epoch integer/numeric
+     * string or any strtotime-parseable string (ISO-8601 datetime, etc.).
+     * Returns null for absent or unparseable input.
+     */
+    public function toTimestamp(mixed $value): ?int {
+        if ($value === null || $value === '') {
+            return null;
+        }
+        if (is_int($value)) {
+            return $value;
+        }
+        if (is_numeric($value)) {
+            return (int) $value;
+        }
+        $ts = strtotime((string) $value);
+        return $ts === false ? null : $ts;
+    }
+
+    /** Render a Unix timestamp as an ISO-8601 string, or null when absent. */
+    public function formatTime(mixed $ts): ?string {
+        if ($ts === null || $ts === '') {
+            return null;
+        }
+        return gmdate('c', (int) $ts);
     }
 
     /** @return string[] */
