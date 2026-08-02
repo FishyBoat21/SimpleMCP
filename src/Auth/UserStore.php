@@ -71,8 +71,12 @@ final class UserStore {
             }
             // A pending user keeps their provisioned username; it is not editable.
             $username = (string) $row['username'];
+            // Grant the `user` role when none was provisioned, so the account can
+            // use the role-gated memory tools once it is active.
             $this->db->pdo()->prepare(
-                'UPDATE users SET name = :name, password_hash = :hash, status = :status, updated_at = :updated_at WHERE username = :username'
+                "UPDATE users SET name = :name, password_hash = :hash,
+                    roles = CASE WHEN roles = '[]' THEN '[\"user\"]' ELSE roles END,
+                    status = :status, updated_at = :updated_at WHERE username = :username"
             )->execute([
                 ':name' => $name !== '' ? $name : (string) $row['name'],
                 ':hash' => $this->hashPassword($password),
@@ -98,7 +102,9 @@ final class UserStore {
             ':username' => $username,
             ':name' => $name,
             ':hash' => $this->hashPassword($password),
-            ':roles' => '[]',
+            // New accounts are granted the `user` role so they can use the
+            // role-gated memory tools after logging in.
+            ':roles' => '["user"]',
             ':permissions' => '[]',
             ':status' => 'active',
             ':created_at' => time(),

@@ -18,6 +18,11 @@ use McpServer\UserContext;
  * account's memory is fully isolated. In stdio mode the injected user is the
  * trusted `local` user.
  *
+ * Access: every tool here requires the caller to hold the `user` or `admin`
+ * role, so only logged-in accounts can list or call them — anonymous HTTP
+ * callers see none of these tools and get a -32001 access-denied on direct
+ * calls.
+ *
  * Every fact is temporal: it carries created/updated timestamps plus a
  * validity window (validFrom / validTo). invalidate_entity / invalidate_relation
  * close the window instead of deleting, so history survives and read_graph /
@@ -26,8 +31,17 @@ use McpServer\UserContext;
  * to get just the neighborhood within that many relation hops.
  */
 readonly class MemoryTool {
+    /**
+     * The memory tools require an authenticated account: the caller must hold
+     * the `user` or `admin` role. Anonymous (unauthenticated) HTTP callers are
+     * hidden from tools/list and rejected at tools/call with -32001. In stdio
+     * mode the injected `local` user holds the `*` role, so access still works.
+     */
+    private const REQUIRED_ROLES = ['user', 'admin'];
+
     #[McpFunction(
         name: 'create_entities',
+        roles: self::REQUIRED_ROLES,
         description: 'Create new entities in the knowledge graph. Adds new objects, persons, or concepts to the persistent graph. Idempotent: re-creating an existing id replaces that entity.',
         schema: [
             'type' => 'object',
@@ -75,6 +89,7 @@ readonly class MemoryTool {
 
     #[McpFunction(
         name: 'create_relations',
+        roles: self::REQUIRED_ROLES,
         description: 'Create relations between existing entities. Connects different entities together with directional links, e.g. "alice works_at acme". Both endpoints must already exist; duplicate relations are ignored.',
         schema: [
             'type' => 'object',
@@ -123,6 +138,7 @@ readonly class MemoryTool {
 
     #[McpFunction(
         name: 'add_observations',
+        roles: self::REQUIRED_ROLES,
         description: 'Add new observations to existing entities. Appends new facts or details to an entity; the entity is matched by name, then by id. Duplicate observations are deduplicated.',
         schema: [
             'type' => 'object',
@@ -172,6 +188,7 @@ readonly class MemoryTool {
 
     #[McpFunction(
         name: 'delete_entities',
+        roles: self::REQUIRED_ROLES,
         description: 'Delete entities from the knowledge graph by id (or name — matched by name first, then id). Any relations pointing to or from a deleted entity are removed as well. Idempotent: missing entities are reported as warnings.',
         schema: [
             'type' => 'object',
@@ -213,6 +230,7 @@ readonly class MemoryTool {
 
     #[McpFunction(
         name: 'delete_relations',
+        roles: self::REQUIRED_ROLES,
         description: 'Delete relations from the knowledge graph. Each spec must include from, to, and relationType, matching the schema used by create_relations. Idempotent: missing relations are reported as warnings.',
         schema: [
             'type' => 'object',
@@ -260,6 +278,7 @@ readonly class MemoryTool {
 
     #[McpFunction(
         name: 'read_graph',
+        roles: self::REQUIRED_ROLES,
         description: 'Read the knowledge graph for the current user. Returns facts valid as of `as_of` (default: now) together with their creation and validity timestamps; pass includeInvalid to also see invalidated historical facts. When `root` is set, the read is scoped to the subgraph reachable from that entity within `depth` relation hops (depth 0 = just the root); each entity then carries its distance from the root.',
         schema: [
             'type' => 'object',
@@ -307,6 +326,7 @@ readonly class MemoryTool {
 
     #[McpFunction(
         name: 'search_graph',
+        roles: self::REQUIRED_ROLES,
         description: 'Search the knowledge graph. keyword = BM25 via a built-in SQLite FTS5 index; semantic = fuzzy character n-gram similarity (a zero-dependency stand-in for embeddings, resilient to typos and CJK text); hybrid = both fused with Reciprocal Rank Fusion. When hops > 0, results are expanded by breadth-first traversal through up to `hops` relation hops from the matched entities. Only facts valid at `as_of` are searched.',
         schema: [
             'type' => 'object',
@@ -353,6 +373,7 @@ readonly class MemoryTool {
 
     #[McpFunction(
         name: 'invalidate_entity',
+        roles: self::REQUIRED_ROLES,
         description: 'Mark an entity (matched by name first, then id) as no longer valid from a point in time, preserving history instead of deleting it. Sets the entity\'s validTo; it disappears from default read_graph/search_graph results but remains visible via as_of lookups or includeInvalid. Any relation touching the entity is invalidated at the same time.',
         schema: [
             'type' => 'object',
@@ -385,6 +406,7 @@ readonly class MemoryTool {
 
     #[McpFunction(
         name: 'invalidate_relation',
+        roles: self::REQUIRED_ROLES,
         description: 'Mark a directed relation as no longer valid from a point in time, preserving history instead of deleting it. Takes from/to/relationType exactly like create_relations. The relation disappears from default read_graph/search_graph results but remains visible via as_of lookups or includeInvalid.',
         schema: [
             'type' => 'object',
