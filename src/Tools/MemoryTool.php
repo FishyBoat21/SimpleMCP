@@ -162,6 +162,94 @@ readonly class MemoryTool {
     }
 
     #[McpFunction(
+        name: 'delete_entities',
+        description: 'Delete entities from the knowledge graph by id (or name — matched by name first, then id). Any relations pointing to or from a deleted entity are removed as well. Idempotent: missing entities are reported as warnings.',
+        schema: [
+            'type' => 'object',
+            'properties' => [
+                'entityIds' => [
+                    'type' => 'array',
+                    'description' => 'Ids (or names) of the entities to delete',
+                    'items' => ['type' => 'string'],
+                ],
+            ],
+            'required' => ['entityIds'],
+        ]
+    )]
+    public function deleteEntities(array $arguments, ?UserContext $user = null): array {
+        $user ??= UserContext::anonymous();
+        $identifiers = $arguments['entityIds'] ?? null;
+        if (!is_array($identifiers) || $identifiers === []) {
+            return [['type' => 'text', 'text' => "Error: 'entityIds' must be a non-empty array."]];
+        }
+
+        $result = (new MemoryStore())->deleteEntities($user->username, $identifiers);
+
+        $lines = [];
+        if ($result['deleted'] !== []) {
+            $label = count($result['deleted']) === 1 ? 'entity' : 'entities';
+            $relLabel = $result['relationsRemoved'] === 1 ? 'relation' : 'relations';
+            $lines[] = 'Deleted ' . count($result['deleted']) . " $label: " . implode(', ', $result['deleted'])
+                . ' (cascade-removed ' . $result['relationsRemoved'] . " $relLabel).";
+        }
+        foreach ($result['errors'] as $error) {
+            $lines[] = "Warning: $error";
+        }
+        if ($lines === []) {
+            $lines[] = 'No entities deleted.';
+        }
+
+        return [['type' => 'text', 'text' => implode("\n", $lines)]];
+    }
+
+    #[McpFunction(
+        name: 'delete_relations',
+        description: 'Delete relations from the knowledge graph. Each spec must include from, to, and relationType, matching the schema used by create_relations. Idempotent: missing relations are reported as warnings.',
+        schema: [
+            'type' => 'object',
+            'properties' => [
+                'relations' => [
+                    'type' => 'array',
+                    'description' => 'Relations to delete',
+                    'items' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'from' => ['type' => 'string', 'description' => 'id of the source entity'],
+                            'to' => ['type' => 'string', 'description' => 'id of the target entity'],
+                            'relationType' => ['type' => 'string', 'description' => 'Label for the directed link, e.g. "works_at"'],
+                        ],
+                        'required' => ['from', 'to', 'relationType'],
+                    ],
+                ],
+            ],
+            'required' => ['relations'],
+        ]
+    )]
+    public function deleteRelations(array $arguments, ?UserContext $user = null): array {
+        $user ??= UserContext::anonymous();
+        $relations = $arguments['relations'] ?? null;
+        if (!is_array($relations) || $relations === []) {
+            return [['type' => 'text', 'text' => "Error: 'relations' must be a non-empty array."]];
+        }
+
+        $result = (new MemoryStore())->deleteRelations($user->username, $relations);
+
+        $lines = [];
+        if ($result['deleted'] !== []) {
+            $label = count($result['deleted']) === 1 ? 'relation' : 'relations';
+            $lines[] = 'Successfully deleted ' . count($result['deleted']) . " $label:\n" . implode("\n", $result['deleted']);
+        }
+        foreach ($result['errors'] as $error) {
+            $lines[] = "Warning: $error";
+        }
+        if ($lines === []) {
+            $lines[] = 'No relations deleted.';
+        }
+
+        return [['type' => 'text', 'text' => implode("\n", $lines)]];
+    }
+
+    #[McpFunction(
         name: 'read_graph',
         description: 'Read the entire knowledge graph. Retrieves the full network of stored memories and connections for the current user.',
         schema: ['type' => 'object', 'properties' => new \stdClass()]

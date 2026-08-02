@@ -190,6 +190,89 @@ final class MemoryStore {
     }
 
     /**
+     * Delete entities by id (or name, matched like addObservations — name
+     * first, then id). Any relation that references a deleted entity is removed
+     * too, so the graph never keeps dangling links.
+     *
+     * @param string $username owner of the graph
+     * @param string[] $identifiers ids or names of the entities to delete
+     * @return array{deleted: string[], relationsRemoved: int, errors: string[]}
+     */
+    public function deleteEntities(string $username, array $identifiers): array {
+        $deleted = [];
+        $errors = [];
+        $relationsRemoved = 0;
+
+        foreach ($identifiers as $identifier) {
+            $entity = $this->findEntity($username, $identifier);
+            if ($entity === null) {
+                $errors[] = "Entity '$identifier' not found in this user's graph.";
+                continue;
+            }
+
+            $id = $entity['id'];
+            if (in_array($id, $deleted, true)) {
+                continue; // the same entity was referenced more than once
+            }
+
+            // Cascade: drop relations pointing to or from this entity.
+            $stmt = $this->pdo->prepare(
+                'DELETE FROM memory_relations WHERE username = :username AND (from_entity = :id OR to_entity = :id)'
+            );
+            $stmt->execute([':username' => $username, ':id' => $id]);
+            $relationsRemoved += $stmt->rowCount();
+
+            $this->pdo->prepare('DELETE FROM memory_entities WHERE username = :username AND id = :id')
+                ->execute([':username' => $username, ':id' => $id]);
+            $deleted[] = $id;
+        }
+
+        return ['deleted' => $deleted, 'relationsRemoved' => $relationsRemoved, 'errors' => $errors];
+    }
+
+    /**
+     * Delete directed relations matching the given from/to/relationType specs.
+     * All three fields are required for each spec, mirroring createRelations.
+     *
+     * @param string $username owner of the graph
+     * @param array<int, array<string, string>> $relations
+     * @return array{deleted: string[], errors: string[]}
+     */
+    public function deleteRelations(string $username, array $relations): array {
+        $deleted = [];
+        $errors = [];
+        $stmt = $this->pdo->prepare(
+            'DELETE FROM memory_relations
+             WHERE username = :username AND from_entity = :from AND to_entity = :to AND relation_type = :relation_type'
+        );
+
+        foreach ($relations as $relation) {
+            $from = (string) ($relation['from'] ?? '');
+            $to = (string) ($relation['to'] ?? '');
+            $type = (string) ($relation['relationType'] ?? '');
+
+            if ($from === '' || $to === '' || $type === '') {
+                $errors[] = 'Relation must include from, to and relationType: ' . json_encode($relation);
+                continue;
+            }
+
+            $stmt->execute([
+                ':username' => $username,
+                ':from' => $from,
+                ':to' => $to,
+                ':relation_type' => $type,
+            ]);
+            if ($stmt->rowCount() > 0) {
+                $deleted[] = "$from -> $to ($type)";
+            } else {
+                $errors[] = "Relation '$from -> $to ($type)' not found.";
+            }
+        }
+
+        return ['deleted' => $deleted, 'errors' => $errors];
+    }
+
+    /**
      * The full graph for a user: every entity with its observations, plus all
      * directed relations.
      *
