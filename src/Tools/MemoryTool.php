@@ -26,9 +26,11 @@ use McpServer\UserContext;
  * Every fact is temporal: it carries created/updated timestamps plus a
  * validity window (validFrom / validTo). invalidate_entity / invalidate_relation
  * close the window instead of deleting, so history survives and read_graph /
- * search_graph accept an `as_of` instant to look back in time. read_graph can
- * also be scoped to a subtree: pass `root` (an entity id or name) plus `depth`
- * to get just the neighborhood within that many relation hops.
+ * search_graph accept an `as_of` instant to look back in time. read_graph is
+ * lazy: it returns a compact paginated index (id/name/type/relation count) by
+ * default and loads full observations on demand — pass `entity_id` for one
+ * entity, or `root` (an entity id or name) plus `depth` for the neighborhood
+ * within that many relation hops.
  */
 readonly class MemoryTool {
     /**
@@ -279,7 +281,7 @@ readonly class MemoryTool {
     #[McpFunction(
         name: 'read_graph',
         roles: self::REQUIRED_ROLES,
-        description: 'Read the knowledge graph for the current user. Returns facts valid as of `as_of` (default: now) together with their creation and validity timestamps; pass includeInvalid to also see invalidated historical facts. When `root` is set, the read is scoped to the subgraph reachable from that entity within `depth` relation hops (depth 0 = just the root); each entity then carries its distance from the root.',
+        description: 'Read the knowledge graph for the current user. Every mode returns compact entries by default (id, name, type, relation count — no observations) so routine reads stay small. Load full observations on demand: pass `entity_id` for a single entity (observations + its relations), or `root` + `depth` for the subgraph around an entity (each entity carries its distance), optionally with `include_observations: true` to also return observations. The no-arg form returns a paginated index (`limit`/`offset`). All modes respect `as_of` (facts valid at that time; default now) and `includeInvalid` (also show historical/invalidated facts).',
         schema: [
             'type' => 'object',
             'properties' => [
@@ -288,9 +290,13 @@ readonly class MemoryTool {
                     'type' => 'boolean',
                     'description' => 'When true, invalidated/historical facts are included as well (they show a validTo value).',
                 ],
+                'entity_id' => [
+                    'type' => 'string',
+                    'description' => 'Optional: entity id (or name — matched by name first, then id) to load in full: observations, timestamps, and every relation touching it. Takes precedence over `root` and the index.',
+                ],
                 'root' => [
                     'type' => 'string',
-                    'description' => 'Optional: root entity id (or name — matched by name first, then id). When set, only the subgraph within `depth` hops of this entity is returned; absent means the full graph.',
+                    'description' => 'Optional: root entity id (or name — matched by name first, then id). When set, the full subgraph within `depth` hops of this entity is returned. Takes precedence over the index.',
                 ],
                 'depth' => [
                     'type' => 'integer',
@@ -298,6 +304,24 @@ readonly class MemoryTool {
                     'minimum' => 0,
                     'maximum' => 8,
                     'description' => 'Maximum undirected relation hops from the root entity to include; 0 returns just the root. Requires `root`; ignored otherwise.',
+                ],
+                'limit' => [
+                    'type' => 'integer',
+                    'default' => 100,
+                    'minimum' => 1,
+                    'maximum' => 1000,
+                    'description' => 'Index mode only: maximum number of index entries to return (pagination). Default 100.',
+                ],
+                'offset' => [
+                    'type' => 'integer',
+                    'default' => 0,
+                    'minimum' => 0,
+                    'description' => 'Index mode only: number of index entries to skip (pagination). Default 0.',
+                ],
+                'include_observations' => [
+                    'type' => 'boolean',
+                    'default' => false,
+                    'description' => 'Subgraph mode only: when true, each subgraph entity also carries its full observations (and creation/validity timestamps). Off by default so routine subgraph reads stay compact; prefer `entity_id` or search_graph for targeted observation detail.',
                 ],
             ],
         ]
@@ -308,12 +332,20 @@ readonly class MemoryTool {
         if (!is_string($root) || $root === '') {
             $root = null;
         }
+        $entityId = $arguments['entity_id'] ?? null;
+        if (!is_string($entityId) || $entityId === '') {
+            $entityId = null;
+        }
         $graph = (new MemoryStore())->readGraph(
             $user->username,
             $arguments['as_of'] ?? null,
             (bool) ($arguments['includeInvalid'] ?? false),
             $root,
             (int) ($arguments['depth'] ?? 0),
+            $entityId,
+            (int) ($arguments['limit'] ?? 100),
+            (int) ($arguments['offset'] ?? 0),
+            (bool) ($arguments['include_observations'] ?? false),
         );
 
         return [

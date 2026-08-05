@@ -385,22 +385,38 @@ final class MemoryStore {
     }
 
     /**
-     * The graph for a user as of a point in time: every entity with its
-     * observations, plus all directed relations. By default only facts valid at
-     * `asOf` are returned; pass `includeInvalid` to include historical state.
+     * Read the graph for a user as of a point in time, in one of three modes.
+     * By default only facts valid at `asOf` are returned; pass `includeInvalid`
+     * to include historical state. `as_of` and `includeInvalid` apply to every
+     * mode.
      *
-     * When `root` is given, the read is scoped to the subgraph reachable from
-     * that entity (matched by name first, then id) through at most `depth`
-     * undirected relation hops — `depth` 0 returns just the root. Each returned
-     * entity carries its `distance` from the root, and only relations whose both
-     * endpoints are in the subgraph are returned. `depth` is ignored when `root`
-     * is absent (full-graph read, as before).
+     * Modes (precedence: entity > subgraph > index):
+     *
+     * - **entity** (`entityId` set): full detail for one entity, matched by
+     *   name first then id — observations, timestamps, and every relation
+     *   touching it. The on-demand counterpart to the index.
+     * - **subgraph** (`root` set): the subgraph reachable from that entity
+     *   through at most `depth` undirected relation hops (`depth` 0 = just the
+     *   root), with full observations. Each entity carries its `distance` from
+     *   the root, and only relations whose both endpoints are in the subgraph
+     *   are returned.
+     * - **index** (default): a compact, paginated table of contents — one entry
+     *   per entity with id, name, type, and its relation count, but no
+     *   observations and no relation list. Use `limit`/`offset` to page; load
+     *   full observations on demand via the entity or subgraph modes.
      *
      * @param string $username owner of the graph
      * @param mixed $asOf Unix timestamp or ISO-8601 datetime (null = now)
      * @param bool $includeInvalid also return facts that have been invalidated
      * @param string|null $root optional root entity id or name to scope the read
      * @param int $depth max relation hops from the root (clamped 0..8)
+     * @param string|null $entityId optional entity id or name to load in full
+     * @param int $limit index mode: max index entries (clamped 1..1000)
+     * @param int $offset index mode: index entries to skip
+     * @param bool $includeObservations subgraph mode: also return each entity's
+     *        observations. Off by default so routine subgraph reads stay compact —
+     *        load observations on demand via the entity mode or search_graph
+     *        instead.
      * @return array<string, mixed>
      */
     public function readGraph(
@@ -409,54 +425,22 @@ final class MemoryStore {
         bool $includeInvalid = false,
         ?string $root = null,
         int $depth = 0,
+        ?string $entityId = null,
+        int $limit = 100,
+        int $offset = 0,
+        bool $includeObservations = false,
     ): array {
         $t = $this->toTimestamp($asOf) ?? time();
 
+        if ($entityId !== null && $entityId !== '') {
+            return $this->readEntity($username, $entityId, $t, $includeInvalid);
+        }
+
         if ($root !== null && $root !== '') {
-            return $this->readSubgraph($username, $root, $depth, $t, $includeInvalid);
+            return $this->readSubgraph($username, $root, $depth, $t, $includeInvalid, $includeObservations);
         }
 
-        $entities = [];
-        foreach ($this->fetchEntities($username) as $entity) {
-            if (!$includeInvalid && !$this->isValidAt($entity, $t)) {
-                continue;
-            }
-            $entities[] = [
-                'id' => $entity['id'],
-                'name' => $entity['name'],
-                'entityType' => $entity['entity_type'],
-                'observations' => $this->decodeObservations($entity['observations']),
-                'createdAt' => $this->formatTime($entity['created_at']),
-                'updatedAt' => $this->formatTime($entity['updated_at']),
-                'validFrom' => $this->formatTime($entity['valid_from']),
-                'validTo' => $this->formatTime($entity['valid_to']),
-            ];
-        }
-
-        $stmt = $this->pdo->prepare(
-            'SELECT from_entity, to_entity, relation_type, created_at, updated_at, valid_from, valid_to
-             FROM memory_relations
-             WHERE username = :username
-             ORDER BY created_at'
-        );
-        $stmt->execute([':username' => $username]);
-        $relations = [];
-        foreach ($stmt->fetchAll() as $row) {
-            if (!$includeInvalid && !$this->isValidAt($row, $t)) {
-                continue;
-            }
-            $relations[] = [
-                'from' => $row['from_entity'],
-                'to' => $row['to_entity'],
-                'relationType' => $row['relation_type'],
-                'createdAt' => $this->formatTime($row['created_at']),
-                'updatedAt' => $this->formatTime($row['updated_at']),
-                'validFrom' => $this->formatTime($row['valid_from']),
-                'validTo' => $this->formatTime($row['valid_to']),
-            ];
-        }
-
-        return ['entities' => $entities, 'relations' => $relations];
+        return $this->readIndex($username, $t, $includeInvalid, $limit, $offset);
     }
 
     /**
@@ -467,14 +451,22 @@ final class MemoryStore {
      * that is missing, or invalid at the snapshot when `includeInvalid` is off,
      * yields an `error` instead of a partial result.
      *
+     * By default the entries are compact (id/name/type/distance/relationCount,
+     * no observations) and relations are topology-only (from/to/type) so a
+     * routine subgraph read of a large neighborhood stays small — mirroring the
+     * index. Pass `$includeObservations` to include each entity's full
+     * observations (and its creation/validity timestamps) and each relation's
+     * timestamps when the caller really wants the detail.
+     *
      * @return array<string, mixed>
      */
-    private function readSubgraph(string $username, string $rootNameOrId, int $depth, int $t, bool $includeInvalid): array {
+    private function readSubgraph(string $username, string $rootNameOrId, int $depth, int $t, bool $includeInvalid, bool $includeObservations): array {
         $depth = max(0, min(8, $depth));
 
         $root = $this->findEntityFull($username, $rootNameOrId);
         if ($root === null) {
             return [
+                'mode' => 'subgraph',
                 'root' => $rootNameOrId,
                 'depth' => $depth,
                 'entities' => [],
@@ -484,6 +476,7 @@ final class MemoryStore {
         }
         if (!$includeInvalid && !$this->isValidAt($root, $t)) {
             return [
+                'mode' => 'subgraph',
                 'root' => $rootNameOrId,
                 'depth' => $depth,
                 'entities' => [],
@@ -495,22 +488,9 @@ final class MemoryStore {
         $distances = $this->subgraphDistances($username, [$root['id']], $depth, $t, $includeInvalid);
         $ids = array_keys($distances);
 
-        $entities = [];
-        foreach ($this->fullEntitiesById($username, $ids) as $entity) {
-            $entities[] = [
-                'id' => $entity['id'],
-                'name' => $entity['name'],
-                'entityType' => $entity['entity_type'],
-                'observations' => $this->decodeObservations($entity['observations']),
-                'distance' => $distances[$entity['id']],
-                'createdAt' => $this->formatTime($entity['created_at']),
-                'updatedAt' => $this->formatTime($entity['updated_at']),
-                'validFrom' => $this->formatTime($entity['valid_from']),
-                'validTo' => $this->formatTime($entity['valid_to']),
-            ];
-        }
-
         // The induced subgraph: relations whose both endpoints made the cut.
+        // Built first so each entity's `relationCount` reflects the relations
+        // actually returned (the same convention as the entity mode).
         $included = array_fill_keys($ids, true);
         $stmt = $this->pdo->prepare(
             'SELECT from_entity, to_entity, relation_type, created_at, updated_at, valid_from, valid_to
@@ -519,11 +499,95 @@ final class MemoryStore {
              ORDER BY created_at'
         );
         $stmt->execute([':username' => $username]);
+        $relationCounts = array_fill_keys($ids, 0);
         $relations = [];
         foreach ($stmt->fetchAll() as $row) {
             if (!isset($included[$row['from_entity']], $included[$row['to_entity']])) {
                 continue;
             }
+            if (!$includeInvalid && !$this->isValidAt($row, $t)) {
+                continue;
+            }
+            $relationCounts[$row['from_entity']]++;
+            $relationCounts[$row['to_entity']]++;
+            $relations[] = $includeObservations
+                ? [
+                    'from' => $row['from_entity'],
+                    'to' => $row['to_entity'],
+                    'relationType' => $row['relation_type'],
+                    'createdAt' => $this->formatTime($row['created_at']),
+                    'updatedAt' => $this->formatTime($row['updated_at']),
+                    'validFrom' => $this->formatTime($row['valid_from']),
+                    'validTo' => $this->formatTime($row['valid_to']),
+                ]
+                : [
+                    'from' => $row['from_entity'],
+                    'to' => $row['to_entity'],
+                    'relationType' => $row['relation_type'],
+                ];
+        }
+
+        $entities = [];
+        foreach ($this->fullEntitiesById($username, $ids) as $entity) {
+            $entry = [
+                'id' => $entity['id'],
+                'name' => $entity['name'],
+                'entityType' => $entity['entity_type'],
+                'distance' => $distances[$entity['id']],
+                'relationCount' => $relationCounts[$entity['id']],
+                'validFrom' => $this->formatTime($entity['valid_from']),
+                'validTo' => $this->formatTime($entity['valid_to']),
+            ];
+            if ($includeObservations) {
+                $entry['observations'] = $this->decodeObservations($entity['observations']);
+                $entry['createdAt'] = $this->formatTime($entity['created_at']);
+                $entry['updatedAt'] = $this->formatTime($entity['updated_at']);
+            }
+            $entities[] = $entry;
+        }
+
+        return [
+            'mode' => 'subgraph',
+            'root' => $rootNameOrId,
+            'rootId' => $root['id'],
+            'depth' => $depth,
+            'entities' => $entities,
+            'relations' => $relations,
+        ];
+    }
+
+    /**
+     * Full detail for a single entity (matched by name first, then id): its
+     * observations, timestamps, and every relation touching it. This is the
+     * on-demand counterpart to the compact index — the client reads the index
+     * first, then drills into the entities it cares about.
+     *
+     * @return array<string, mixed>
+     */
+    private function readEntity(string $username, string $nameOrId, int $t, bool $includeInvalid): array {
+        $entity = $this->findEntityFull($username, $nameOrId);
+        if ($entity === null) {
+            return [
+                'mode' => 'entity',
+                'error' => "Entity '$nameOrId' not found in this user's graph.",
+            ];
+        }
+        if (!$includeInvalid && !$this->isValidAt($entity, $t)) {
+            return [
+                'mode' => 'entity',
+                'error' => "Entity '$nameOrId' is not valid at the requested time.",
+            ];
+        }
+
+        $stmt = $this->pdo->prepare(
+            'SELECT from_entity, to_entity, relation_type, created_at, updated_at, valid_from, valid_to
+             FROM memory_relations
+             WHERE username = :username AND (from_entity = :id OR to_entity = :id)
+             ORDER BY created_at'
+        );
+        $stmt->execute([':username' => $username, ':id' => $entity['id']]);
+        $relations = [];
+        foreach ($stmt->fetchAll() as $row) {
             if (!$includeInvalid && !$this->isValidAt($row, $t)) {
                 continue;
             }
@@ -539,11 +603,93 @@ final class MemoryStore {
         }
 
         return [
-            'root' => $rootNameOrId,
-            'rootId' => $root['id'],
-            'depth' => $depth,
-            'entities' => $entities,
+            'mode' => 'entity',
+            'entity' => [
+                'id' => $entity['id'],
+                'name' => $entity['name'],
+                'entityType' => $entity['entity_type'],
+                'observations' => $this->decodeObservations($entity['observations']),
+                'relationCount' => count($relations),
+                'createdAt' => $this->formatTime($entity['created_at']),
+                'updatedAt' => $this->formatTime($entity['updated_at']),
+                'validFrom' => $this->formatTime($entity['valid_from']),
+                'validTo' => $this->formatTime($entity['valid_to']),
+            ],
             'relations' => $relations,
+        ];
+    }
+
+    /**
+     * Compact, paginated index of the graph — the default read. One entry per
+     * entity with id, name, type, and its relation count (the number of
+     * relations touching it, in or out, within the same snapshot), but no
+     * observations and no relation list. This is the cheap table of contents:
+     * full observations are loaded on demand via readEntity (one entity) or
+     * readSubgraph (a neighborhood).
+     *
+     * @return array<string, mixed>
+     */
+    private function readIndex(string $username, int $t, bool $includeInvalid, int $limit, int $offset): array {
+        $limit = max(1, min(1000, $limit));
+        $offset = max(0, $offset);
+
+        $totalStmt = $this->pdo->prepare(
+            $includeInvalid
+                ? 'SELECT COUNT(*) FROM memory_entities WHERE username = :username'
+                : 'SELECT COUNT(*) FROM memory_entities
+                   WHERE username = :username AND valid_from <= :asof AND (valid_to IS NULL OR valid_to > :asof)'
+        );
+        $totalStmt->execute($includeInvalid
+            ? [':username' => $username]
+            : [':username' => $username, ':asof' => $t]);
+        $total = (int) $totalStmt->fetchColumn();
+
+        $sql = 'SELECT e.id, e.name, e.entity_type, e.valid_from, e.valid_to,
+                       COUNT(DISTINCT r.rowid) AS relation_count
+                FROM memory_entities e
+                LEFT JOIN memory_relations r
+                  ON r.username = e.username
+                 AND (r.from_entity = e.id OR r.to_entity = e.id)'
+            . ($includeInvalid
+                ? ''
+                : ' AND r.valid_from <= :asof AND (r.valid_to IS NULL OR r.valid_to > :asof)')
+            . '
+                WHERE e.username = :username'
+            . ($includeInvalid
+                ? ''
+                : ' AND e.valid_from <= :asof AND (e.valid_to IS NULL OR e.valid_to > :asof)')
+            . '
+                GROUP BY e.id, e.name, e.entity_type, e.created_at, e.valid_from, e.valid_to
+                ORDER BY e.created_at, e.id
+                LIMIT :limit OFFSET :offset';
+
+        $stmt = $this->pdo->prepare($sql);
+        $stmt->bindValue(':username', $username);
+        if (!$includeInvalid) {
+            $stmt->bindValue(':asof', $t);
+        }
+        $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
+        $stmt->bindValue(':offset', $offset, PDO::PARAM_INT);
+        $stmt->execute();
+
+        $entities = [];
+        foreach ($stmt->fetchAll() as $row) {
+            $entities[] = [
+                'id' => $row['id'],
+                'name' => $row['name'],
+                'entityType' => $row['entity_type'],
+                'relationCount' => (int) $row['relation_count'],
+                'validFrom' => $this->formatTime($row['valid_from']),
+                'validTo' => $this->formatTime($row['valid_to']),
+            ];
+        }
+
+        return [
+            'mode' => 'index',
+            'total' => $total,
+            'limit' => $limit,
+            'offset' => $offset,
+            'entities' => $entities,
         ];
     }
 
