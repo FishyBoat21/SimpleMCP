@@ -8,6 +8,7 @@ use McpServer\Auth\AccountController;
 use McpServer\Auth\ClientStore;
 use McpServer\Auth\Database;
 use McpServer\Auth\DebugLog;
+use McpServer\Auth\MountPath;
 use McpServer\Auth\OAuthServer;
 use McpServer\Auth\TokenStore;
 use McpServer\Auth\UserStore;
@@ -31,6 +32,12 @@ if (php_sapi_name() === 'cli') {
 } else {
     $path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?? '/';
     $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+
+    // Hosted under a virtual directory (e.g. IIS "/SimpleMCP")? REQUEST_URI then
+    // carries the mount prefix while the routes below are app-relative. Strip it
+    // (and any trailing slash) so the route table matches wherever the app runs.
+    $mount = MountPath::from($_SERVER);
+    $path = MountPath::strip($path, $mount);
 
     // OAuth + user-management pages share the same SQLite-backed stores.
     $oauthConfig = require __DIR__ . '/config/oauth.php';
@@ -63,7 +70,7 @@ if (php_sapi_name() === 'cli') {
 
         $post = [];
         parse_str(file_get_contents('php://input'), $post);
-        sendResponse((new AccountController($userStore))->handle($method, $path, $_GET, $post));
+        sendResponse((new AccountController($userStore, $mount))->handle($method, $path, $_GET, $post));
         exit;
     }
 
@@ -81,12 +88,8 @@ if (php_sapi_name() === 'cli') {
         $user = $oauth->resolveUser($token);
         if ($user === null) {
             DebugLog::write("MCP {$method} {$path} token=present => 401 INVALID_TOKEN");
-            $https = ($_SERVER['HTTPS'] ?? '') !== '' && ($_SERVER['HTTPS'] ?? '') !== 'off';
-            $scheme = $https ? 'https' : 'http';
-            $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
-            $origin = $scheme . '://' . $host;
             http_response_code(401);
-            header('WWW-Authenticate: Bearer resource_metadata="' . $origin . '/.well-known/oauth-protected-resource", error="invalid_token"');
+            header('WWW-Authenticate: Bearer resource_metadata="' . $oauth->origin($_SERVER) . '/.well-known/oauth-protected-resource", error="invalid_token"');
             header('Content-Type: application/json; charset=utf-8');
             header('Cache-Control: no-store');
             echo json_encode(['error' => 'invalid_token', 'error_description' => 'The access token is invalid or expired. Re-authenticate via OAuth.']);

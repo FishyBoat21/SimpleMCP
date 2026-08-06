@@ -13,7 +13,11 @@ namespace McpServer\Auth;
  * `{status, headers, body}` shape as {@see OAuthServer::handle()}.
  */
 final class AccountController {
-    public function __construct(private readonly UserStore $users) {}
+    public function __construct(
+        private readonly UserStore $users,
+        /** App mount prefix (e.g. "/SimpleMCP") when hosted under a virtual directory; '' at the site root. */
+        private readonly string $mountPath = '',
+    ) {}
 
     /**
      * @param array<string, mixed> $get
@@ -159,13 +163,13 @@ final class AccountController {
             <dt>Permissions</dt><dd>' . htmlspecialchars(implode(', ', $user->permissions)) . '</dd>
         </dl>
         <h2>Change password</h2>
-        <form method="post" action="/account/change-password">
+        <form method="post" action="' . $this->url('/account/change-password') . '">
             <input type="hidden" name="csrf" value="' . $this->csrf() . '">
             <label>Current password <input type="password" name="old_password" required autocomplete="current-password"></label>
             <label>New password <input type="password" name="new_password" minlength="8" required autocomplete="new-password"></label>
             <button type="submit">Change password</button>
         </form>
-        <form method="post" action="/account/logout">
+        <form method="post" action="' . $this->url('/account/logout') . '">
             <input type="hidden" name="csrf" value="' . $this->csrf() . '">
             <button type="submit" class="secondary">Log out</button>
         </form>';
@@ -175,25 +179,25 @@ final class AccountController {
 
     private function usernamePage(?string $error): array {
         $body = $this->errorHtml($error) . '
-        <form method="post" action="/account/login">
+        <form method="post" action="' . $this->url('/account/login') . '">
             <input type="hidden" name="csrf" value="' . $this->csrf() . '">
             <label>Username <input type="text" name="username" required autofocus autocomplete="username"></label>
             <button type="submit">Continue</button>
         </form>
-        <p class="hint">New user? <a href="/account/onboard">Set up your account</a>.</p>';
+        <p class="hint">New user? <a href="' . $this->url('/account/onboard') . '">Set up your account</a>.</p>';
         return $this->page(200, 'Log in', $body);
     }
 
     private function passwordPage(?string $error, string $identifier): array {
         $body = $this->errorHtml($error) . '
-        <form method="post" action="/account/login">
+        <form method="post" action="' . $this->url('/account/login') . '">
             <input type="hidden" name="csrf" value="' . $this->csrf() . '">
             <input type="hidden" name="username" value="' . htmlspecialchars($identifier, ENT_QUOTES) . '">
             <p class="hint">Logging in as <strong>' . htmlspecialchars($identifier) . '</strong>.</p>
             <label>Password <input type="password" name="password" required autofocus autocomplete="current-password"></label>
             <button type="submit">Log in</button>
         </form>
-        <p class="hint"><a href="/account">Use a different username</a>.</p>';
+        <p class="hint"><a href="' . $this->url('/account') . '">Use a different username</a>.</p>';
         return $this->page(200, 'Log in', $body);
     }
 
@@ -204,7 +208,7 @@ final class AccountController {
             ? '<p class="hint">Username <strong>' . htmlspecialchars($existingUsername, ENT_QUOTES) . '</strong> — cannot be changed.</p>'
             : '<label>Username <input type="text" name="new_username" value="' . htmlspecialchars($username, ENT_QUOTES) . '" required autofocus autocomplete="username"></label>';
         $body = $this->errorHtml($error) . '
-        <form method="post" action="/account/onboard">
+        <form method="post" action="' . $this->url('/account/onboard') . '">
             <input type="hidden" name="csrf" value="' . $this->csrf() . '">
             <input type="hidden" name="existing_username" value="' . htmlspecialchars($existingUsername, ENT_QUOTES) . '">
             ' . $usernameField . '
@@ -212,7 +216,7 @@ final class AccountController {
             <label>Confirm password <input type="password" name="confirm_password" minlength="8" required autocomplete="new-password"></label>
             <button type="submit">Set up my account</button>
         </form>
-        <p class="hint">Already have an account? <a href="/account">Log in</a>.</p>';
+        <p class="hint">Already have an account? <a href="' . $this->url('/account') . '">Log in</a>.</p>';
         return $this->page(200, 'Set up your account', $body);
     }
 
@@ -229,9 +233,14 @@ final class AccountController {
         return isset($post['csrf'], $_SESSION['csrf']) && hash_equals((string) $_SESSION['csrf'], (string) $post['csrf']);
     }
 
+    /** Prefix an app-relative path with the mount prefix (e.g. "/account/login"). */
+    private function url(string $path): string {
+        return $this->mountPath . $path;
+    }
+
     /** @return array{status: int, headers: array<string, string>, body: string} */
     private function redirect(string $location): array {
-        return ['status' => 303, 'headers' => ['Location' => $location], 'body' => ''];
+        return ['status' => 303, 'headers' => ['Location' => $this->url($location)], 'body' => ''];
     }
 
     /** @return array{status: int, headers: array<string, string>, body: string} */
