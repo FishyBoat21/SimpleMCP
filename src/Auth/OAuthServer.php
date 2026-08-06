@@ -22,6 +22,9 @@ use McpServer\UserContext;
  * Returns plain `{status, headers, body}` arrays so index.php can emit them.
  */
 final class OAuthServer {
+    /** App mount prefix (e.g. "/SimpleMCP") when hosted under a virtual directory; '' at the site root. */
+    private string $mountPath = '';
+
     public function __construct(
         private readonly UserStore $users,
         private readonly TokenStore $tokens,
@@ -60,6 +63,7 @@ final class OAuthServer {
     public function handle(string $method, string $path, array $server, array $get, string $rawBody): array {
         $post = [];
         parse_str($rawBody, $post);
+        $this->mountPath = MountPath::from($server);
 
         return match ($path) {
             '/oauth/authorize' => $method === 'GET' || $method === 'POST'
@@ -411,12 +415,18 @@ final class OAuthServer {
         ];
     }
 
-    /** @param array<string, mixed> $server */
-    private function origin(array $server): string {
+    /**
+     * Absolute base URL the server advertises (scheme://host, plus the mount
+     * prefix when hosted under a virtual directory). Public so index.php can
+     * build the 401 resource_metadata URL.
+     *
+     * @param array<string, mixed> $server
+     */
+    public function origin(array $server): string {
         $https = ($server['HTTPS'] ?? '') !== '' && ($server['HTTPS'] ?? '') !== 'off';
         $scheme = $https ? 'https' : 'http';
         $host = $server['HTTP_HOST'] ?? 'localhost';
-        return $scheme . '://' . $host;
+        return $scheme . '://' . $host . MountPath::from($server);
     }
 
     // ---- helpers ------------------------------------------------------------
@@ -462,16 +472,21 @@ final class OAuthServer {
 
     // ---- rendering ----------------------------------------------------------
 
+    /** Prefix an app-relative path with the mount prefix ("/oauth/authorize" => "/SimpleMCP/oauth/authorize"). */
+    private function appPath(string $path): string {
+        return $this->mountPath . $path;
+    }
+
     private function usernamePage(?string $error, string $identifier, string $clientId, string $redirectUri, string $challenge, string $challengeMethod, string $state, string $scope): array {
         $body = '
         <p class="hint">Log in to grant <strong>' . htmlspecialchars($clientId) . '</strong> access to this MCP server.</p>' .
         $this->errorHtml($error) . '
-        <form method="post" action="/oauth/authorize">
+        <form method="post" action="' . $this->appPath('/oauth/authorize') . '">
             ' . $this->oauthFields($clientId, $redirectUri, $challenge, $challengeMethod, $state, $scope) . '
             <label>Username <input type="text" name="username" value="' . htmlspecialchars($identifier, ENT_QUOTES) . '" required autofocus></label>
             <button type="submit">Continue</button>
         </form>
-        <p class="hint">New user? <a href="/account/onboard">Set up your account</a>.</p>' .
+        <p class="hint">New user? <a href="' . $this->appPath('/account/onboard') . '">Set up your account</a>.</p>' .
         $this->anonymousForm($clientId, $redirectUri, $challenge, $challengeMethod, $state, $scope);
         return $this->page(200, 'Log in', $body);
     }
@@ -480,14 +495,14 @@ final class OAuthServer {
         $body = '
         <p class="hint">Log in to grant <strong>' . htmlspecialchars($clientId) . '</strong> access to this MCP server.</p>' .
         $this->errorHtml($error) . '
-        <form method="post" action="/oauth/authorize">
+        <form method="post" action="' . $this->appPath('/oauth/authorize') . '">
             ' . $this->oauthFields($clientId, $redirectUri, $challenge, $challengeMethod, $state, $scope)
             . $this->hidden('username', $identifier) . '
             <p class="hint">Logging in as <strong>' . htmlspecialchars($identifier) . '</strong>.</p>
             <label>Password <input type="password" name="password" required autofocus autocomplete="current-password"></label>
             <button type="submit">Log in</button>
         </form>
-        <p class="hint"><a href="/oauth/authorize?' . htmlspecialchars(http_build_query([
+        <p class="hint"><a href="' . $this->appPath('/oauth/authorize') . '?' . htmlspecialchars(http_build_query([
             'client_id' => $clientId,
             'redirect_uri' => $redirectUri,
             'code_challenge' => $challenge,
@@ -515,7 +530,7 @@ final class OAuthServer {
     private function anonymousForm(string $clientId, string $redirectUri, string $challenge, string $challengeMethod, string $state, string $scope): string {
         return '<div class="anon">
         <p class="hint">No account? Continue <strong>anonymously</strong> — you will only be able to use public tools.</p>
-        <form method="post" action="/oauth/authorize">
+        <form method="post" action="' . $this->appPath('/oauth/authorize') . '">
             ' . $this->oauthFields($clientId, $redirectUri, $challenge, $challengeMethod, $state, $scope)
             . $this->hidden('anonymous', '1') . '
             <button type="submit">Continue anonymously</button>
@@ -535,7 +550,7 @@ final class OAuthServer {
         $body = '
         <p class="hint">Your account has not been set up yet. Choose a password to finish creating it.</p>' .
         $this->errorHtml($error) . '
-        <form method="post" action="/oauth/authorize">
+        <form method="post" action="' . $this->appPath('/oauth/authorize') . '">
             ' . $this->hidden('onboard', '1') . $this->hidden('existing_username', $username)
             . $this->oauthFields($clientId, $redirectUri, $challenge, $challengeMethod, $state, $scope) . '
             ' . $usernameField . '
