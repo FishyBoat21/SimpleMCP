@@ -44,7 +44,7 @@ readonly class MemoryTool {
     #[McpFunction(
         name: 'create_entities',
         roles: self::REQUIRED_ROLES,
-        description: 'Create new entities in the knowledge graph. Adds new objects, persons, or concepts to the persistent graph. Idempotent: re-creating an existing id replaces that entity.',
+        description: 'Create new entities in the knowledge graph. Adds new objects, persons, or concepts to the persistent graph. Idempotent: re-creating an existing id replaces that entity. Reports (but never blocks on) existing entities with the same name+entityType, with their owning projects, so you can merge same-project forks and ignore cross-project basename collisions.',
         schema: [
             'type' => 'object',
             'properties' => [
@@ -78,15 +78,26 @@ readonly class MemoryTool {
             return [['type' => 'text', 'text' => "Error: 'entities' must be a non-empty array."]];
         }
 
-        $ids = (new MemoryStore())->createEntities($user->username, $entities);
-        $label = count($ids) === 1 ? 'entity' : 'entities';
+        $result = (new MemoryStore())->createEntities($user->username, $entities);
+        $ids = $result['ids'];
+        $duplicates = $result['duplicates'];
 
-        return [
-            [
-                'type' => 'text',
-                'text' => "Successfully created or updated " . count($ids) . " $label: " . implode(', ', $ids),
-            ],
-        ];
+        $lines = [];
+        if ($ids !== []) {
+            $label = count($ids) === 1 ? 'entity' : 'entities';
+            $lines[] = 'Successfully created or updated ' . count($ids) . " $label: " . implode(', ', $ids);
+        }
+        foreach ($duplicates as $requested => $matches) {
+            foreach ($matches as $match) {
+                $root = $match['roots'] !== [] ? ' in project ' . implode('/', $match['roots']) : ' (no owning project)';
+                $lines[] = "Note: '$requested' shares name+type with existing '{$match['id']}'$root — if it's the same entity, merge_entities keep='{$match['id']}' absorb=['$requested'].";
+            }
+        }
+        if ($lines === []) {
+            $lines[] = 'No entities created.';
+        }
+
+        return [['type' => 'text', 'text' => implode("\n", $lines)]];
     }
 
     #[McpFunction(
@@ -130,6 +141,9 @@ readonly class MemoryTool {
         }
         foreach ($result['errors'] as $error) {
             $lines[] = "Warning: $error";
+        }
+        foreach ($result['warnings'] as $warning) {
+            $lines[] = "Note: $warning";
         }
         if ($lines === []) {
             $lines[] = 'No relations created (all were duplicates or missing endpoints).';
@@ -181,6 +195,9 @@ readonly class MemoryTool {
         foreach ($result['errors'] as $error) {
             $lines[] = "Warning: $error";
         }
+        foreach ($result['warnings'] as $warning) {
+            $lines[] = "Warning: $warning";
+        }
         if ($lines === []) {
             $lines[] = 'No observations added.';
         }
@@ -222,6 +239,9 @@ readonly class MemoryTool {
         }
         foreach ($result['errors'] as $error) {
             $lines[] = "Warning: $error";
+        }
+        foreach ($result['warnings'] as $warning) {
+            $lines[] = "Warning: $warning";
         }
         if ($lines === []) {
             $lines[] = 'No entities deleted.';
@@ -310,18 +330,30 @@ readonly class MemoryTool {
                     'default' => 100,
                     'minimum' => 1,
                     'maximum' => 1000,
-                    'description' => 'Index mode only: maximum number of index entries to return (pagination). Default 100.',
+                    'description' => 'Index and subgraph modes: maximum number of entries to return per page. Default 100.',
                 ],
                 'offset' => [
                     'type' => 'integer',
                     'default' => 0,
                     'minimum' => 0,
-                    'description' => 'Index mode only: number of index entries to skip (pagination). Default 0.',
+                    'description' => 'Index and subgraph modes: number of entries to skip (pagination). Default 0.',
                 ],
                 'include_observations' => [
                     'type' => 'boolean',
                     'default' => false,
                     'description' => 'Subgraph mode only: when true, each subgraph entity also carries its full observations (and creation/validity timestamps). Off by default so routine subgraph reads stay compact; prefer `entity_id` or search_graph for targeted observation detail.',
+                ],
+                'projection' => [
+                    'type' => 'string',
+                    'enum' => ['entities', 'edges', 'both'],
+                    'default' => 'both',
+                    'description' => 'Subgraph mode only: what to return — `both` (entities + relations, default), `entities` (entities only), or `edges` (relations only).',
+                ],
+                'direction' => [
+                    'type' => 'string',
+                    'enum' => ['incoming', 'outgoing', 'both'],
+                    'default' => 'both',
+                    'description' => 'Subgraph mode only: traversal direction — `outgoing` follows from→to, `incoming` to→from, `both` traverses undirected (default).',
                 ],
             ],
         ]
@@ -346,6 +378,8 @@ readonly class MemoryTool {
             (int) ($arguments['limit'] ?? 100),
             (int) ($arguments['offset'] ?? 0),
             (bool) ($arguments['include_observations'] ?? false),
+            (string) ($arguments['projection'] ?? 'both'),
+            (string) ($arguments['direction'] ?? 'both'),
         );
 
         return [
@@ -385,6 +419,17 @@ readonly class MemoryTool {
                     'description' => 'Breadth-first traversal depth over relations from matched entities; 0 disables graph expansion.',
                 ],
                 'as_of' => ['description' => 'Optional: Unix timestamp or ISO-8601 datetime. Only facts valid at that time are searched. Defaults to now.'],
+                'include_relations' => [
+                    'type' => 'boolean',
+                    'default' => false,
+                    'description' => 'When true, each result also carries its direct relations (from/to/relationType) so a hit is traceable in one call.',
+                ],
+                'direction' => [
+                    'type' => 'string',
+                    'enum' => ['incoming', 'outgoing', 'both'],
+                    'default' => 'both',
+                    'description' => 'Traversal direction for `hops` graph expansion: outgoing/incoming/both (default).',
+                ],
             ],
             'required' => ['query'],
         ]
@@ -398,8 +443,115 @@ readonly class MemoryTool {
             (int) ($arguments['top_k'] ?? 10),
             (int) ($arguments['hops'] ?? 1),
             $arguments['as_of'] ?? null,
+            (bool) ($arguments['include_relations'] ?? false),
+            (string) ($arguments['direction'] ?? 'both'),
         );
 
+        return [['type' => 'text', 'text' => json_encode($result, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)]];
+    }
+
+    #[McpFunction(
+        name: 'merge_entities',
+        roles: self::REQUIRED_ROLES,
+        description: 'Collapse duplicate entities into one canonical node. The `keep` entity (matched by name first, then id) absorbs each `absorb` entity: observations are merged (deduped), relations are re-pointed onto keep, then absorb is deleted. Atomic — a failed merge leaves the graph unchanged.',
+        schema: [
+            'type' => 'object',
+            'properties' => [
+                'keep' => ['type' => 'string', 'description' => 'Id (or name) of the entity to keep.'],
+                'absorb' => [
+                    'type' => 'array',
+                    'description' => 'Ids (or names) of the entities to fold into keep.',
+                    'items' => ['type' => 'string'],
+                ],
+            ],
+            'required' => ['keep', 'absorb'],
+        ]
+    )]
+    public function mergeEntities(array $arguments, ?UserContext $user = null): array {
+        $user ??= UserContext::anonymous();
+        $keep = (string) ($arguments['keep'] ?? '');
+        $absorb = $arguments['absorb'] ?? null;
+        if ($keep === '' || !is_array($absorb) || $absorb === []) {
+            return [['type' => 'text', 'text' => "Error: 'keep' and a non-empty 'absorb' array are required."]];
+        }
+
+        $result = (new MemoryStore())->mergeEntities($user->username, $keep, array_map('strval', $absorb));
+
+        $lines = [];
+        if ($result['absorbed'] !== []) {
+            $suffix = count($result['absorbed']) === 1 ? 'y' : 'ies';
+            $lines[] = "Merged " . count($result['absorbed']) . " entit$suffix into '{$result['keep']}': " . implode(', ', $result['absorbed']) . '.';
+            $lines[] = "Moved {$result['observationsMerged']} observation(s) and {$result['relationsMoved']} relation(s).";
+        }
+        foreach ($result['errors'] as $error) {
+            $lines[] = "Warning: $error";
+        }
+        foreach ($result['warnings'] as $warning) {
+            $lines[] = "Warning: $warning";
+        }
+        if ($lines === []) {
+            $lines[] = 'Nothing merged.';
+        }
+        return [['type' => 'text', 'text' => implode("\n", $lines)]];
+    }
+
+    #[McpFunction(
+        name: 'search_relations',
+        roles: self::REQUIRED_ROLES,
+        description: 'Search relations directly. Filter by exact relationType and/or by an endpoint entity (matched by name first, then id), with direction choosing outgoing/incoming/either edges from that entity. With no filters, returns all edges (paginated).',
+        schema: [
+            'type' => 'object',
+            'properties' => [
+                'relation_type' => ['type' => 'string', 'description' => 'Optional: exact relation type to match, e.g. "uses".'],
+                'entity' => ['type' => 'string', 'description' => 'Optional: entity id (or name) to match as an endpoint.'],
+                'direction' => [
+                    'type' => 'string',
+                    'enum' => ['outgoing', 'incoming', 'both'],
+                    'default' => 'both',
+                    'description' => 'Which edges from `entity` to match: outgoing (entity→x), incoming (x→entity), or both (default).',
+                ],
+                'limit' => ['type' => 'integer', 'default' => 100, 'minimum' => 1, 'maximum' => 1000, 'description' => 'Maximum relations to return.'],
+                'offset' => ['type' => 'integer', 'default' => 0, 'minimum' => 0, 'description' => 'Relations to skip.'],
+                'as_of' => ['description' => 'Optional: only relations valid at this instant (defaults to now).'],
+            ],
+        ]
+    )]
+    public function searchRelations(array $arguments, ?UserContext $user = null): array {
+        $user ??= UserContext::anonymous();
+        $relationType = $arguments['relation_type'] ?? null;
+        if (!is_string($relationType) || $relationType === '') {
+            $relationType = null;
+        }
+        $entity = $arguments['entity'] ?? null;
+        if (!is_string($entity) || $entity === '') {
+            $entity = null;
+        }
+
+        $result = (new MemoryStore())->searchRelations(
+            $user->username,
+            $relationType,
+            $entity,
+            (string) ($arguments['direction'] ?? 'both'),
+            (int) ($arguments['limit'] ?? 100),
+            (int) ($arguments['offset'] ?? 0),
+            $arguments['as_of'] ?? null,
+        );
+
+        return [['type' => 'text', 'text' => json_encode($result, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)]];
+    }
+
+    #[McpFunction(
+        name: 'graph_summary',
+        roles: self::REQUIRED_ROLES,
+        description: 'Health/introspection for the current user\'s knowledge graph: node and edge counts, a relation-type histogram, duplicate name+entityType groups (the anomaly merge_entities fixes), and the orphan count (entities with no relations). Cheap — no full traversal.',
+        schema: [
+            'type' => 'object',
+            'properties' => new \stdClass(), // encodes as {} so MCP clients accept it as a record
+        ]
+    )]
+    public function graphSummary(array $arguments, ?UserContext $user = null): array {
+        $user ??= UserContext::anonymous();
+        $result = (new MemoryStore())->summary($user->username);
         return [['type' => 'text', 'text' => json_encode($result, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)]];
     }
 
@@ -432,6 +584,9 @@ readonly class MemoryTool {
         if ($result['relationsInvalidated'] > 0) {
             $label = $result['relationsInvalidated'] === 1 ? 'relation' : 'relations';
             $text .= " Also invalidated {$result['relationsInvalidated']} $label touching it.";
+        }
+        if (($result['warning'] ?? null) !== null) {
+            $text .= ' Warning: ' . $result['warning'];
         }
         return [['type' => 'text', 'text' => $text]];
     }
