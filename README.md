@@ -23,11 +23,17 @@ printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n{"jsonrpc":"
   tools are hidden from `tools/list` and rejected at `tools/call` with JSON-RPC `-32001`.
 - **User context** — the current `UserContext` is injected into any tool method that asks
   for it. In stdio mode every request runs as a trusted `local` user with full access.
+- **Persistent knowledge graph** — a per-user SQLite graph (`data/memory.sqlite`) exposing the
+  standard MCP memory interface (`create_entities`, `create_relations`, `add_observations`,
+  `read_graph`) plus search, temporal invalidation, entity merging, and graph summaries.
+- **Documents & RAG** — ingest text documents into a per-user chunked store and retrieve them
+  with keyword (BM25), semantic, or hybrid (RRF) strategies, optionally fused with graph search.
 - **Self-hosted OAuth 2.1** — interactive login page, token endpoint, RFC 7591 dynamic
   client registration, RFC 8414 / RFC 9728 discovery. Tokens are sha256-hashed at rest.
 - **User management page** (`/account`) — login, public onboarding, change password, logout.
 - **SQLite storage** — users, OAuth clients, and tokens in `data/app.sqlite` (gitignored),
-  seeded from [config/users.php](config/users.php) on first run.
+  seeded from [config/users.php](config/users.php) on first run; the knowledge graph and
+  document store live in their own `data/memory.sqlite`.
 - **No dependencies** — `composer.json` declares only `php >= 8.4`.
 
 ## Requirements
@@ -69,7 +75,10 @@ else).
 
 ## Included tools
 
-All tools on this branch are examples that demonstrate the server's capabilities:
+### Sample tools
+
+Small examples that demonstrate the server's capabilities (attribute registration,
+access control, and `UserContext` injection):
 
 | Tool | Description | Access |
 |------|-------------|--------|
@@ -82,6 +91,103 @@ All tools on this branch are examples that demonstrate the server's capabilities
 | `get_system_time` | Current server time (ISO 8601) | public |
 | `get_current_user` | The authenticated caller (username, name, roles, permissions) | public |
 | `server_status` | Server runtime info | **admin** (`roles: ['admin']`) |
+
+### Memory graph tools
+
+The persistent knowledge graph — see [Knowledge graph & RAG](#knowledge-graph--rag).
+Every tool here requires the caller to hold the `user` or `admin` role.
+
+| Tool | What it does |
+|------|--------------|
+| `create_entities` | Create or upsert entities (`id`, `name`, `entityType`, optional observations and `validFrom`). Reports existing same-name+type entities with their owning project. |
+| `create_relations` | Link existing entities with a directed edge (`from`, `to`, `relationType`). Duplicates are ignored; unknown relation types warn. |
+| `add_observations` | Append facts to an entity (matched by name, then id), deduplicated. |
+| `read_graph` | Lazy, paginated reads: a compact index (default), one entity (`entity_id`), or the subgraph within `depth` hops of `root`. Honors `as_of` / `includeInvalid`. |
+| `search_graph` | keyword (BM25 via FTS5), semantic (character-trigram), or hybrid (RRF) search; `hops` adds breadth-first expansion through relations. |
+| `delete_entities` | Delete by name-or-id; cascades to touching relations. |
+| `delete_relations` | Delete edges by exact `from`/`to`/`relationType` spec. |
+| `invalidate_entity` | Close the validity window instead of deleting (history preserved); cascades to touching relations. |
+| `invalidate_relation` | Close an edge's validity window instead of deleting. |
+| `merge_entities` | Fold duplicate entities into one canonical node (observations merged, relations re-pointed, atomic). |
+| `search_relations` | Filter edges directly by relation type and/or endpoint, with direction. |
+| `graph_summary` | Health/introspection: node/edge counts, relation-type histogram, duplicate groups, orphans. |
+
+### Knowledge-base (RAG) tools
+
+Document ingestion and retrieval — same login requirement as the graph tools.
+
+| Tool | What it does |
+|------|--------------|
+| `ingest_document` | Chunk and store a text document (txt/markdown/csv/json/html/code); re-ingesting an existing id replaces that document. |
+| `retrieve` | RAG over chunks: keyword / semantic / hybrid (default); `include_graph` also fuses matching graph entities. |
+| `list_documents` | List ingested documents with metadata. |
+| `get_document` | Fetch one document's full text, chunks in order. |
+| `delete_document` | Delete a document and its chunks. |
+
+## Knowledge graph & RAG
+
+Beyond the sample tools, this branch adds a full **memory toolset**: a persistent, per-user
+knowledge graph plus a document knowledge base with retrieval — all implemented with zero
+extra dependencies (SQLite + PHP's built-in FTS5).
+
+### The graph
+
+[src/Auth/MemoryStore.php](src/Auth/MemoryStore.php) stores the graph in its own SQLite file,
+`data/memory.sqlite` (tables `memory_entities` / `memory_relations` plus an FTS5 mirror
+`memory_entities_fts`), separate from the auth database. Every row carries the calling user's
+`username`, so each account reads and writes only its own subgraph (in stdio mode all requests
+run as the trusted `local` user).
+
+- **Login required** — every memory tool declares `roles: ['user', 'admin']`, so anonymous
+  HTTP callers get none of them in `tools/list` and a `-32001` access-denied on direct
+  `tools/call`. The seed accounts `admin`, `alice`, and `bob` all hold the `user` role.
+- **Temporal facts** — entities and relations carry a transaction timeline
+  (`createdAt`/`updatedAt`) and a validity window (`validFrom`/`validTo`). `invalidate_entity`
+  (which cascades to touching relations) and `invalidate_relation` close the window instead of
+  deleting, so history survives. `read_graph` / `search_graph` accept `as_of` to look back in
+  time and `includeInvalid` to reveal closed windows; re-creating an invalidated relation
+  re-activates it.
+- **Lazy, paginated reads** — `read_graph` returns a compact index by default (id/name/type/
+  relation count, paginated via `limit`/`offset`). Pass `entity_id` for one entity's
+  observations and every relation touching it, or `root` + `depth` (0–8) for the subgraph
+  within that many relation hops (optionally `include_observations`, and `projection` /
+  `direction` to shape the result).
+- **Search** — `search_graph(query, search_type, top_k, hops, ...)`: keyword = BM25 over the
+  FTS5 index, semantic = character-trigram similarity with corpus-level IDF weighting
+  (resilient to typos and CJK text that FTS5's tokenizer can't split), hybrid = both fused with
+  Reciprocal Rank Fusion. `hops > 0` adds breadth-first graph traversal through up to `hops`
+  relation hops from the matches, directed by `direction`.
+- **Graph hygiene** — `merge_entities` collapses duplicates atomically (observations merged,
+  relations re-pointed); `search_relations` filters edges directly; `graph_summary` reports
+  node/edge counts, a relation-type histogram, duplicate groups, and orphans. `create_entities`
+  is root-aware: it never blocks creation but reports any existing entity sharing
+  `name` + `entityType` together with its owning project, so only same-project forks warrant a
+  merge.
+
+### Documents & RAG
+
+[src/Auth/DocumentStore.php](src/Auth/DocumentStore.php) ingests free-form text documents
+(txt/markdown/csv/json/html/code) into a per-user chunked store (`memory_documents` /
+`memory_chunks` + FTS5 mirror `memory_chunks_fts`) in the same `data/memory.sqlite`.
+
+- `ingest_document` chunks the text at paragraph then line boundaries, greedily packing to
+  `chunk_size` (default 1000 chars, clamped 50–8000) with `chunk_overlap` (default 150)
+  characters carried across boundaries so context isn't cut off. Re-ingesting an existing id
+  replaces that document.
+- `retrieve` returns the most relevant chunks for a query with the same keyword/semantic/hybrid
+  strategies (default hybrid). `include_graph: true` also runs `search_graph` and appends the
+  matching entities under an `entities` key, so one call covers both stores.
+- `list_documents` / `get_document` / `delete_document` list, read, and cascade-delete ingested
+  documents.
+
+Documents carry `created_at`/`updated_at` but no validity window — document content is not a
+temporal fact, so there is no `as_of` / `invalidate` plumbing for them.
+
+The graph tools work in stdio mode too (the injected `local` user has full access):
+
+```sh
+printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"graph_summary","arguments":{}}}\n' | php index.php
+```
 
 ## Adding a tool
 
@@ -159,11 +265,14 @@ table is empty. On this branch the seed is:
 
 | Username | Password | Roles | Status |
 |----------|----------|-------|--------|
-| `admin` | `admin123` | `admin` | active |
+| `admin` | `admin123` | `admin, user` | active |
 | `alice` | `secret` | `user` | active |
 | `bob` | *(none yet)* | `user` | pending |
 
 > These are dev-only seed credentials — change them before deploying anywhere real.
+
+On this branch the memory and knowledge-base tools additionally require the `user` or `admin`
+role, so only logged-in accounts can use them (all three seed accounts hold `user`).
 
 A user added with no password (status `pending`) must complete **onboarding**: the first time
 they log in — via `/account` or the OAuth flow a tool call triggers — they are asked to set a
@@ -230,23 +339,27 @@ src/
   McpServer.php               MCP core: tool registry, routing, access control, UserContext injection
   UserContext.php             immutable user value object (local() / anonymous() factories, * wildcard)
   Attributes/McpFunction.php  the #[McpFunction(name, description, schema, roles, permissions)] attribute
-  Tools/                      auto-discovered tool classes (CalculatorTool, AdminTool, ...)
+  Tools/                      auto-discovered tool classes (CalculatorTool, AdminTool,
+                              MemoryTool, KnowledgeBaseTool, ...)
   Auth/
     Database.php              SQLite bootstrap + idempotent schema + user seeding
     UserStore.php             DB-backed accounts: auth, onboarding, change password
+    MemoryStore.php           per-user knowledge graph + FTS5 search (data/memory.sqlite)
+    DocumentStore.php         per-user chunked document store + RAG retrieval
     TokenStore.php            OAuth codes/access/refresh tokens (sha256-hashed, single-use, rotating)
     ClientStore.php           OAuth client registry: static config + RFC 7591 dynamic clients
     OAuthServer.php           authorize/token/register/discovery + resolveUser()
     AccountController.php     /account user-management pages (native sessions + CSRF)
     DebugLog.php              append-only diagnostics log to data/requests.log
-data/                         runtime-only, gitignored (app.sqlite, requests.log, sessions/)
+data/                         runtime-only, gitignored (app.sqlite, memory.sqlite,
+                              requests.log, sessions/)
 ```
 
 ## Notes & gotchas
 
 - `data/` is runtime-only and gitignored (`/data/*`): `app.sqlite` (users + tokens),
-  `requests.log`, `sessions/`. Deleting it re-seeds users from `config/users.php` on the next
-  HTTP start.
+  `memory.sqlite` (knowledge graph + document store), `requests.log`, `sessions/`. Deleting it
+  re-seeds users from `config/users.php` on the next HTTP start.
 - Run the dev server with `php -S localhost:8000 index.php` so `data/` is never served
   statically.
 - The `try/catch` in `processMethod()` catches `Throwable`, so PHP `Error`s escaping a tool
