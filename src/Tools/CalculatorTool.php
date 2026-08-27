@@ -74,7 +74,7 @@ readonly class CalculatorTool {
         return [
             [
                 'type' => 'text',
-                'text' => "The result of $a / $b is " . (round($a / $b,2))
+                'text' => "The result of $a / $b is " . ($a / $b)
             ]
         ];
     }
@@ -98,7 +98,7 @@ readonly class CalculatorTool {
         return [
             [
                 'type' => 'text',
-                'text' => "The result of $a * $b is " . round($a * $b, 2)
+                'text' => "The result of $a * $b is " . ($a * $b)
             ]
         ];
     }
@@ -122,7 +122,7 @@ readonly class CalculatorTool {
         return [
             [
                 'type' => 'text',
-                'text' => "The result of $base ^ $exponent is " . round(pow($base, $exponent), 2)
+                'text' => "The result of $base ^ $exponent is " . pow($base, $exponent)
             ]
         ];
     }
@@ -165,9 +165,9 @@ readonly class CalculatorTool {
         return [
             [
                 'type' => 'text',
-                'text' => "Monthly Installment: " . round($installment, 2) . "\n" .
-                          "Total Amount Paid: " . round($total_paid, 2) . "\n" .
-                          "Total Interest Paid: " . round($total_interest, 2)
+                'text' => "Monthly Installment: " . $installment . "\n" .
+                          "Total Amount Paid: " . $total_paid . "\n" .
+                          "Total Interest Paid: " . $total_interest
             ]
         ];
     }

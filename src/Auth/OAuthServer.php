@@ -38,6 +38,12 @@ final class OAuthServer {
         if ($row === null) {
             return null;
         }
+        // Tokens issued via the "continue anonymously" action on the login page
+        // are bound to a reserved identity that maps to the anonymous user, who
+        // only sees/calls public tools (no roles/permissions requirements).
+        if ((string) $row['username'] === UserStore::ANONYMOUS_USERNAME) {
+            return UserContext::anonymous();
+        }
         $user = $this->users->getByUsername((string) $row['username']);
         if ($user === null) {
             return null;
@@ -107,6 +113,14 @@ final class OAuthServer {
             return $this->usernamePage(null, '', $clientId, $redirectUri, $challenge, $challengeMethod, $state, $scope);
         }
 
+        // "Continue anonymously": grant the authorization code without a login,
+        // bound to the reserved anonymous identity. The client / redirect_uri /
+        // PKCE checks above still apply; the resulting token only unlocks public
+        // tools (see resolveUser()).
+        if (($params['anonymous'] ?? '') === '1') {
+            return $this->issueAnonymousCodeAndRedirect($clientId, $redirectUri, $challenge, $challengeMethod, $state);
+        }
+
         // Login form submitted with an onboarding payload.
         if (($params['onboard'] ?? '') === '1') {
             return $this->completeOnboarding($params, $clientId, $redirectUri, $challenge, $challengeMethod, $state, $scope);
@@ -165,6 +179,17 @@ final class OAuthServer {
         // Re-render. Pending users keep their provisioned username.
         $row = $this->users->getByUsername($existingUsername);
         return $this->onboardingPage($row !== null ? $row : ['username' => $existingUsername !== '' ? $existingUsername : $newUsername], $clientId, $redirectUri, $challenge, $challengeMethod, $state, $scope, $error);
+    }
+
+    /**
+     * Issue an authorization code bound to the reserved anonymous identity, so
+     * the client can complete the token exchange without an account.
+     */
+    private function issueAnonymousCodeAndRedirect(string $clientId, string $redirectUri, string $challenge, string $challengeMethod, string $state): array {
+        return $this->issueCodeAndRedirect(
+            ['username' => UserStore::ANONYMOUS_USERNAME],
+            $clientId, $redirectUri, $challenge, $challengeMethod, $state,
+        );
     }
 
     /** @param array<string, mixed> $user */
@@ -446,7 +471,8 @@ final class OAuthServer {
             <label>Username <input type="text" name="username" value="' . htmlspecialchars($identifier, ENT_QUOTES) . '" required autofocus></label>
             <button type="submit">Continue</button>
         </form>
-        <p class="hint">New user? <a href="/account/onboard">Set up your account</a>.</p>';
+        <p class="hint">New user? <a href="/account/onboard">Set up your account</a>.</p>' .
+        $this->anonymousForm($clientId, $redirectUri, $challenge, $challengeMethod, $state, $scope);
         return $this->page(200, 'Log in', $body);
     }
 
@@ -468,7 +494,8 @@ final class OAuthServer {
             'code_challenge_method' => $challengeMethod,
             'state' => $state,
             'scope' => $scope,
-        ]), ENT_QUOTES) . '">Use a different username</a>.</p>';
+        ]), ENT_QUOTES) . '">Use a different username</a>.</p>' .
+        $this->anonymousForm($clientId, $redirectUri, $challenge, $challengeMethod, $state, $scope);
         return $this->page(200, 'Log in', $body);
     }
 
@@ -477,6 +504,23 @@ final class OAuthServer {
         return $this->hidden('client_id', $clientId) . $this->hidden('redirect_uri', $redirectUri)
             . $this->hidden('code_challenge', $challenge) . $this->hidden('code_challenge_method', $challengeMethod)
             . $this->hidden('state', $state) . $this->hidden('scope', $scope);
+    }
+
+    /**
+     * The "continue anonymously" action shown alongside each login step: posts
+     * the OAuth parameters back with `anonymous=1` so handleAuthorize() issues
+     * the grant without an account. The token maps to the anonymous user, who
+     * only sees/calls public tools.
+     */
+    private function anonymousForm(string $clientId, string $redirectUri, string $challenge, string $challengeMethod, string $state, string $scope): string {
+        return '<div class="anon">
+        <p class="hint">No account? Continue <strong>anonymously</strong> — you will only be able to use public tools.</p>
+        <form method="post" action="/oauth/authorize">
+            ' . $this->oauthFields($clientId, $redirectUri, $challenge, $challengeMethod, $state, $scope)
+            . $this->hidden('anonymous', '1') . '
+            <button type="submit">Continue anonymously</button>
+        </form>
+        </div>';
     }
 
     /**
@@ -498,7 +542,8 @@ final class OAuthServer {
             <label>Password <input type="password" name="new_password" minlength="8" required></label>
             <label>Confirm password <input type="password" name="confirm_password" minlength="8" required></label>
             <button type="submit">Set up my account</button>
-        </form>';
+        </form>' .
+        $this->anonymousForm($clientId, $redirectUri, $challenge, $challengeMethod, $state, $scope);
         return $this->page(200, 'Set up your account', $body);
     }
 
@@ -519,6 +564,7 @@ final class OAuthServer {
             . 'h1{font-size:1.4rem}.hint{color:#555;font-size:.9rem}.error{color:#b00020;background:#fdecea;border:1px solid #f5c6c2;padding:.5rem .75rem;border-radius:6px;margin-bottom:1rem}'
             . 'label{display:block;margin-bottom:.9rem;font-size:.9rem}input{width:100%;box-sizing:border-box;padding:.55rem .6rem;margin-top:.25rem;border:1px solid #ccc;border-radius:6px}'
             . 'button{width:100%;padding:.6rem;background:#2563eb;color:#fff;border:0;border-radius:6px;font-size:1rem;cursor:pointer}a{color:#2563eb}'
+            . '.anon{margin-top:1.5rem;padding-top:1rem;border-top:1px solid #e5e5e5}.anon button{background:#fff;color:#2563eb;border:1px solid #2563eb}'
             . '</style></head><body><h1>' . htmlspecialchars($title) . '</h1>' . $body . '</body></html>';
         return [
             'status' => $status,
