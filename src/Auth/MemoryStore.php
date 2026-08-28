@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace McpServer\Auth;
 
 use PDO;
+use PDOStatement;
 use SplQueue;
 
 /**
@@ -30,6 +31,32 @@ use SplQueue;
  */
 final class MemoryStore {
     private PDO $pdo;
+
+    /**
+     * Relation-type vocabulary (B7). Not exhaustive and not enforced — unknown
+     * types are still stored — but createRelations warns on any type outside
+     * this list so the vocabulary stays defined rather than drifting into
+     * ad-hoc labels.
+     */
+    private const KNOWN_RELATION_TYPES = [
+        'contains', 'uses', 'decided', 'entry_point', 'core_component',
+        'configured_by', 'targets', 'registers', 'exposes', 'depends_on',
+        'works_at', 'lives_at', 'authored_by', 'references', 'implements',
+        'replaces', 'part_of', 'related_to', 'belongs_to', 'has', 'manages', 'owns',
+    ];
+
+    /**
+     * Relation types that express *ownership* — the source (usually a project)
+     * contains the target as a member. These are the edges traversed when
+     * resolving an entity's root project for duplicate detection; "relates to"
+     * types like `uses`/`targets`/`adapted_from` are deliberately excluded, so a
+     * shared library (`PHPMailer`) has no root while two projects' `composer.json`
+     * files resolve to different roots.
+     */
+    private const MEMBERSHIP_TYPES = [
+        'contains', 'core_component', 'entry_point', 'configured_by',
+        'part_of', 'belongs_to', 'implemented_in', 'decided', 'exposes',
+    ];
 
     public function __construct(?string $dbPath = null) {
         $dbPath ??= dirname(__DIR__, 2) . '/data/memory.sqlite';
@@ -140,9 +167,16 @@ final class MemoryStore {
      * existing id replaces name, type, and observations entirely and makes the
      * entity valid again.
      *
+     * Duplicate detection is root-aware: creation is never blocked (a new
+     * entity's owning project isn't known until its relations are added), but
+     * the result reports any existing entity that shares name + entityType,
+     * together with its root projects, so the caller can merge same-project
+     * forks and leave cross-project basename collisions alone.
+     *
      * @param string $username owner of the new entities
      * @param array<int, array<string, mixed>> $entities
-     * @return string[] ids that were created or updated
+     * @return array{ids: string[], duplicates: array<string, array<int, array{id: string, roots: string[]}>>}
+     *         created/updated ids, plus informational same-name+type matches
      */
     public function createEntities(string $username, array $entities): array {
         $now = time();
@@ -180,7 +214,68 @@ final class MemoryStore {
             $this->syncFtsRow($username, $id);
             $ids[] = $id;
         }
-        return $ids;
+
+        return ['ids' => $ids, 'duplicates' => $this->potentialDuplicates($username, $entities, $ids)];
+    }
+
+    /**
+     * Informational duplicate hints for freshly created entities: every existing
+     * entity (different id) that shares name + entityType, with its root project
+     * ids so the caller can tell "same file in the same project" (merge) from
+     * "same basename in a different project" (leave alone). Nothing is skipped.
+     *
+     * @param array<int, array<string, mixed>> $entities
+     * @param string[] $ids
+     * @return array<string, array<int, array{id: string, roots: string[]}>>
+     */
+    private function potentialDuplicates(string $username, array $entities, array $ids): array {
+        if ($ids === []) {
+            return [];
+        }
+
+        $meta = [];
+        foreach ($entities as $entity) {
+            $id = (string) ($entity['id'] ?? '');
+            if ($id === '') {
+                continue;
+            }
+            $meta[$id] = ['name' => (string) ($entity['name'] ?? ''), 'type' => (string) ($entity['entityType'] ?? '')];
+        }
+
+        $lookup = $this->pdo->prepare(
+            'SELECT id FROM memory_entities
+             WHERE username = :username AND name = :name AND entity_type = :entity_type AND id != :id'
+        );
+        $candidateIds = [];
+        foreach ($ids as $id) {
+            $name = $meta[$id]['name'] ?? '';
+            if ($name === '') {
+                continue;
+            }
+            $lookup->execute([
+                ':username' => $username,
+                ':name' => $name,
+                ':entity_type' => $meta[$id]['type'] ?? '',
+                ':id' => $id,
+            ]);
+            foreach ($lookup->fetchAll() as $row) {
+                $candidateIds[$id][] = $row['id'];
+            }
+        }
+        if ($candidateIds === []) {
+            return [];
+        }
+
+        $all = array_values(array_unique(array_merge(...array_values($candidateIds))));
+        $roots = $this->projectRootsFor($username, $all);
+
+        $duplicates = [];
+        foreach ($candidateIds as $id => $candidates) {
+            foreach ($candidates as $candidate) {
+                $duplicates[$id][] = ['id' => $candidate, 'roots' => $roots[$candidate] ?? []];
+            }
+        }
+        return $duplicates;
     }
 
     /**
@@ -214,6 +309,7 @@ final class MemoryStore {
 
         $created = [];
         $errors = [];
+        $warnings = [];
         foreach ($relations as $relation) {
             $from = (string) ($relation['from'] ?? '');
             $to = (string) ($relation['to'] ?? '');
@@ -222,6 +318,9 @@ final class MemoryStore {
             if ($from === '' || $to === '' || $type === '') {
                 $errors[] = 'Relation must include from, to and relationType: ' . json_encode($relation);
                 continue;
+            }
+            if (!in_array($type, self::KNOWN_RELATION_TYPES, true)) {
+                $warnings[] = "Relation type '$type' is not in the known vocabulary (" . implode(', ', self::KNOWN_RELATION_TYPES) . ').';
             }
             if (!isset($known[$from], $known[$to])) {
                 $errors[] = "Cannot link '$from' to '$to': one of the entities does not exist in this user's graph.";
@@ -259,7 +358,7 @@ final class MemoryStore {
             ]);
             $created[] = "$from -> $to ($type)";
         }
-        return ['relations' => $created, 'errors' => $errors];
+        return ['relations' => $created, 'errors' => $errors, 'warnings' => array_values(array_unique($warnings))];
     }
 
     /**
@@ -273,6 +372,7 @@ final class MemoryStore {
     public function addObservations(string $username, array $observations): array {
         $updates = [];
         $errors = [];
+        $warnings = [];
         foreach ($observations as $observation) {
             $entityName = (string) ($observation['entityName'] ?? '');
             $contents = $this->stringList($observation['contents'] ?? []);
@@ -286,6 +386,10 @@ final class MemoryStore {
                 $errors[] = "Entity '$entityName' not found in this user's graph.";
                 continue;
             }
+            $warning = $this->ambiguityWarning($username, $entityName);
+            if ($warning !== null) {
+                $warnings[] = $warning;
+            }
 
             $existing = json_decode((string) ($entity['observations'] ?? '[]'), true);
             if (!is_array($existing)) {
@@ -295,7 +399,7 @@ final class MemoryStore {
             $this->updateObservations($username, $entity['id'], $merged);
             $updates[$entityName] = ['added' => count($contents), 'total' => count($merged)];
         }
-        return ['updates' => $updates, 'errors' => $errors];
+        return ['updates' => $updates, 'errors' => $errors, 'warnings' => array_values(array_unique($warnings))];
     }
 
     /**
@@ -310,6 +414,7 @@ final class MemoryStore {
     public function deleteEntities(string $username, array $identifiers): array {
         $deleted = [];
         $errors = [];
+        $warnings = [];
         $relationsRemoved = 0;
 
         foreach ($identifiers as $identifier) {
@@ -317,6 +422,10 @@ final class MemoryStore {
             if ($entity === null) {
                 $errors[] = "Entity '$identifier' not found in this user's graph.";
                 continue;
+            }
+            $warning = $this->ambiguityWarning($username, $identifier);
+            if ($warning !== null) {
+                $warnings[] = $warning;
             }
 
             $id = $entity['id'];
@@ -339,7 +448,7 @@ final class MemoryStore {
             $deleted[] = $id;
         }
 
-        return ['deleted' => $deleted, 'relationsRemoved' => $relationsRemoved, 'errors' => $errors];
+        return ['deleted' => $deleted, 'relationsRemoved' => $relationsRemoved, 'errors' => $errors, 'warnings' => array_values(array_unique($warnings))];
     }
 
     /**
@@ -385,6 +494,186 @@ final class MemoryStore {
     }
 
     /**
+     * Collapse duplicate entities into one canonical node (B2). The `keep`
+     * entity (matched by name first, then id) absorbs each `absorb` entity:
+     * absorb's observations are appended (deduped), every relation touching
+     * absorb is re-pointed onto keep (skipping relations keep already holds,
+     * and re-activating ones keep had invalidated), then absorb — and its own
+     * remaining relations and FTS row — is deleted. Runs in one transaction so
+     * a failure mid-way leaves the graph unchanged.
+     *
+     * Cross-root guard: when keep and an absorb belong to *different* projects
+     * (disjoint, non-empty root sets) the merge still runs, but a `warnings`
+     * entry flags it so a basename collision across projects isn't silently
+     * collapsed into one node.
+     *
+     * @param string $username owner of the graph
+     * @param string $keep id or name of the entity to keep
+     * @param string[] $absorb ids or names of the entities to fold into keep
+     * @return array{keep: ?string, absorbed: string[], observationsMerged: int, relationsMoved: int, errors: string[], warnings: string[]}
+     */
+    public function mergeEntities(string $username, string $keep, array $absorb): array {
+        $keepEntity = $this->findEntityFull($username, $keep);
+        if ($keepEntity === null) {
+            return [
+                'keep' => null,
+                'absorbed' => [],
+                'observationsMerged' => 0,
+                'relationsMoved' => 0,
+                'errors' => ["Keep entity '$keep' not found in this user's graph."],
+                'warnings' => [],
+            ];
+        }
+        $keepId = $keepEntity['id'];
+
+        // Resolve absorbs up front so their roots can be checked before mutating.
+        $errors = [];
+        $absorbEntities = [];
+        foreach ($absorb as $target) {
+            $absorbEntity = $this->findEntityFull($username, $target);
+            if ($absorbEntity === null) {
+                $errors[] = "Absorb entity '$target' not found in this user's graph.";
+                continue;
+            }
+            if ($absorbEntity['id'] !== $keepId) {
+                $absorbEntities[$absorbEntity['id']] = $absorbEntity;
+            }
+        }
+
+        // Cross-root guard: warn when keep and an absorb belong to different
+        // projects (disjoint, non-empty root sets).
+        $warnings = [];
+        if ($absorbEntities !== []) {
+            $roots = $this->projectRootsFor($username, array_values(array_unique([$keepId, ...array_keys($absorbEntities)])));
+            $keepRoots = $roots[$keepId] ?? [];
+            foreach (array_keys($absorbEntities) as $absorbId) {
+                $absorbRoots = $roots[$absorbId] ?? [];
+                if ($keepRoots !== [] && $absorbRoots !== [] && array_intersect($keepRoots, $absorbRoots) === []) {
+                    $warnings[] = "'$keepId' (project " . implode('/', $keepRoots) . ") and '$absorbId' (project " . implode('/', $absorbRoots) . ') belong to different projects.';
+                }
+            }
+        }
+
+        $absorbed = [];
+        $observationsMerged = 0;
+        $relationsMoved = 0;
+
+        $this->pdo->beginTransaction();
+        try {
+            foreach ($absorbEntities as $absorbId => $absorbEntity) {
+                // 1. Fold observations into keep (deduped).
+                $keepObs = $this->decodeObservations($keepEntity['observations']);
+                $absorbObs = $this->decodeObservations($absorbEntity['observations']);
+                $merged = array_values(array_unique(array_merge($keepObs, $absorbObs)));
+                if (count($merged) > count($keepObs)) {
+                    $this->updateObservations($username, $keepId, $merged);
+                    $observationsMerged += count($merged) - count($keepObs);
+                    $keepEntity['observations'] = json_encode($merged, JSON_UNESCAPED_SLASHES);
+                }
+
+                // 2. Re-point absorb's relations onto keep, then drop absorb.
+                $relationsMoved += $this->copyRelations($username, $absorbId, $keepId);
+                $this->pdo->prepare(
+                    'DELETE FROM memory_relations WHERE username = :username AND (from_entity = :id OR to_entity = :id)'
+                )->execute([':username' => $username, ':id' => $absorbId]);
+                $this->pdo->prepare('DELETE FROM memory_entities_fts WHERE username = :username AND entity_id = :id')
+                    ->execute([':username' => $username, ':id' => $absorbId]);
+                $this->pdo->prepare('DELETE FROM memory_entities WHERE username = :username AND id = :id')
+                    ->execute([':username' => $username, ':id' => $absorbId]);
+
+                $absorbed[] = $absorbId;
+            }
+            $this->pdo->commit();
+        } catch (\Throwable $e) {
+            $this->pdo->rollBack();
+            throw $e;
+        }
+
+        return [
+            'keep' => $keepId,
+            'absorbed' => $absorbed,
+            'observationsMerged' => $observationsMerged,
+            'relationsMoved' => $relationsMoved,
+            'errors' => $errors,
+            'warnings' => $warnings,
+        ];
+    }
+
+    /**
+     * Copy every relation touching `$fromId` onto `$toId`, used by mergeEntities.
+     * A relation keep already holds (active) is skipped; one keep held but has
+     * since invalidated is re-activated instead of inserted twice. Returns the
+     * number of relations moved/re-activated.
+     */
+    private function copyRelations(string $username, string $fromId, string $toId): int {
+        $rels = $this->pdo->prepare(
+            'SELECT from_entity, to_entity, relation_type, created_at, updated_at, valid_from
+             FROM memory_relations
+             WHERE username = :username AND (from_entity = :id OR to_entity = :id)'
+        );
+        $rels->execute([':username' => $username, ':id' => $fromId]);
+
+        $lookup = $this->pdo->prepare(
+            'SELECT valid_to FROM memory_relations
+             WHERE username = :username AND from_entity = :from AND to_entity = :to AND relation_type = :type'
+        );
+        $reactivate = $this->pdo->prepare(
+            'UPDATE memory_relations
+             SET valid_to = NULL, valid_from = :valid_from, updated_at = :updated_at
+             WHERE username = :username AND from_entity = :from AND to_entity = :to AND relation_type = :type'
+        );
+        $insert = $this->pdo->prepare(
+            'INSERT INTO memory_relations (username, from_entity, to_entity, relation_type, created_at, updated_at, valid_from)
+             VALUES (:username, :from, :to, :type, :created_at, :updated_at, :valid_from)'
+        );
+
+        $moved = 0;
+        $now = time();
+        foreach ($rels->fetchAll() as $row) {
+            $from = $row['from_entity'] === $fromId ? $toId : $row['from_entity'];
+            $to = $row['to_entity'] === $fromId ? $toId : $row['to_entity'];
+            if ($from === $to) {
+                continue; // a self-loop after re-pointing carries no information
+            }
+
+            $lookup->execute([
+                ':username' => $username,
+                ':from' => $from,
+                ':to' => $to,
+                ':type' => $row['relation_type'],
+            ]);
+            $existing = $lookup->fetch();
+            if ($existing !== false) {
+                if ($existing['valid_to'] === null) {
+                    continue; // keep already has this active relation
+                }
+                $reactivate->execute([
+                    ':valid_from' => $row['valid_from'],
+                    ':updated_at' => $now,
+                    ':username' => $username,
+                    ':from' => $from,
+                    ':to' => $to,
+                    ':type' => $row['relation_type'],
+                ]);
+                $moved++;
+                continue;
+            }
+
+            $insert->execute([
+                ':username' => $username,
+                ':from' => $from,
+                ':to' => $to,
+                ':type' => $row['relation_type'],
+                ':created_at' => $row['created_at'],
+                ':updated_at' => $now,
+                ':valid_from' => $row['valid_from'],
+            ]);
+            $moved++;
+        }
+        return $moved;
+    }
+
+    /**
      * Read the graph for a user as of a point in time, in one of three modes.
      * By default only facts valid at `asOf` are returned; pass `includeInvalid`
      * to include historical state. `as_of` and `includeInvalid` apply to every
@@ -417,6 +706,10 @@ final class MemoryStore {
      *        observations. Off by default so routine subgraph reads stay compact —
      *        load observations on demand via the entity mode or search_graph
      *        instead.
+     * @param string $projection subgraph mode: `both` (entities + relations,
+     *        default), `entities` (entities only), or `edges` (relations only).
+     * @param string $direction traversal direction: `incoming`, `outgoing`, or
+     *        `both` (default).
      * @return array<string, mixed>
      */
     public function readGraph(
@@ -429,6 +722,8 @@ final class MemoryStore {
         int $limit = 100,
         int $offset = 0,
         bool $includeObservations = false,
+        string $projection = 'both',
+        string $direction = 'both',
     ): array {
         $t = $this->toTimestamp($asOf) ?? time();
 
@@ -437,7 +732,7 @@ final class MemoryStore {
         }
 
         if ($root !== null && $root !== '') {
-            return $this->readSubgraph($username, $root, $depth, $t, $includeInvalid, $includeObservations);
+            return $this->readSubgraph($username, $root, $depth, $t, $includeInvalid, $includeObservations, $projection, $limit, $offset, $direction);
         }
 
         return $this->readIndex($username, $t, $includeInvalid, $limit, $offset);
@@ -445,11 +740,11 @@ final class MemoryStore {
 
     /**
      * The subgraph around a root entity: the root plus every entity reachable
-     * through at most `depth` undirected relation hops, and the relations among
-     * them. Entities carry their BFS `distance` from the root. Traversal and the
-     * root itself respect `includeInvalid` (validity ignored when set); a root
-     * that is missing, or invalid at the snapshot when `includeInvalid` is off,
-     * yields an `error` instead of a partial result.
+     * through at most `depth` relation hops, and the relations among them.
+     * Entities carry their BFS `distance` from the root. Traversal and the root
+     * itself respect `includeInvalid` (validity ignored when set); a root that
+     * is missing, or invalid at the snapshot when `includeInvalid` is off, yields
+     * an `error` instead of a partial result.
      *
      * By default the entries are compact (id/name/type/distance/relationCount,
      * no observations) and relations are topology-only (from/to/type) so a
@@ -458,10 +753,35 @@ final class MemoryStore {
      * observations (and its creation/validity timestamps) and each relation's
      * timestamps when the caller really wants the detail.
      *
+     * `$projection` selects what is returned: `entities`, `edges`, or `both`.
+     * `$limit`/`$offset` page the entity list (sorted by distance then id), so a
+     * hub with hundreds of neighbours no longer dumps everything at once; a
+     * partial page sets `truncated` and a `nextOffset` continuation marker.
+     * `$direction` controls traversal (incoming/outgoing/both).
+     *
      * @return array<string, mixed>
      */
-    private function readSubgraph(string $username, string $rootNameOrId, int $depth, int $t, bool $includeInvalid, bool $includeObservations): array {
+    private function readSubgraph(
+        string $username,
+        string $rootNameOrId,
+        int $depth,
+        int $t,
+        bool $includeInvalid,
+        bool $includeObservations,
+        string $projection = 'both',
+        int $limit = 100,
+        int $offset = 0,
+        string $direction = 'both',
+    ): array {
         $depth = max(0, min(8, $depth));
+        if (!in_array($projection, ['entities', 'edges', 'both'], true)) {
+            $projection = 'both';
+        }
+        if (!in_array($direction, ['incoming', 'outgoing', 'both'], true)) {
+            $direction = 'both';
+        }
+        $limit = max(1, min(1000, $limit));
+        $offset = max(0, $offset);
 
         $root = $this->findEntityFull($username, $rootNameOrId);
         if ($root === null) {
@@ -469,6 +789,8 @@ final class MemoryStore {
                 'mode' => 'subgraph',
                 'root' => $rootNameOrId,
                 'depth' => $depth,
+                'projection' => $projection,
+                'direction' => $direction,
                 'entities' => [],
                 'relations' => [],
                 'error' => "Root entity '$rootNameOrId' not found in this user's graph.",
@@ -479,81 +801,109 @@ final class MemoryStore {
                 'mode' => 'subgraph',
                 'root' => $rootNameOrId,
                 'depth' => $depth,
+                'projection' => $projection,
+                'direction' => $direction,
                 'entities' => [],
                 'relations' => [],
                 'error' => "Root entity '$rootNameOrId' is not valid at the requested time.",
             ];
         }
 
-        $distances = $this->subgraphDistances($username, [$root['id']], $depth, $t, $includeInvalid);
-        $ids = array_keys($distances);
+        $warning = $this->ambiguityWarning($username, $rootNameOrId);
 
-        // The induced subgraph: relations whose both endpoints made the cut.
-        // Built first so each entity's `relationCount` reflects the relations
-        // actually returned (the same convention as the entity mode).
-        $included = array_fill_keys($ids, true);
-        $stmt = $this->pdo->prepare(
-            'SELECT from_entity, to_entity, relation_type, created_at, updated_at, valid_from, valid_to
-             FROM memory_relations
-             WHERE username = :username
-             ORDER BY created_at'
-        );
-        $stmt->execute([':username' => $username]);
+        $distances = $this->subgraphDistances($username, [$root['id']], $depth, $t, $includeInvalid, $direction);
+        $ids = array_keys($distances);
+        $total = count($ids);
+
+        // The induced subgraph: relations whose both endpoints made the cut,
+        // filtered in SQL so a large graph doesn't pull every relation row into
+        // PHP for a small neighbourhood (B3).
         $relationCounts = array_fill_keys($ids, 0);
         $relations = [];
-        foreach ($stmt->fetchAll() as $row) {
-            if (!isset($included[$row['from_entity']], $included[$row['to_entity']])) {
-                continue;
+        if ($ids !== []) {
+            $placeholders = implode(',', array_fill(0, $total, '?'));
+            $stmt = $this->pdo->prepare(
+                "SELECT from_entity, to_entity, relation_type, created_at, updated_at, valid_from, valid_to
+                 FROM memory_relations
+                 WHERE username = ? AND from_entity IN ($placeholders) AND to_entity IN ($placeholders)
+                 ORDER BY created_at"
+            );
+            $stmt->execute([$username, ...$ids, ...$ids]);
+            foreach ($stmt->fetchAll() as $row) {
+                if (!$includeInvalid && !$this->isValidAt($row, $t)) {
+                    continue;
+                }
+                $relationCounts[$row['from_entity']]++;
+                $relationCounts[$row['to_entity']]++;
+                $relations[] = $includeObservations
+                    ? [
+                        'from' => $row['from_entity'],
+                        'to' => $row['to_entity'],
+                        'relationType' => $row['relation_type'],
+                        'createdAt' => $this->formatTime($row['created_at']),
+                        'updatedAt' => $this->formatTime($row['updated_at']),
+                        'validFrom' => $this->formatTime($row['valid_from']),
+                        'validTo' => $this->formatTime($row['valid_to']),
+                    ]
+                    : [
+                        'from' => $row['from_entity'],
+                        'to' => $row['to_entity'],
+                        'relationType' => $row['relation_type'],
+                    ];
             }
-            if (!$includeInvalid && !$this->isValidAt($row, $t)) {
-                continue;
-            }
-            $relationCounts[$row['from_entity']]++;
-            $relationCounts[$row['to_entity']]++;
-            $relations[] = $includeObservations
-                ? [
-                    'from' => $row['from_entity'],
-                    'to' => $row['to_entity'],
-                    'relationType' => $row['relation_type'],
-                    'createdAt' => $this->formatTime($row['created_at']),
-                    'updatedAt' => $this->formatTime($row['updated_at']),
-                    'validFrom' => $this->formatTime($row['valid_from']),
-                    'validTo' => $this->formatTime($row['valid_to']),
-                ]
-                : [
-                    'from' => $row['from_entity'],
-                    'to' => $row['to_entity'],
-                    'relationType' => $row['relation_type'],
-                ];
         }
 
+        // Entities are paginated here; relationCount is still computed over the
+        // full subgraph so a paged entry reports its true degree.
         $entities = [];
-        foreach ($this->fullEntitiesById($username, $ids) as $entity) {
-            $entry = [
-                'id' => $entity['id'],
-                'name' => $entity['name'],
-                'entityType' => $entity['entity_type'],
-                'distance' => $distances[$entity['id']],
-                'relationCount' => $relationCounts[$entity['id']],
-                'validFrom' => $this->formatTime($entity['valid_from']),
-                'validTo' => $this->formatTime($entity['valid_to']),
-            ];
-            if ($includeObservations) {
-                $entry['observations'] = $this->decodeObservations($entity['observations']);
-                $entry['createdAt'] = $this->formatTime($entity['created_at']);
-                $entry['updatedAt'] = $this->formatTime($entity['updated_at']);
+        $truncated = false;
+        $nextOffset = null;
+        if ($projection !== 'edges') {
+            $rows = $this->fullEntitiesById($username, $ids);
+            usort($rows, static function (array $a, array $b) use ($distances): int {
+                return $distances[$a['id']] <=> $distances[$b['id']]
+                    ?: strcmp($a['id'], $b['id']);
+            });
+            foreach (array_slice($rows, $offset, $limit) as $entity) {
+                $entry = [
+                    'id' => $entity['id'],
+                    'name' => $entity['name'],
+                    'entityType' => $entity['entity_type'],
+                    'distance' => $distances[$entity['id']],
+                    'relationCount' => $relationCounts[$entity['id']],
+                    'validFrom' => $this->formatTime($entity['valid_from']),
+                    'validTo' => $this->formatTime($entity['valid_to']),
+                ];
+                if ($includeObservations) {
+                    $entry['observations'] = $this->decodeObservations($entity['observations']);
+                    $entry['createdAt'] = $this->formatTime($entity['created_at']);
+                    $entry['updatedAt'] = $this->formatTime($entity['updated_at']);
+                }
+                $entities[] = $entry;
             }
-            $entities[] = $entry;
+            $truncated = ($offset + $limit) < $total;
+            $nextOffset = $truncated ? $offset + count($entities) : null;
         }
 
-        return [
+        $result = [
             'mode' => 'subgraph',
             'root' => $rootNameOrId,
             'rootId' => $root['id'],
             'depth' => $depth,
+            'projection' => $projection,
+            'direction' => $direction,
+            'total' => $total,
+            'limit' => $limit,
+            'offset' => $offset,
+            'truncated' => $truncated,
+            'nextOffset' => $nextOffset,
             'entities' => $entities,
-            'relations' => $relations,
+            'relations' => $projection === 'entities' ? [] : $relations,
         ];
+        if ($warning !== null) {
+            $result['warning'] = $warning;
+        }
+        return $result;
     }
 
     /**
@@ -602,7 +952,7 @@ final class MemoryStore {
             ];
         }
 
-        return [
+        $result = [
             'mode' => 'entity',
             'entity' => [
                 'id' => $entity['id'],
@@ -617,6 +967,11 @@ final class MemoryStore {
             ],
             'relations' => $relations,
         ];
+        $warning = $this->ambiguityWarning($username, $nameOrId);
+        if ($warning !== null) {
+            $result['warning'] = $warning;
+        }
+        return $result;
     }
 
     /**
@@ -718,6 +1073,8 @@ final class MemoryStore {
         int $topK = 10,
         int $hops = 1,
         mixed $asOf = null,
+        bool $includeRelations = false,
+        string $direction = 'both',
     ): array {
         $topK = max(1, min(100, $topK));
         $hops = max(0, min(4, $hops));
@@ -728,6 +1085,9 @@ final class MemoryStore {
         }
         if (!in_array($searchType, ['keyword', 'semantic', 'hybrid'], true)) {
             $searchType = 'keyword';
+        }
+        if (!in_array($direction, ['incoming', 'outgoing', 'both'], true)) {
+            $direction = 'both';
         }
         $t = $this->toTimestamp($asOf) ?? time();
 
@@ -743,7 +1103,7 @@ final class MemoryStore {
         }
         if ($hops > 0) {
             $seeds = array_values(array_unique(array_merge($keywordIds, $semanticIds)));
-            $graphIds = $this->bfsExpand($username, $seeds, $hops, $t);
+            $graphIds = $this->bfsExpand($username, $seeds, $hops, $t, $direction);
             if ($graphIds !== []) {
                 $lists['graph'] = $graphIds;
             }
@@ -752,6 +1112,7 @@ final class MemoryStore {
         $ranked = $this->rrf($lists);
         $resultIds = array_slice(array_keys($ranked), 0, $topK);
         $byId = $this->entitiesById($username, $resultIds);
+        $relations = $includeRelations ? $this->relationsForIds($username, $resultIds, $t) : [];
 
         $results = [];
         foreach ($resultIds as $id) {
@@ -759,7 +1120,7 @@ final class MemoryStore {
                 continue;
             }
             $row = $byId[$id];
-            $results[] = [
+            $entry = [
                 'id' => $id,
                 'name' => $row['name'],
                 'entityType' => $row['entity_type'],
@@ -767,6 +1128,10 @@ final class MemoryStore {
                 'score' => round($ranked[$id], 4),
                 'matchedOn' => $this->matchedOn($row, $query),
             ];
+            if ($includeRelations) {
+                $entry['relations'] = $relations[$id] ?? [];
+            }
+            $results[] = $entry;
         }
 
         return [
@@ -776,6 +1141,259 @@ final class MemoryStore {
             'hops' => $hops,
             'total' => count($results),
             'results' => $results,
+        ];
+    }
+
+    /**
+     * Search relations directly (C1) — search_graph only matches entities, so
+     * this is the edge-level counterpart. Filter by exact `relationType` and/or
+     * by an endpoint entity (matched by name first, then id), with `direction`
+     * choosing outgoing/incoming/either edges from that entity. When neither
+     * filter is given it returns all edges (paginated).
+     *
+     * @return array<string, mixed>
+     */
+    public function searchRelations(
+        string $username,
+        ?string $relationType = null,
+        ?string $entity = null,
+        string $direction = 'both',
+        int $limit = 100,
+        int $offset = 0,
+        mixed $asOf = null,
+    ): array {
+        $limit = max(1, min(1000, $limit));
+        $offset = max(0, $offset);
+        if (!in_array($direction, ['incoming', 'outgoing', 'both'], true)) {
+            $direction = 'both';
+        }
+        $t = $this->toTimestamp($asOf) ?? time();
+
+        $entityId = null;
+        if ($entity !== null && $entity !== '') {
+            $found = $this->findEntity($username, $entity);
+            if ($found === null) {
+                return [
+                    'relationType' => $relationType,
+                    'entity' => $entity,
+                    'direction' => $direction,
+                    'total' => 0,
+                    'relations' => [],
+                    'error' => "Entity '$entity' not found in this user's graph.",
+                ];
+            }
+            $entityId = $found['id'];
+        }
+
+        $where = ['username = :username'];
+        if ($relationType !== null && $relationType !== '') {
+            $where[] = 'relation_type = :type';
+        }
+        if ($entityId !== null) {
+            if ($direction === 'outgoing') {
+                $where[] = 'from_entity = :entity';
+            } elseif ($direction === 'incoming') {
+                $where[] = 'to_entity = :entity';
+            } else {
+                $where[] = '(from_entity = :entity OR to_entity = :entity)';
+            }
+        }
+        $where[] = 'valid_from <= :asof AND (valid_to IS NULL OR valid_to > :asof)';
+        $base = implode(' AND ', $where);
+
+        $bind = function (PDOStatement $stmt) use ($username, $relationType, $entityId, $t): void {
+            $stmt->bindValue(':username', $username);
+            if ($relationType !== null && $relationType !== '') {
+                $stmt->bindValue(':type', $relationType);
+            }
+            if ($entityId !== null) {
+                $stmt->bindValue(':entity', $entityId);
+            }
+            $stmt->bindValue(':asof', $t);
+        };
+
+        $count = $this->pdo->prepare("SELECT COUNT(*) FROM memory_relations WHERE $base");
+        $bind($count);
+        $count->execute();
+        $total = (int) $count->fetchColumn();
+
+        $stmt = $this->pdo->prepare(
+            "SELECT from_entity, to_entity, relation_type, created_at, updated_at, valid_from, valid_to
+             FROM memory_relations WHERE $base
+             ORDER BY created_at
+             LIMIT :limit OFFSET :offset"
+        );
+        $bind($stmt);
+        $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
+        $stmt->bindValue(':offset', $offset, PDO::PARAM_INT);
+        $stmt->execute();
+
+        $relations = [];
+        foreach ($stmt->fetchAll() as $row) {
+            $relations[] = [
+                'from' => $row['from_entity'],
+                'to' => $row['to_entity'],
+                'relationType' => $row['relation_type'],
+                'createdAt' => $this->formatTime($row['created_at']),
+                'updatedAt' => $this->formatTime($row['updated_at']),
+                'validFrom' => $this->formatTime($row['valid_from']),
+                'validTo' => $this->formatTime($row['valid_to']),
+            ];
+        }
+
+        return [
+            'relationType' => $relationType,
+            'entity' => $entity,
+            'direction' => $direction,
+            'total' => $total,
+            'limit' => $limit,
+            'offset' => $offset,
+            'relations' => $relations,
+        ];
+    }
+
+    /**
+     * Resolve the project-type roots that own each entity, by walking membership
+     * edges (MEMBERSHIP_TYPES, traversed in either direction since some entities
+     * point up at their project via `belongs_to`/`part_of`) transitively. An
+     * entity with no project ancestor yields an empty list — e.g. a shared
+     * library used by many projects but contained by none.
+     *
+     * @param string[] $entityIds ids whose roots to resolve
+     * @return array<string, string[]> id => sorted project ids
+     */
+    private function projectRootsFor(string $username, array $entityIds): array {
+        $result = array_fill_keys($entityIds, []);
+        if ($entityIds === []) {
+            return $result;
+        }
+
+        $placeholders = implode(',', array_fill(0, count(self::MEMBERSHIP_TYPES), '?'));
+        $rels = $this->pdo->prepare(
+            "SELECT from_entity, to_entity FROM memory_relations
+             WHERE username = ? AND relation_type IN ($placeholders)
+               AND valid_from <= ? AND (valid_to IS NULL OR valid_to > ?)"
+        );
+        $rels->execute([$username, ...self::MEMBERSHIP_TYPES, time(), time()]);
+
+        $adjacency = [];
+        foreach ($rels->fetchAll() as $row) {
+            $adjacency[$row['from_entity']][] = $row['to_entity'];
+            $adjacency[$row['to_entity']][] = $row['from_entity'];
+        }
+
+        $projects = $this->pdo->prepare(
+            "SELECT id FROM memory_entities WHERE username = ? AND entity_type = 'project'"
+        );
+        $projects->execute([$username]);
+        $projectSet = array_fill_keys(array_column($projects->fetchAll(), 'id'), true);
+
+        foreach ($entityIds as $id) {
+            $roots = [];
+            if (isset($projectSet[$id])) {
+                $roots[$id] = true;
+            }
+            $visited = [$id => true];
+            $queue = [$id];
+            for ($depth = 0; $depth < 4 && $queue !== []; $depth++) {
+                $next = [];
+                foreach ($queue as $node) {
+                    foreach ($adjacency[$node] ?? [] as $neighbor) {
+                        if (isset($visited[$neighbor])) {
+                            continue;
+                        }
+                        $visited[$neighbor] = true;
+                        if (isset($projectSet[$neighbor])) {
+                            $roots[$neighbor] = true;
+                        }
+                        $next[] = $neighbor;
+                    }
+                }
+                $queue = $next;
+            }
+            $roots = array_keys($roots);
+            sort($roots);
+            $result[$id] = $roots;
+        }
+        return $result;
+    }
+
+    /**
+     * Cheap graph health/introspection (C4): node and edge counts, a
+     * relation-type histogram, the duplicate groups (same name + entityType AND
+     * same root project — the exact anomaly merge_entities exists to fix), and
+     * the orphan count (entities with no relations). No full traversal, so it
+     * scales to a large graph.
+     *
+     * @return array<string, mixed>
+     */
+    public function summary(string $username): array {
+        $entities = $this->pdo->prepare('SELECT COUNT(*) FROM memory_entities WHERE username = :u');
+        $entities->execute([':u' => $username]);
+        $entityCount = (int) $entities->fetchColumn();
+
+        $relations = $this->pdo->prepare('SELECT COUNT(*) FROM memory_relations WHERE username = :u');
+        $relations->execute([':u' => $username]);
+        $relationCount = (int) $relations->fetchColumn();
+
+        $types = $this->pdo->prepare(
+            'SELECT relation_type, COUNT(*) AS c FROM memory_relations WHERE username = :u GROUP BY relation_type ORDER BY c DESC, relation_type'
+        );
+        $types->execute([':u' => $username]);
+        $histogram = [];
+        foreach ($types->fetchAll() as $row) {
+            $histogram[$row['relation_type']] = (int) $row['c'];
+        }
+
+        // Root-aware duplicate detection: group by (name, entityType, root
+        // projects). Two entities that merely share a basename across projects
+        // (composer.json in SimpleAPI vs SimpleExam) resolve to different roots
+        // and are not flagged.
+        $all = $this->pdo->prepare('SELECT id, name, entity_type FROM memory_entities WHERE username = :u');
+        $all->execute([':u' => $username]);
+        $rows = $all->fetchAll();
+        $roots = $this->projectRootsFor($username, array_column($rows, 'id'));
+
+        $groups = [];
+        foreach ($rows as $row) {
+            $key = (string) $row['name'] . "\0" . (string) $row['entity_type'] . "\0" . implode(',', $roots[$row['id']] ?? []);
+            if (!isset($groups[$key])) {
+                $groups[$key] = [
+                    'name' => (string) $row['name'],
+                    'entityType' => (string) $row['entity_type'],
+                    'roots' => $roots[$row['id']] ?? [],
+                    'ids' => [],
+                ];
+            }
+            $groups[$key]['ids'][] = (string) $row['id'];
+        }
+
+        $duplicateGroups = [];
+        foreach ($groups as $group) {
+            if (count($group['ids']) <= 1) {
+                continue;
+            }
+            $group['count'] = count($group['ids']);
+            $duplicateGroups[] = $group;
+        }
+        usort($duplicateGroups, static fn(array $a, array $b): int => $b['count'] <=> $a['count'] ?: strcmp($a['name'], $b['name']));
+
+        $orphans = $this->pdo->prepare(
+            'SELECT COUNT(*) FROM memory_entities e
+             LEFT JOIN memory_relations r
+               ON r.username = e.username AND (r.from_entity = e.id OR r.to_entity = e.id)
+             WHERE e.username = :u AND r.from_entity IS NULL'
+        );
+        $orphans->execute([':u' => $username]);
+        $orphanCount = (int) $orphans->fetchColumn();
+
+        return [
+            'entityCount' => $entityCount,
+            'relationCount' => $relationCount,
+            'relationTypes' => $histogram,
+            'duplicateGroupCount' => count($duplicateGroups),
+            'duplicateGroups' => $duplicateGroups,
+            'orphanCount' => $orphanCount,
         ];
     }
 
@@ -810,6 +1428,7 @@ final class MemoryStore {
             'id' => $entity['id'],
             'validTo' => $this->formatTime($t),
             'relationsInvalidated' => $rels->rowCount(),
+            'warning' => $this->ambiguityWarning($username, $identifier),
         ];
     }
 
@@ -950,12 +1569,12 @@ final class MemoryStore {
      * @param string[] $seeds starting entity ids
      * @return string[] reachable entity ids
      */
-    private function bfsExpand(string $username, array $seeds, int $hops, int $asOf): array {
+    private function bfsExpand(string $username, array $seeds, int $hops, int $asOf, string $direction = 'both'): array {
         if ($seeds === [] || $hops <= 0) {
             return [];
         }
 
-        $distance = $this->subgraphDistances($username, $seeds, $hops, $asOf, false);
+        $distance = $this->subgraphDistances($username, $seeds, $hops, $asOf, false, $direction);
         uksort($distance, function (string $a, string $b) use ($distance): int {
             return $distance[$a] <=> $distance[$b] ?: strcmp($a, $b);
         });
@@ -976,9 +1595,12 @@ final class MemoryStore {
      * @param bool $includeInvalid traverse regardless of validity
      * @return array<string, int> id => distance, nearest first
      */
-    private function subgraphDistances(string $username, array $seeds, int $maxDepth, int $asOf, bool $includeInvalid): array {
+    private function subgraphDistances(string $username, array $seeds, int $maxDepth, int $asOf, bool $includeInvalid, string $direction = 'both'): array {
         if ($seeds === [] || $maxDepth < 0) {
             return [];
+        }
+        if (!in_array($direction, ['incoming', 'outgoing', 'both'], true)) {
+            $direction = 'both';
         }
 
         $valid = $this->pdo->prepare(
@@ -1003,8 +1625,14 @@ final class MemoryStore {
             : [':username' => $username, ':asof' => $asOf]);
         $adjacency = [];
         foreach ($rels->fetchAll() as $row) {
-            $adjacency[$row['from_entity']][] = $row['to_entity'];
-            $adjacency[$row['to_entity']][] = $row['from_entity']; // traversed undirected
+            if ($direction === 'incoming') {
+                $adjacency[$row['to_entity']][] = $row['from_entity'];
+            } elseif ($direction === 'outgoing') {
+                $adjacency[$row['from_entity']][] = $row['to_entity'];
+            } else {
+                $adjacency[$row['from_entity']][] = $row['to_entity'];
+                $adjacency[$row['to_entity']][] = $row['from_entity'];
+            }
         }
 
         $distance = [];
@@ -1119,6 +1747,35 @@ final class MemoryStore {
     }
 
     /**
+     * Direct relations (topology-only) touching each of the given entity ids,
+     * valid at `$t`, keyed by entity id. Used by search_graph's `include_relations`
+     * so a search hit can be traced to its neighbours in one call.
+     *
+     * @param string[] $ids @return array<string, array<int, array{from: string, to: string, relationType: string}>>
+     */
+    private function relationsForIds(string $username, array $ids, int $t): array {
+        $out = array_fill_keys($ids, []);
+        if ($ids === []) {
+            return $out;
+        }
+        $placeholders = implode(',', array_fill(0, count($ids), '?'));
+        $stmt = $this->pdo->prepare(
+            "SELECT from_entity, to_entity, relation_type FROM memory_relations
+             WHERE username = ?
+               AND valid_from <= ? AND (valid_to IS NULL OR valid_to > ?)
+               AND (from_entity IN ($placeholders) OR to_entity IN ($placeholders))
+             ORDER BY created_at"
+        );
+        $stmt->execute([$username, $t, $t, ...$ids, ...$ids]);
+        foreach ($stmt->fetchAll() as $row) {
+            $rel = ['from' => $row['from_entity'], 'to' => $row['to_entity'], 'relationType' => $row['relation_type']];
+            $out[$row['from_entity']][] = $rel;
+            $out[$row['to_entity']][] = $rel;
+        }
+        return $out;
+    }
+
+    /**
      * Same as entitiesById but with the full row (creation/validity timestamps),
      * used by the scoped subgraph read.
      *
@@ -1190,6 +1847,29 @@ final class MemoryStore {
         $byId->execute([':username' => $username, ':key' => $nameOrId]);
         $entity = $byId->fetch();
         return $entity !== false ? $entity : null;
+    }
+
+    /** @return string[] ids (ordered by creation) whose name equals the given value */
+    private function nameMatches(string $username, string $name): array {
+        $stmt = $this->pdo->prepare(
+            'SELECT id FROM memory_entities WHERE username = :username AND name = :name ORDER BY created_at, id'
+        );
+        $stmt->execute([':username' => $username, ':name' => $name]);
+        return array_column($stmt->fetchAll(), 'id');
+    }
+
+    /**
+     * Warning when a value resolves by name to more than one entity (C5): the
+     * "name first, then id" matchers pick one arbitrarily, so surface the
+     * collision and let the caller disambiguate with an explicit id.
+     */
+    private function ambiguityWarning(string $username, string $nameOrId): ?string {
+        $matches = $this->nameMatches($username, $nameOrId);
+        if (count($matches) <= 1) {
+            return null;
+        }
+        return "Name '$nameOrId' is ambiguous (ids: " . implode(', ', $matches)
+            . ') — matched by name first; pass an id to target a specific entity.';
     }
 
     /** @param string[] $observations */
