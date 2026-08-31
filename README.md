@@ -118,11 +118,13 @@ Document ingestion and retrieval — same login requirement as the graph tools.
 
 | Tool | What it does |
 |------|--------------|
-| `ingest_document` | Chunk and store a text document (txt/markdown/csv/json/html/code); re-ingesting an existing id replaces that document. |
+| `ingest_document` | Ingest a file the user dropped into the exchange folder (`data/exchange`): the file's content is read from disk, chunked and stored; re-ingesting an existing id replaces that document. The source file is moved to `data/exchange/processed/` afterwards. |
 | `retrieve` | RAG over chunks: keyword / semantic / hybrid (default); `include_graph` also fuses matching graph entities. |
 | `list_documents` | List ingested documents with metadata. |
 | `get_document` | Fetch one document's full text, chunks in order. |
 | `delete_document` | Delete a document and its chunks. |
+| `list_exchange_files` | List what is in the exchange folder: top-level files are **not yet ingested** (`status: pending`); files under `processed/` have been ingested (`status: ingested`). |
+| `open_exchange_folder` | Pop up the exchange folder in the OS file manager (Explorer on Windows) so you can drop a file to be ingested. |
 
 ## Knowledge graph & RAG
 
@@ -170,10 +172,22 @@ run as the trusted `local` user).
 (txt/markdown/csv/json/html/code) into a per-user chunked store (`memory_documents` /
 `memory_chunks` + FTS5 mirror `memory_chunks_fts`) in the same `data/memory.sqlite`.
 
-- `ingest_document` chunks the text at paragraph then line boundaries, greedily packing to
-  `chunk_size` (default 1000 chars, clamped 50–8000) with `chunk_overlap` (default 150)
-  characters carried across boundaries so context isn't cut off. Re-ingesting an existing id
-  replaces that document.
+Files get into the store through a **drop-zone exchange folder** at `data/exchange/`
+(gitignored like the rest of `data/`, managed by [src/Auth/ExchangeFolder.php](src/Auth/ExchangeFolder.php)):
+
+- `open_exchange_folder` pops the folder up in the OS file manager (Explorer on Windows)
+  so you can drag a markdown (or txt/csv/json/html/code) file into it.
+- `list_exchange_files` shows what is waiting — top-level files are **not yet ingested**
+  (`status: pending`), while files already moved to `data/exchange/processed/` were
+  ingested (`status: ingested`).
+- `ingest_document` takes just the `filename` of a dropped file; the server reads its
+  content straight from disk (no model round-trip, so arbitrarily large files work) and
+  moves the source into `processed/` afterwards.
+
+`ingest_document` chunks the text at paragraph then line boundaries, greedily packing to
+`chunk_size` (default 1000 chars, clamped 50–8000) with `chunk_overlap` (default 150)
+characters carried across boundaries so context isn't cut off. Re-ingesting an existing id
+replaces that document.
 - `retrieve` returns the most relevant chunks for a query with the same keyword/semantic/hybrid
   strategies (default hybrid). `include_graph: true` also runs `search_graph` and appends the
   matching entities under an `entities` key, so one call covers both stores.
@@ -346,6 +360,7 @@ src/
     UserStore.php             DB-backed accounts: auth, onboarding, change password
     MemoryStore.php           per-user knowledge graph + FTS5 search (data/memory.sqlite)
     DocumentStore.php         per-user chunked document store + RAG retrieval
+    ExchangeFolder.php        drop-zone exchange folder (data/exchange) — open/list/consume files
     TokenStore.php            OAuth codes/access/refresh tokens (sha256-hashed, single-use, rotating)
     ClientStore.php           OAuth client registry: static config + RFC 7591 dynamic clients
     OAuthServer.php           authorize/token/register/discovery + resolveUser()
