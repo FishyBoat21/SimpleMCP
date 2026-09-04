@@ -6,7 +6,6 @@ namespace McpServer\Tools;
 
 use McpServer\Attributes\McpFunction;
 use McpServer\Auth\DocumentStore;
-use McpServer\Auth\ExchangeFolder;
 use McpServer\Auth\MemoryStore;
 use McpServer\UserContext;
 
@@ -33,11 +32,12 @@ readonly class KnowledgeBaseTool {
     #[McpFunction(
         name: 'ingest_document',
         roles: self::REQUIRED_ROLES,
-        description: 'Ingest a file from the exchange folder into the knowledge base. The user first drops a file (markdown or another supported format) into the exchange folder — open_exchange_folder pops the folder up, list_exchange_files shows what is waiting (files not yet ingested). Pass the file\'s name as filename; its content is read from disk and split into overlapping chunks for retrieval. Re-ingesting the same id (default: derived from the filename) replaces the previous version. The source file is moved to data/exchange/processed/ after a successful ingest. Returns the document id, the chunk ids and the chunk count.',
+        description: 'Ingest a text-based document (txt, markdown, csv, json, html, code) into the knowledge base. The content is split into overlapping chunks for retrieval. Re-ingesting the same id (default: derived from the filename) replaces the previous version. Returns the document id, the chunk ids and the chunk count.',
         schema: [
             'type' => 'object',
             'properties' => [
-                'filename' => ['type' => 'string', 'description' => 'Name of the file to ingest. It must already be sitting in the exchange folder (data/exchange).'],
+                'content' => ['type' => 'string', 'description' => 'The raw text of the document to ingest.'],
+                'filename' => ['type' => 'string', 'description' => 'Name of the file (used for the default id and format inference).'],
                 'id' => ['type' => 'string', 'description' => 'Optional stable id for the document. Defaults to a slug of the filename; re-using an existing id replaces that document.'],
                 'format' => ['type' => 'string', 'enum' => ['text', 'markdown', 'csv', 'json', 'html', 'code'], 'description' => 'Optional file format. Defaults to a guess from the filename extension.'],
                 'title' => ['type' => 'string', 'description' => 'Optional human-readable title for the document.'],
@@ -45,42 +45,15 @@ readonly class KnowledgeBaseTool {
                 'chunk_size' => ['type' => 'integer', 'default' => 1000, 'minimum' => 50, 'maximum' => 8000, 'description' => 'Target chunk length in characters.'],
                 'chunk_overlap' => ['type' => 'integer', 'default' => 150, 'minimum' => 0, 'maximum' => 2000, 'description' => 'Characters of overlap carried between consecutive chunks so context spans boundaries.'],
             ],
-            'required' => ['filename'],
+            'required' => ['content', 'filename'],
         ]
     )]
     public function ingestDocument(array $arguments, ?UserContext $user = null): array {
         $user ??= UserContext::anonymous();
-        $filename = trim((string) ($arguments['filename'] ?? ''));
-        if ($filename === '') {
-            return [['type' => 'text', 'text' => "Error: 'filename' must be the name of a file sitting in the exchange folder."]];
-        }
-
-        $exchange = new ExchangeFolder();
-        $path = $exchange->resolve($filename);
-        if ($path === null) {
-            $waiting = array_map(static fn(array $f): string => $f['filename'], $exchange->files());
-            $list = $waiting === []
-                ? '(none — call open_exchange_folder to drop a file)'
-                : implode(', ', $waiting);
-            return [
-                [
-                    'type' => 'text',
-                    'text' => "Error: '{$filename}' is not in the exchange folder ({$exchange->path()})."
-                        . "\nFiles not yet ingested: {$list}",
-                ],
-            ];
-        }
-
-        $params = $arguments;
-        $params['content'] = (string) file_get_contents($path);
-        $params['filename'] = $filename;
-
-        $result = (new DocumentStore())->ingestDocument($user->username, $params);
+        $result = (new DocumentStore())->ingestDocument($user->username, $arguments);
         if (isset($result['error'])) {
             return [['type' => 'text', 'text' => 'Error: ' . $result['error']]];
         }
-
-        $movedTo = $exchange->consume($filename);
 
         $chunkLabel = $result['chunkCount'] === 1 ? 'chunk' : 'chunks';
         $text = 'Ingested "' . $result['filename'] . '" as ' . $result['format']
@@ -88,61 +61,9 @@ readonly class KnowledgeBaseTool {
         if ($result['replaced']) {
             $text .= ' Replaced a previous version.';
         }
-        if ($movedTo !== null) {
-            $text .= "\nSource file moved to: {$movedTo}";
-        }
         $text .= "\n\nChunks:\n" . implode("\n", $result['chunks']);
 
         return [['type' => 'text', 'text' => $text]];
-    }
-
-    #[McpFunction(
-        name: 'list_exchange_files',
-        roles: self::REQUIRED_ROLES,
-        description: 'List the files in the exchange folder (data/exchange). Files at the top level have NOT been ingested yet (status "pending"); files already moved to data/exchange/processed/ have been ingested (status "ingested"). Use this to see what is waiting to be ingested before calling ingest_document.',
-        schema: [
-            'type' => 'object',
-            'properties' => new \stdClass(), // encodes as {} so MCP clients accept it as a record
-        ]
-    )]
-    public function listExchangeFiles(array $arguments, ?UserContext $user = null): array {
-        $user ??= UserContext::anonymous();
-        $exchange = new ExchangeFolder();
-        $pending = $exchange->files();
-        $ingested = $exchange->processedFiles();
-        return [
-            [
-                'type' => 'text',
-                'text' => json_encode([
-                    'folder' => $exchange->path(),
-                    'processedFolder' => $exchange->processedPath(),
-                    'notIngestedCount' => count($pending),
-                    'files' => array_map(
-                        static fn(array $f): array => $f + ['status' => 'pending'],
-                        $pending,
-                    ),
-                    'ingestedFiles' => array_map(
-                        static fn(array $f): array => $f + ['status' => 'ingested'],
-                        $ingested,
-                    ),
-                ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES),
-            ],
-        ];
-    }
-
-    #[McpFunction(
-        name: 'open_exchange_folder',
-        roles: self::REQUIRED_ROLES,
-        description: 'Open the exchange folder (data/exchange) in the OS file manager (Explorer on Windows) so the user can drag-and-drop a file to be ingested. Call this to pop the folder up, then ingest_document will read the dropped file from disk.',
-        schema: [
-            'type' => 'object',
-            'properties' => new \stdClass(), // encodes as {} so MCP clients accept it as a record
-        ]
-    )]
-    public function openExchangeFolder(array $arguments, ?UserContext $user = null): array {
-        $user ??= UserContext::anonymous();
-        $result = (new ExchangeFolder())->open();
-        return [['type' => 'text', 'text' => json_encode($result, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)]];
     }
 
     #[McpFunction(
