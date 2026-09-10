@@ -222,7 +222,7 @@ final class AccountController {
             <button type="submit">Change password</button>
         </form>
         <h2>PDF conversion (Stirling-PDF)</h2>
-        <p class="hint">Used by the convert_markdown_to_pdf tool when you access the server over HTTP. The endpoint may include a path; the server address must be reachable from this machine.</p>
+        <p class="hint">Used by the convert_markdown_to_pdf and convert_pdf_to_markdown tools when you access the server over HTTP. The endpoint may include a path; the server address must be reachable from this machine.</p>
         <form method="post" action="' . $this->url('/account/settings') . '">
             <input type="hidden" name="csrf" value="' . $this->csrf() . '">
             <label>Server URL <input type="url" name="stirling_endpoint" value="' . htmlspecialchars($spEndpoint, ENT_QUOTES) . '" placeholder="https://stirling.example.com"></label>
