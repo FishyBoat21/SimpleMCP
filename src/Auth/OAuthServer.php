@@ -423,10 +423,7 @@ final class OAuthServer {
      * @param array<string, mixed> $server
      */
     public function origin(array $server): string {
-        $https = ($server['HTTPS'] ?? '') !== '' && ($server['HTTPS'] ?? '') !== 'off';
-        $scheme = $https ? 'https' : 'http';
-        $host = $server['HTTP_HOST'] ?? 'localhost';
-        return $scheme . '://' . $host . MountPath::from($server);
+        return MountPath::origin($server);
     }
 
     // ---- helpers ------------------------------------------------------------

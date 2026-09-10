@@ -13,11 +13,18 @@ namespace McpServer\Auth;
  * `{status, headers, body}` shape as {@see OAuthServer::handle()}.
  */
 final class AccountController {
+    private readonly SettingsStore $settings;
+
     public function __construct(
         private readonly UserStore $users,
         /** App mount prefix (e.g. "/SimpleMCP") when hosted under a virtual directory; '' at the site root. */
         private readonly string $mountPath = '',
-    ) {}
+        ?SettingsStore $settings = null,
+    ) {
+        // Non-promoted readonly assigned here so omitting the store is allowed
+        // (readonly props can't be defaulted AND reassigned).
+        $this->settings = $settings ?? new SettingsStore();
+    }
 
     /**
      * @param array<string, mixed> $get
@@ -29,6 +36,7 @@ final class AccountController {
             '/account/login' => $method === 'POST' ? $this->login($post) : $this->redirect('/account'),
             '/account/onboard' => $method === 'GET' ? $this->onboardPage('', '', '') : $this->onboard($post),
             '/account/change-password' => $method === 'POST' ? $this->changePassword($post) : $this->redirect('/account'),
+            '/account/settings' => $method === 'POST' ? $this->saveSettings($post) : $this->redirect('/account'),
             '/account/logout' => $method === 'POST' ? $this->logout($post) : $this->redirect('/account'),
             default => $method === 'GET' ? $this->accountPage($get) : $this->redirect('/account'),
         };
@@ -137,6 +145,40 @@ final class AccountController {
         return $this->redirect('/account');
     }
 
+    /**
+     * Persist the Stirling-PDF settings from the account page. A blank endpoint
+     * clears the override (so the tool falls back to config/config.php); a blank
+     * API key keeps the stored key.
+     */
+    private function saveSettings(array $post): array {
+        $username = $_SESSION['username'] ?? null;
+        if ($username === null) {
+            return $this->redirect('/account');
+        }
+        if (!$this->csrfOk($post)) {
+            return $this->page(400, 'Bad request', '<p class="error">Invalid form submission.</p>');
+        }
+
+        $endpoint = trim((string) ($post['stirling_endpoint'] ?? ''));
+        if ($endpoint !== '' && !self::validHttpUrl($endpoint)) {
+            return $this->page(400, 'Bad request', '<p class="error">Server URL must be a valid http(s) address, e.g. https://stirling.example.com.</p>');
+        }
+
+        $updates = ['stirling_pdf_endpoint' => $endpoint];
+        $newApiKey = trim((string) ($post['stirling_api_key'] ?? ''));
+        if ($newApiKey !== '') {
+            $updates['stirling_pdf_api_key'] = $newApiKey;
+        }
+
+        $this->settings->set((string) $username, $updates);
+        return $this->redirect('/account?msg=' . rawurlencode('Stirling-PDF settings saved.'));
+    }
+
+    /** True when $url is an absolute http(s) URL. */
+    private static function validHttpUrl(string $url): bool {
+        return filter_var($url, FILTER_VALIDATE_URL) !== false && preg_match('#^https?://#i', $url) === 1;
+    }
+
     private function accountPage(array $get): array {
         $username = $_SESSION['username'] ?? null;
         if ($username === null) {
@@ -154,6 +196,16 @@ final class AccountController {
         $msg = (string) ($get['msg'] ?? '');
         $msgHtml = $msg === '' ? '' : '<div class="ok">' . htmlspecialchars($msg) . '</div>';
 
+        // Stirling-PDF settings for the markdown→PDF tool. The stored API key is
+        // never rendered back — only a hint that one is set, so the user can
+        // replace it by typing a new value.
+        $stirling = $this->settings->get((string) $user->username);
+        $spEndpoint = (string) ($stirling['stirling_pdf_endpoint'] ?? '');
+        $spApiKey = (string) ($stirling['stirling_pdf_api_key'] ?? '');
+        $apiKeyHint = $spApiKey !== ''
+            ? '<p class="hint">API key is set (ends with ' . htmlspecialchars(substr($spApiKey, -4)) . '). Leave the field blank to keep it.</p>'
+            : '<p class="hint">No API key set — used only if your Stirling-PDF instance requires one.</p>';
+
         $body = $msgHtml . '
         <h2>Your account</h2>
         <dl class="user">
@@ -168,6 +220,15 @@ final class AccountController {
             <label>Current password <input type="password" name="old_password" required autocomplete="current-password"></label>
             <label>New password <input type="password" name="new_password" minlength="8" required autocomplete="new-password"></label>
             <button type="submit">Change password</button>
+        </form>
+        <h2>PDF conversion (Stirling-PDF)</h2>
+        <p class="hint">Used by the convert_markdown_to_pdf tool when you access the server over HTTP. The endpoint may include a path; the server address must be reachable from this machine.</p>
+        <form method="post" action="' . $this->url('/account/settings') . '">
+            <input type="hidden" name="csrf" value="' . $this->csrf() . '">
+            <label>Server URL <input type="url" name="stirling_endpoint" value="' . htmlspecialchars($spEndpoint, ENT_QUOTES) . '" placeholder="https://stirling.example.com"></label>
+            <label>API key <input type="password" name="stirling_api_key" value="" autocomplete="off" placeholder="optional"></label>
+            ' . $apiKeyHint . '
+            <button type="submit" class="secondary">Save Stirling-PDF settings</button>
         </form>
         <form method="post" action="' . $this->url('/account/logout') . '">
             <input type="hidden" name="csrf" value="' . $this->csrf() . '">

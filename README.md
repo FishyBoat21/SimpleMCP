@@ -28,6 +28,9 @@ printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n{"jsonrpc":"
   `read_graph`) plus search, temporal invalidation, entity merging, and graph summaries.
 - **Documents & RAG** — ingest text documents into a per-user chunked store and retrieve them
   with keyword (BM25), semantic, or hybrid (RRF) strategies, optionally fused with graph search.
+- **Markdown → PDF** — convert Markdown to a PDF via a Stirling-PDF server; the endpoint and
+  optional API key are set per account on the `/account` page (HTTP mode) or globally in
+  [config/config.php](config/config.php) (stdio mode).
 - **Self-hosted OAuth 2.1** — interactive login page, token endpoint, RFC 7591 dynamic
   client registration, RFC 8414 / RFC 9728 discovery. Tokens are sha256-hashed at rest.
 - **User management page** (`/account`) — login, public onboarding, change password, logout.
@@ -123,6 +126,84 @@ Document ingestion and retrieval — same login requirement as the graph tools.
 | `list_documents` | List ingested documents with metadata. |
 | `get_document` | Fetch one document's full text, chunks in order. |
 | `delete_document` | Delete a document and its chunks. |
+
+### Markdown → PDF (Stirling-PDF) tools
+
+PDF rendering via a configured Stirling-PDF server — login required like the graph/RAG tools.
+
+| Tool | What it does |
+|------|--------------|
+| `convert_markdown_to_pdf` | Render Markdown to a PDF via the Stirling-PDF `/api/v1/convert/markdown/pdf` endpoint. The PDF is saved inside the server (data/output); HTTP returns a download URL, stdio returns the file path. |
+
+## Markdown → PDF (Stirling-PDF)
+
+[src/StirlingPdfClient.php](src/StirlingPdfClient.php) converts Markdown text to a PDF by
+POSTing it — as a multipart form upload named `document.md` (field `fileInput`) — to
+`{endpoint}/api/v1/convert/markdown/pdf` on a Stirling-PDF instance, with the optional API key
+sent as an `X-API-KEY` header. The request uses PHP streams (`file_get_contents`), so no extra
+extension is needed.
+
+### Where the PDF goes
+
+The generated PDF is saved inside the app by [src/PdfStore.php](src/PdfStore.php) at
+**`data/output/<token>/<name>.pdf`**, where `<token>` is an unguessable random name. How the
+caller receives it depends on the transport:
+
+- **HTTP (streamable) mode** — the tool result carries a **download URL**
+  (`https://host[/mount]/download/<token>/<name>.pdf`). The route in `index.php` serves the file
+  as `application/pdf`, unauthenticated — the token is the capability, so the link is
+  shareable but not enumerable (bad/traversed paths return 404).
+- **stdio mode** — there is no HTTP layer, so the tool result carries the **filesystem path** of
+  the saved file.
+
+`<name>` comes from the tool's optional `filename` argument (default `document`). Files persist
+under `data/output/` (gitignored) until you delete them.
+
+Connection settings are transport-aware:
+
+- **HTTP (streamable) mode** — the signed-in account's values, saved on the **`/account` page**
+  ("PDF conversion (Stirling-PDF)" section → `user_settings` table in `data/app.sqlite`). The API
+  key is stored once and never rendered back (only a trailing-4-char hint); leave the field blank
+  to keep the stored key. A blank endpoint clears the override and falls back to the global
+  default.
+- **stdio mode** — the global defaults from **[config/config.php](config/config.php)**
+  (`stirling_pdf.endpoint` / `stirling_pdf.api_key`). There is no account page over stdio, so a
+  blank endpoint makes the tool return a configuration error until set.
+
+Any field left blank on the account page falls back to `config/config.php`, so a server-wide
+default can be configured once and individual users may override just their endpoint or key.
+
+Smoke test over stdio (uses `config/config.php`):
+
+```sh
+printf '%s\n%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"convert_markdown_to_pdf","arguments":{"markdown":"# Hi\n\nA tiny test.","filename":"hello"}}}' \
+  | php index.php
+```
+
+By hand against Stirling-PDF the equivalent request is:
+
+```sh
+# Only include the X-API-KEY header if your Stirling-PDF instance requires it.
+curl -X POST "$ENDPOINT/api/v1/convert/markdown/pdf" \
+  -H "Accept: application/octet-stream" \
+  -H "X-API-KEY: $API_KEY" \
+  -F "fileInput=@document.md"
+```
+
+Notes:
+
+- The tool requires the `user` or `admin` role (like the memory tools), so only logged-in
+  accounts can call it; anonymous HTTP callers never see it. In stdio mode the trusted `local`
+  user passes.
+- The endpoint is used verbatim apart from trimming a trailing `/` — include any path prefix your
+  Stirling-PDF deployment is served under. It must be reachable from the machine running SimpleMCP.
+- The API key is stored in plaintext in `data/app.sqlite` (never in git — `data/` is gitignored).
+  Treat it like other server credentials: it is the key your own Stirling-PDF deployment accepts.
+- No extra PHP extensions are required: the request is made with PHP streams
+  (`file_get_contents` + a hand-built `multipart/form-data` body), so `allow_url_fopen`
+  (on by default) is the only prerequisite — the cURL extension is not needed.
 
 ## Knowledge graph & RAG
 
@@ -327,6 +408,9 @@ OAuth handshake when `client_secret_basic` is offered, so DCR-registered clients
   as a dev fallback. `status: 'pending'` (or a missing password) marks a user for onboarding.
 - **[config/oauth.php](config/oauth.php)** — OAuth clients, token/code TTLs, whether plain
   PKCE is allowed, and an optional `registration_access_token` protecting `/oauth/register`.
+- **[config/config.php](config/config.php)** — global defaults for the markdown→PDF tool
+  (`stirling_pdf.endpoint` / `stirling_pdf.api_key`), used in stdio mode and as the fallback
+  for HTTP accounts that left a field blank on the `/account` page.
 
 ## Project structure
 
@@ -335,15 +419,19 @@ index.php                     entry point — stdio loop, or HTTP router + auth 
 config/
   users.php                   seed users
   oauth.php                   OAuth clients, TTLs, registration token
+  config.php                  global defaults for the markdown→PDF tool (endpoint + API key)
 src/
   McpServer.php               MCP core: tool registry, routing, access control, UserContext injection
   UserContext.php             immutable user value object (local() / anonymous() factories, * wildcard)
+  StirlingPdfClient.php       Stirling-PDF convert-to-PDF client + transport-aware config resolution
+  PdfStore.php                saves generated PDFs under data/output + capability download URLs
   Attributes/McpFunction.php  the #[McpFunction(name, description, schema, roles, permissions)] attribute
   Tools/                      auto-discovered tool classes (CalculatorTool, AdminTool,
-                              MemoryTool, KnowledgeBaseTool, ...)
+                              MemoryTool, KnowledgeBaseTool, PdfTool, ...)
   Auth/
     Database.php              SQLite bootstrap + idempotent schema + user seeding
     UserStore.php             DB-backed accounts: auth, onboarding, change password
+    SettingsStore.php         per-account settings editable on /account (Stirling-PDF endpoint + key)
     MemoryStore.php           per-user knowledge graph + FTS5 search (data/memory.sqlite)
     DocumentStore.php         per-user chunked document store + RAG retrieval
     TokenStore.php            OAuth codes/access/refresh tokens (sha256-hashed, single-use, rotating)
@@ -352,7 +440,7 @@ src/
     AccountController.php     /account user-management pages (native sessions + CSRF)
     DebugLog.php              append-only diagnostics log to data/requests.log
 data/                         runtime-only, gitignored (app.sqlite, memory.sqlite,
-                              requests.log, sessions/)
+                              requests.log, sessions/, output/ for generated PDFs)
 ```
 
 ## Notes & gotchas
