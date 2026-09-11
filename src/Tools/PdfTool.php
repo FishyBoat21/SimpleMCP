@@ -35,10 +35,25 @@ use RuntimeException;
  * only logged-in accounts can list/call it — anonymous HTTP callers see none
  * and get a -32001 on direct calls. In stdio mode the injected `local` user
  * holds the `*` role, so access still works.
+ *
+ * Availability: both tools are enabled only when a Stirling-PDF endpoint is
+ * actually configured for the caller ({@see self::isAvailable()}). Without
+ * one the tools are disabled entirely — hidden from `tools/list`, and a
+ * direct `tools/call` is answered with tool-not-found (-32601) as if the
+ * tool didn't exist.
  */
 readonly class PdfTool {
     /** @var string[] login required, mirroring MemoryTool::REQUIRED_ROLES */
     private const REQUIRED_ROLES = ['user', 'admin'];
+
+    /**
+     * Registration gate consulted by the MCP server: the tools exist only when
+     * an endpoint is configured for the current user (global config in stdio
+     * mode, the account's setting in HTTP mode).
+     */
+    public static function isAvailable(?UserContext $user = null): bool {
+        return StirlingPdfClient::forUser($user)['endpoint'] !== '';
+    }
 
     #[McpFunction(
         name: 'convert_markdown_to_pdf',
@@ -64,11 +79,9 @@ readonly class PdfTool {
             return [['type' => 'text', 'text' => "Error: 'markdown' must be a non-empty string."]];
         }
 
+        // Availability is checked at registration time (isAvailable()); with an
+        // endpoint configured this always resolves to a usable client.
         $settings = StirlingPdfClient::forUser($user);
-        if ($settings['endpoint'] === '') {
-            return [['type' => 'text', 'text' => "Error: No Stirling-PDF endpoint configured. Set it on the /account page when running over HTTP, or in config/config.php when running via stdio."]];
-        }
-
         $client = new StirlingPdfClient($settings['endpoint'], $settings['api_key']);
         $result = $client->convertMarkdownToPdf($markdown, $uploadName . '.md');
 
@@ -135,10 +148,6 @@ readonly class PdfTool {
         }
 
         $settings = StirlingPdfClient::forUser($user);
-        if ($settings['endpoint'] === '') {
-            return [['type' => 'text', 'text' => "Error: No Stirling-PDF endpoint configured. Set it on the /account page when running over HTTP, or in config/config.php when running via stdio."]];
-        }
-
         $client = new StirlingPdfClient($settings['endpoint'], $settings['api_key']);
         $result = $client->convertPdfToMarkdown($pdf['data'], $uploadName);
 

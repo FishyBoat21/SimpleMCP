@@ -129,7 +129,10 @@ Document ingestion and retrieval — same login requirement as the graph tools.
 
 ### Markdown ⇄ PDF (Stirling-PDF) tools
 
-Document conversion via a configured Stirling-PDF server — login required like the graph/RAG tools.
+Document conversion via a configured Stirling-PDF server — login required like the graph/RAG
+tools. The tools are only **listed and callable when a Stirling-PDF endpoint is configured**
+for the caller; with none set they are disabled entirely (hidden from `tools/list`, and a
+direct call is answered with tool-not-found).
 
 | Tool | What it does |
 |------|--------------|
@@ -169,7 +172,8 @@ Connection settings are transport-aware:
   default.
 - **stdio mode** — the global defaults from **[config/config.php](config/config.php)**
   (`stirling_pdf.endpoint` / `stirling_pdf.api_key`). There is no account page over stdio, so a
-  blank endpoint makes the tool return a configuration error until set.
+  blank endpoint **disables the tools** — they vanish from `tools/list` and a direct call is
+  answered with tool-not-found until an endpoint is set.
 
 Any field left blank on the account page falls back to `config/config.php`, so a server-wide
 default can be configured once and individual users may override just their endpoint or key.
@@ -198,6 +202,8 @@ Notes:
 - The tool requires the `user` or `admin` role (like the memory tools), so only logged-in
   accounts can call it; anonymous HTTP callers never see it. In stdio mode the trusted `local`
   user passes.
+- With no endpoint configured for the caller the tools are disabled (see above) — they are
+  hidden from `tools/list` and a direct call returns tool-not-found, even for `admin`.
 - The endpoint is used verbatim apart from trimming a trailing `/` — include any path prefix your
   Stirling-PDF deployment is served under. It must be reachable from the machine running SimpleMCP.
 - The API key is stored in plaintext in `data/app.sqlite` (never in git — `data/` is gitignored).
