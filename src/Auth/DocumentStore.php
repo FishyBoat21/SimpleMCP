@@ -474,7 +474,11 @@ final class DocumentStore {
         if ($documentId !== null) {
             $sql .= ' AND document_id = :document_id';
         }
-        $sql .= ' ORDER BY rank DESC LIMIT :limit';
+        // FTS5's `rank` column holds a negated BM25 score, so a BETTER match has a
+        // numerically SMALLER (more negative) value: ASC is best-first. Sorting DESC
+        // handed back the worst-matching chunks first, which made keyword retrieval
+        // look like the query was being ignored.
+        $sql .= ' ORDER BY rank ASC LIMIT :limit';
 
         $stmt = $this->pdo->prepare($sql);
         $stmt->bindValue(':username', $username);

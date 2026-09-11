@@ -1470,11 +1470,13 @@ final class MemoryStore {
             return [];
         }
 
+        // FTS5's `rank` column holds a negated BM25 score, so a BETTER match has a
+        // numerically SMALLER (more negative) value: ASC is best-first.
         $stmt = $this->pdo->prepare(
             'SELECT entity_id AS id
              FROM memory_entities_fts
              WHERE username = :username AND memory_entities_fts MATCH :match
-             ORDER BY rank DESC
+             ORDER BY rank ASC
              LIMIT :limit'
         );
         $stmt->bindValue(':username', $username);
