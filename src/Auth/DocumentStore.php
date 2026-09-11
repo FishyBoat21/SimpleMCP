@@ -571,7 +571,32 @@ final class DocumentStore {
         foreach ($tokens as $token) {
             $terms[] = '"' . str_replace('"', '', $token) . '"*';
         }
+        // unicode61 treats '_' as an identifier character, so SUBMIT_LATE_SECONDS is
+        // indexed as ONE token that only its head segment reaches above. Also emit
+        // each underscored run verbatim so the whole identifier is searchable as a
+        // unit and BM25 can weigh an exact-identifier hit. Split terms never
+        // contain an underscore, so these cannot collide with them.
+        foreach ($this->wholeRuns($query) as $run) {
+            $terms[] = '"' . $run . '"*';
+        }
         return implode(' OR ', $terms);
+    }
+
+    /**
+     * Underscored runs in the query, verbatim and lowercased (MAX_LATE_SECONDS ->
+     * "max_late_seconds"): the tokens unicode61 indexes whole, which the split
+     * terms cannot reach past the head segment. Runs without a letter or digit
+     * (e.g. a bare "___") are dropped.
+     * @return string[]
+     */
+    private function wholeRuns(string $query): array {
+        $runs = [];
+        foreach (preg_split('/[^\p{L}\p{N}_]+/u', $query) ?: [] as $run) {
+            if ($run !== '' && str_contains($run, '_') && preg_match('/[\p{L}\p{N}]/u', $run)) {
+                $runs[] = strtolower($run);
+            }
+        }
+        return array_values(array_unique($runs));
     }
 
     /** Character trigrams (byte-level, case-folded) — see MemoryStore::nGramSet. @return array<string, true> */

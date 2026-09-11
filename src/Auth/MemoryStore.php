@@ -1687,7 +1687,9 @@ final class MemoryStore {
     /**
      * Turn a user query into an FTS5 MATCH expression: each alphanumeric run is
      * quoted and given a prefix `*`, joined with OR, so "alice acme" matches
-     * any entity mentioning either token.
+     * any entity mentioning either token. Underscored runs (SUBMIT_LATE_SECONDS)
+     * are additionally emitted verbatim — unicode61 indexes them as a single
+     * token, reachable otherwise only through the head segment (wholeRuns()).
      */
     private function ftsMatchQuery(string $query): string {
         $tokens = preg_split('/[^\p{L}\p{N}]+/u', strtolower($query), -1, PREG_SPLIT_NO_EMPTY) ?? [];
@@ -1695,7 +1697,32 @@ final class MemoryStore {
         foreach ($tokens as $token) {
             $terms[] = '"' . str_replace('"', '', $token) . '"*';
         }
+        // unicode61 treats '_' as an identifier character, so SUBMIT_LATE_SECONDS is
+        // indexed as ONE token that only its head segment reaches above. Also emit
+        // each underscored run verbatim so the whole identifier is searchable as a
+        // unit and BM25 can weigh an exact-identifier hit. Split terms never
+        // contain an underscore, so these cannot collide with them.
+        foreach ($this->wholeRuns($query) as $run) {
+            $terms[] = '"' . $run . '"*';
+        }
         return implode(' OR ', $terms);
+    }
+
+    /**
+     * Underscored runs in the query, verbatim and lowercased (MAX_LATE_SECONDS ->
+     * "max_late_seconds"): the tokens unicode61 indexes whole, which the split
+     * terms cannot reach past the head segment. Runs without a letter or digit
+     * (e.g. a bare "___") are dropped.
+     * @return string[]
+     */
+    private function wholeRuns(string $query): array {
+        $runs = [];
+        foreach (preg_split('/[^\p{L}\p{N}_]+/u', $query) ?: [] as $run) {
+            if ($run !== '' && str_contains($run, '_') && preg_match('/[\p{L}\p{N}]/u', $run)) {
+                $runs[] = strtolower($run);
+            }
+        }
+        return array_values(array_unique($runs));
     }
 
     /**
