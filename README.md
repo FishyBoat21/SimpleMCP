@@ -136,32 +136,21 @@ direct call is answered with tool-not-found).
 
 | Tool | What it does |
 |------|--------------|
-| `convert_markdown_to_pdf` | Render Markdown to a PDF via the Stirling-PDF `/api/v1/convert/markdown/pdf` endpoint. The PDF is saved inside the server (data/output); HTTP returns a download URL, stdio returns the file path. |
-| `convert_pdf_to_markdown` | Extract Markdown text from a PDF via the `/api/v1/convert/pdf/markdown` endpoint. The Markdown is returned **directly in the tool result** — nothing is written to disk. Input is `pdf_base64` or a server-side `path`. |
+| `convert_markdown_to_pdf` | Render a Markdown file to a PDF via the Stirling-PDF `/api/v1/convert/markdown/pdf` endpoint. Accepts an input file path (`path`) and exports the resulting PDF to the same directory with the same name (`<name>.pdf`). |
+| `convert_pdf_to_markdown` | Extract Markdown text from a PDF file via the `/api/v1/convert/pdf/markdown` endpoint. Accepts an input file path (`path`), exports the extracted Markdown to the same directory with the same name (`<name>.md`), and returns the Markdown in the tool result. |
 
 ## Markdown → PDF (Stirling-PDF)
 
-[src/StirlingPdfClient.php](src/StirlingPdfClient.php) converts Markdown text to a PDF by
-POSTing it — as a multipart form upload named `document.md` (field `fileInput`) — to
+[src/StirlingPdfClient.php](src/StirlingPdfClient.php) converts a Markdown file to a PDF by
+reading the file at `path`, POSTing it — as a multipart form upload (field `fileInput`) — to
 `{endpoint}/api/v1/convert/markdown/pdf` on a Stirling-PDF instance, with the optional API key
 sent as an `X-API-KEY` header. The request uses PHP streams (`file_get_contents`), so no extra
 extension is needed.
 
 ### Where the PDF goes
 
-The generated PDF is saved inside the app by [src/PdfStore.php](src/PdfStore.php) at
-**`data/output/<token>/<name>.pdf`**, where `<token>` is an unguessable random name. How the
-caller receives it depends on the transport:
-
-- **HTTP (streamable) mode** — the tool result carries a **download URL**
-  (`https://host[/mount]/download/<token>/<name>.pdf`). The route in `index.php` serves the file
-  as `application/pdf`, unauthenticated — the token is the capability, so the link is
-  shareable but not enumerable (bad/traversed paths return 404).
-- **stdio mode** — there is no HTTP layer, so the tool result carries the **filesystem path** of
-  the saved file.
-
-`<name>` comes from the tool's optional `filename` argument (default `document`). Files persist
-under `data/output/` (gitignored) until you delete them.
+The generated PDF is saved directly to the **same directory with the same base name** as the input file:
+**`<dir>/<name>.pdf`** (e.g. `path/to/notes.md` → `path/to/notes.pdf`).
 
 Connection settings are transport-aware:
 
@@ -183,7 +172,7 @@ Smoke test over stdio (uses `config/config.php`):
 ```sh
 printf '%s\n%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
-  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"convert_markdown_to_pdf","arguments":{"markdown":"# Hi\n\nA tiny test.","filename":"hello"}}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"convert_markdown_to_pdf","arguments":{"path":"data/example.md"}}}' \
   | php index.php
 ```
 
@@ -215,30 +204,25 @@ Notes:
 ## PDF → Markdown (Stirling-PDF)
 
 The inverse direction, `convert_pdf_to_markdown`, POSTs a PDF — again as a multipart upload
-(field `fileInput`, named `document.pdf`) — to `{endpoint}/api/v1/convert/pdf/markdown` and
-returns the extracted Markdown **directly in the tool result**. Unlike the Markdown → PDF tool,
-nothing is written to `data/output/` and no download URL is produced: the Markdown text *is* the
-result, so a caller can ingest it straight into a document store or knowledge graph.
+(field `fileInput`) — to `{endpoint}/api/v1/convert/pdf/markdown`, writes the extracted Markdown
+to the **same directory with the same base name** (`<dir>/<name>.md`), and returns the Markdown
+**directly in the tool result**.
 
 ### Supplying the PDF
 
-Because a PDF is binary, the tool accepts it either way:
-
 | Argument | Notes |
 |----------|-------|
-| `pdf_base64` | Base64-encoded PDF bytes. A `data:application/pdf;base64,` prefix and base64 wrapped across lines are both tolerated. |
-| `path` | Path of a PDF readable by the **server** process — convenient in stdio mode, where the client and server share a filesystem. |
-| `filename` | Optional. Names the upload (`<name>.pdf`, default `document`); the output name reported back is `<name>.md`. |
+| `path` | Path of a PDF file to convert. The tool reads the file, exports the converted Markdown to `<dir>/<name>.md`, and returns the extracted text. |
+| `input_file_path` | Alias for `path`. |
 
-Provide `pdf_base64` or `path` (at least one). The input is rejected before any network call if
-it is not valid base64, is empty, exceeds 100 MB, or has no `%PDF` header in its first 1 KiB.
+The input is rejected before any network call if the file does not exist, cannot be read, exceeds 100 MB, or has no `%PDF` header in its first 1 KiB.
 
 Smoke test over stdio (uses `config/config.php`):
 
 ```sh
 printf '%s\n%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
-  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"convert_pdf_to_markdown","arguments":{"path":"/tmp/report.pdf","filename":"report"}}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"convert_pdf_to_markdown","arguments":{"path":"/tmp/report.pdf"}}}' \
   | php index.php
 ```
 
