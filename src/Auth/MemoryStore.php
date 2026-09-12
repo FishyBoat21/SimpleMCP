@@ -89,6 +89,7 @@ final class MemoryStore {
             );
 
             CREATE INDEX IF NOT EXISTS idx_memory_entities_username ON memory_entities(username);
+            CREATE INDEX IF NOT EXISTS idx_memory_entities_name ON memory_entities(username, name);
 
             CREATE TABLE IF NOT EXISTS memory_relations (
                 username      TEXT NOT NULL,
@@ -103,6 +104,8 @@ final class MemoryStore {
             );
 
             CREATE INDEX IF NOT EXISTS idx_memory_relations_username ON memory_relations(username);
+            CREATE INDEX IF NOT EXISTS idx_memory_relations_to ON memory_relations(username, to_entity);
+            CREATE INDEX IF NOT EXISTS idx_memory_relations_type ON memory_relations(username, relation_type);
             SQL);
 
         $this->migrateColumns();
@@ -110,8 +113,8 @@ final class MemoryStore {
     }
 
     /**
-     * Add columns that post-date the originally shipped schema, for databases
-     * created before the temporal/FTS model existed. Runs as part of the
+     * Add columns and secondary indexes that post-date the originally shipped
+     * schema, for databases created before they existed. Runs as part of the
      * idempotent bootstrap, so it is a no-op on fresh databases.
      */
     private function migrateColumns(): void {
@@ -133,6 +136,11 @@ final class MemoryStore {
         $this->pdo->exec('UPDATE memory_entities SET valid_from = created_at WHERE valid_from IS NULL');
         $this->pdo->exec('UPDATE memory_relations SET valid_from = created_at WHERE valid_from IS NULL');
         $this->pdo->exec('UPDATE memory_relations SET updated_at = created_at WHERE updated_at IS NULL');
+
+        // Ensure secondary indexes exist on existing databases
+        $this->pdo->exec('CREATE INDEX IF NOT EXISTS idx_memory_entities_name ON memory_entities(username, name)');
+        $this->pdo->exec('CREATE INDEX IF NOT EXISTS idx_memory_relations_to ON memory_relations(username, to_entity)');
+        $this->pdo->exec('CREATE INDEX IF NOT EXISTS idx_memory_relations_type ON memory_relations(username, relation_type)');
     }
 
     private function createFtsTable(): void {
@@ -193,26 +201,33 @@ final class MemoryStore {
         );
 
         $ids = [];
-        foreach ($entities as $entity) {
-            $id = (string) ($entity['id'] ?? '');
-            $name = (string) ($entity['name'] ?? '');
-            if ($id === '' || $name === '') {
-                continue;
-            }
+        $this->pdo->beginTransaction();
+        try {
+            foreach ($entities as $entity) {
+                $id = (string) ($entity['id'] ?? '');
+                $name = (string) ($entity['name'] ?? '');
+                if ($id === '' || $name === '') {
+                    continue;
+                }
 
-            $validFrom = $this->toTimestamp($entity['validFrom'] ?? null) ?? $now;
-            $stmt->execute([
-                ':id' => $id,
-                ':username' => $username,
-                ':name' => $name,
-                ':entity_type' => (string) ($entity['entityType'] ?? ''),
-                ':observations' => json_encode($this->stringList($entity['observations'] ?? []), JSON_UNESCAPED_SLASHES),
-                ':created_at' => $now,
-                ':updated_at' => $now,
-                ':valid_from' => $validFrom,
-            ]);
-            $this->syncFtsRow($username, $id);
-            $ids[] = $id;
+                $validFrom = $this->toTimestamp($entity['validFrom'] ?? null) ?? $now;
+                $stmt->execute([
+                    ':id' => $id,
+                    ':username' => $username,
+                    ':name' => $name,
+                    ':entity_type' => (string) ($entity['entityType'] ?? ''),
+                    ':observations' => json_encode($this->stringList($entity['observations'] ?? []), JSON_UNESCAPED_SLASHES),
+                    ':created_at' => $now,
+                    ':updated_at' => $now,
+                    ':valid_from' => $validFrom,
+                ]);
+                $this->syncFtsRow($username, $id);
+                $ids[] = $id;
+            }
+            $this->pdo->commit();
+        } catch (\Throwable $e) {
+            $this->pdo->rollBack();
+            throw $e;
         }
 
         return ['ids' => $ids, 'duplicates' => $this->potentialDuplicates($username, $entities, $ids)];
@@ -287,9 +302,27 @@ final class MemoryStore {
      * @return array{relations: string[], errors: string[]}
      */
     public function createRelations(string $username, array $relations): array {
+        $checkIds = [];
+        foreach ($relations as $relation) {
+            $from = (string) ($relation['from'] ?? '');
+            $to = (string) ($relation['to'] ?? '');
+            if ($from !== '') {
+                $checkIds[$from] = true;
+            }
+            if ($to !== '') {
+                $checkIds[$to] = true;
+            }
+        }
+
         $known = [];
-        foreach ($this->fetchEntities($username) as $entity) {
-            $known[$entity['id']] = true;
+        if ($checkIds !== []) {
+            $idList = array_keys($checkIds);
+            $placeholders = implode(',', array_fill(0, count($idList), '?'));
+            $chkStmt = $this->pdo->prepare("SELECT id FROM memory_entities WHERE username = ? AND id IN ($placeholders)");
+            $chkStmt->execute([$username, ...$idList]);
+            foreach ($chkStmt->fetchAll() as $row) {
+                $known[$row['id']] = true;
+            }
         }
 
         $now = time();
@@ -310,54 +343,63 @@ final class MemoryStore {
         $created = [];
         $errors = [];
         $warnings = [];
-        foreach ($relations as $relation) {
-            $from = (string) ($relation['from'] ?? '');
-            $to = (string) ($relation['to'] ?? '');
-            $type = (string) ($relation['relationType'] ?? '');
 
-            if ($from === '' || $to === '' || $type === '') {
-                $errors[] = 'Relation must include from, to and relationType: ' . json_encode($relation);
-                continue;
-            }
-            if (!in_array($type, self::KNOWN_RELATION_TYPES, true)) {
-                $warnings[] = "Relation type '$type' is not in the known vocabulary (" . implode(', ', self::KNOWN_RELATION_TYPES) . ').';
-            }
-            if (!isset($known[$from], $known[$to])) {
-                $errors[] = "Cannot link '$from' to '$to': one of the entities does not exist in this user's graph.";
-                continue;
-            }
+        $this->pdo->beginTransaction();
+        try {
+            foreach ($relations as $relation) {
+                $from = (string) ($relation['from'] ?? '');
+                $to = (string) ($relation['to'] ?? '');
+                $type = (string) ($relation['relationType'] ?? '');
 
-            $validFrom = $this->toTimestamp($relation['validFrom'] ?? null) ?? $now;
-
-            $lookup->execute([':username' => $username, ':from' => $from, ':to' => $to, ':relation_type' => $type]);
-            $existing = $lookup->fetch();
-            if ($existing !== false) {
-                if ($existing['valid_to'] === null) {
-                    continue; // duplicate of an active relation — ignored, as before
+                if ($from === '' || $to === '' || $type === '') {
+                    $errors[] = 'Relation must include from, to and relationType: ' . json_encode($relation);
+                    continue;
                 }
-                $reactivate->execute([
-                    ':valid_from' => $validFrom,
-                    ':updated_at' => $now,
+                if (!in_array($type, self::KNOWN_RELATION_TYPES, true)) {
+                    $warnings[] = "Relation type '$type' is not in the known vocabulary (" . implode(', ', self::KNOWN_RELATION_TYPES) . ').';
+                }
+                if (!isset($known[$from], $known[$to])) {
+                    $errors[] = "Cannot link '$from' to '$to': one of the entities does not exist in this user's graph.";
+                    continue;
+                }
+
+                $validFrom = $this->toTimestamp($relation['validFrom'] ?? null) ?? $now;
+
+                $lookup->execute([':username' => $username, ':from' => $from, ':to' => $to, ':relation_type' => $type]);
+                $existing = $lookup->fetch();
+                if ($existing !== false) {
+                    if ($existing['valid_to'] === null) {
+                        continue; // duplicate of an active relation — ignored, as before
+                    }
+                    $reactivate->execute([
+                        ':valid_from' => $validFrom,
+                        ':updated_at' => $now,
+                        ':username' => $username,
+                        ':from' => $from,
+                        ':to' => $to,
+                        ':relation_type' => $type,
+                    ]);
+                    $created[] = "$from -> $to ($type) (re-activated)";
+                    continue;
+                }
+
+                $stmt->execute([
                     ':username' => $username,
                     ':from' => $from,
                     ':to' => $to,
                     ':relation_type' => $type,
+                    ':created_at' => $now,
+                    ':updated_at' => $now,
+                    ':valid_from' => $validFrom,
                 ]);
-                $created[] = "$from -> $to ($type) (re-activated)";
-                continue;
+                $created[] = "$from -> $to ($type)";
             }
-
-            $stmt->execute([
-                ':username' => $username,
-                ':from' => $from,
-                ':to' => $to,
-                ':relation_type' => $type,
-                ':created_at' => $now,
-                ':updated_at' => $now,
-                ':valid_from' => $validFrom,
-            ]);
-            $created[] = "$from -> $to ($type)";
+            $this->pdo->commit();
+        } catch (\Throwable $e) {
+            $this->pdo->rollBack();
+            throw $e;
         }
+
         return ['relations' => $created, 'errors' => $errors, 'warnings' => array_values(array_unique($warnings))];
     }
 
@@ -373,32 +415,41 @@ final class MemoryStore {
         $updates = [];
         $errors = [];
         $warnings = [];
-        foreach ($observations as $observation) {
-            $entityName = (string) ($observation['entityName'] ?? '');
-            $contents = $this->stringList($observation['contents'] ?? []);
-            if ($entityName === '' || $contents === []) {
-                $errors[] = 'Observation must include entityName and non-empty contents: ' . json_encode($observation);
-                continue;
-            }
 
-            $entity = $this->findEntity($username, $entityName);
-            if ($entity === null) {
-                $errors[] = "Entity '$entityName' not found in this user's graph.";
-                continue;
-            }
-            $warning = $this->ambiguityWarning($username, $entityName);
-            if ($warning !== null) {
-                $warnings[] = $warning;
-            }
+        $this->pdo->beginTransaction();
+        try {
+            foreach ($observations as $observation) {
+                $entityName = (string) ($observation['entityName'] ?? '');
+                $contents = $this->stringList($observation['contents'] ?? []);
+                if ($entityName === '' || $contents === []) {
+                    $errors[] = 'Observation must include entityName and non-empty contents: ' . json_encode($observation);
+                    continue;
+                }
 
-            $existing = json_decode((string) ($entity['observations'] ?? '[]'), true);
-            if (!is_array($existing)) {
-                $existing = [];
+                $entity = $this->findEntity($username, $entityName);
+                if ($entity === null) {
+                    $errors[] = "Entity '$entityName' not found in this user's graph.";
+                    continue;
+                }
+                $warning = $this->ambiguityWarning($username, $entityName);
+                if ($warning !== null) {
+                    $warnings[] = $warning;
+                }
+
+                $existing = json_decode((string) ($entity['observations'] ?? '[]'), true);
+                if (!is_array($existing)) {
+                    $existing = [];
+                }
+                $merged = array_values(array_unique([...$existing, ...$contents]));
+                $this->updateObservations($username, $entity['id'], $merged);
+                $updates[$entityName] = ['added' => count($contents), 'total' => count($merged)];
             }
-            $merged = array_values(array_unique([...$existing, ...$contents]));
-            $this->updateObservations($username, $entity['id'], $merged);
-            $updates[$entityName] = ['added' => count($contents), 'total' => count($merged)];
+            $this->pdo->commit();
+        } catch (\Throwable $e) {
+            $this->pdo->rollBack();
+            throw $e;
         }
+
         return ['updates' => $updates, 'errors' => $errors, 'warnings' => array_values(array_unique($warnings))];
     }
 
@@ -417,35 +468,42 @@ final class MemoryStore {
         $warnings = [];
         $relationsRemoved = 0;
 
-        foreach ($identifiers as $identifier) {
-            $entity = $this->findEntity($username, $identifier);
-            if ($entity === null) {
-                $errors[] = "Entity '$identifier' not found in this user's graph.";
-                continue;
-            }
-            $warning = $this->ambiguityWarning($username, $identifier);
-            if ($warning !== null) {
-                $warnings[] = $warning;
-            }
+        $this->pdo->beginTransaction();
+        try {
+            foreach ($identifiers as $identifier) {
+                $entity = $this->findEntity($username, $identifier);
+                if ($entity === null) {
+                    $errors[] = "Entity '$identifier' not found in this user's graph.";
+                    continue;
+                }
+                $warning = $this->ambiguityWarning($username, $identifier);
+                if ($warning !== null) {
+                    $warnings[] = $warning;
+                }
 
-            $id = $entity['id'];
-            if (in_array($id, $deleted, true)) {
-                continue; // the same entity was referenced more than once
+                $id = $entity['id'];
+                if (in_array($id, $deleted, true)) {
+                    continue; // the same entity was referenced more than once
+                }
+
+                // Cascade: drop relations pointing to or from this entity.
+                $stmt = $this->pdo->prepare(
+                    'DELETE FROM memory_relations WHERE username = :username AND (from_entity = :id OR to_entity = :id)'
+                );
+                $stmt->execute([':username' => $username, ':id' => $id]);
+                $relationsRemoved += $stmt->rowCount();
+
+                // Drop the FTS mirror before the source row, then the source row.
+                $this->pdo->prepare('DELETE FROM memory_entities_fts WHERE username = :username AND entity_id = :id')
+                    ->execute([':username' => $username, ':id' => $id]);
+                $this->pdo->prepare('DELETE FROM memory_entities WHERE username = :username AND id = :id')
+                    ->execute([':username' => $username, ':id' => $id]);
+                $deleted[] = $id;
             }
-
-            // Cascade: drop relations pointing to or from this entity.
-            $stmt = $this->pdo->prepare(
-                'DELETE FROM memory_relations WHERE username = :username AND (from_entity = :id OR to_entity = :id)'
-            );
-            $stmt->execute([':username' => $username, ':id' => $id]);
-            $relationsRemoved += $stmt->rowCount();
-
-            // Drop the FTS mirror before the source row, then the source row.
-            $this->pdo->prepare('DELETE FROM memory_entities_fts WHERE username = :username AND entity_id = :id')
-                ->execute([':username' => $username, ':id' => $id]);
-            $this->pdo->prepare('DELETE FROM memory_entities WHERE username = :username AND id = :id')
-                ->execute([':username' => $username, ':id' => $id]);
-            $deleted[] = $id;
+            $this->pdo->commit();
+        } catch (\Throwable $e) {
+            $this->pdo->rollBack();
+            throw $e;
         }
 
         return ['deleted' => $deleted, 'relationsRemoved' => $relationsRemoved, 'errors' => $errors, 'warnings' => array_values(array_unique($warnings))];
@@ -467,27 +525,34 @@ final class MemoryStore {
              WHERE username = :username AND from_entity = :from AND to_entity = :to AND relation_type = :relation_type'
         );
 
-        foreach ($relations as $relation) {
-            $from = (string) ($relation['from'] ?? '');
-            $to = (string) ($relation['to'] ?? '');
-            $type = (string) ($relation['relationType'] ?? '');
+        $this->pdo->beginTransaction();
+        try {
+            foreach ($relations as $relation) {
+                $from = (string) ($relation['from'] ?? '');
+                $to = (string) ($relation['to'] ?? '');
+                $type = (string) ($relation['relationType'] ?? '');
 
-            if ($from === '' || $to === '' || $type === '') {
-                $errors[] = 'Relation must include from, to and relationType: ' . json_encode($relation);
-                continue;
-            }
+                if ($from === '' || $to === '' || $type === '') {
+                    $errors[] = 'Relation must include from, to and relationType: ' . json_encode($relation);
+                    continue;
+                }
 
-            $stmt->execute([
-                ':username' => $username,
-                ':from' => $from,
-                ':to' => $to,
-                ':relation_type' => $type,
-            ]);
-            if ($stmt->rowCount() > 0) {
-                $deleted[] = "$from -> $to ($type)";
-            } else {
-                $errors[] = "Relation '$from -> $to ($type)' not found.";
+                $stmt->execute([
+                    ':username' => $username,
+                    ':from' => $from,
+                    ':to' => $to,
+                    ':relation_type' => $type,
+                ]);
+                if ($stmt->rowCount() > 0) {
+                    $deleted[] = "$from -> $to ($type)";
+                } else {
+                    $errors[] = "Relation '$from -> $to ($type)' not found.";
+                }
             }
+            $this->pdo->commit();
+        } catch (\Throwable $e) {
+            $this->pdo->rollBack();
+            throw $e;
         }
 
         return ['deleted' => $deleted, 'errors' => $errors];
@@ -724,6 +789,7 @@ final class MemoryStore {
         bool $includeObservations = false,
         string $projection = 'both',
         string $direction = 'both',
+        ?string $entityType = null,
     ): array {
         $t = $this->toTimestamp($asOf) ?? time();
 
@@ -732,10 +798,10 @@ final class MemoryStore {
         }
 
         if ($root !== null && $root !== '') {
-            return $this->readSubgraph($username, $root, $depth, $t, $includeInvalid, $includeObservations, $projection, $limit, $offset, $direction);
+            return $this->readSubgraph($username, $root, $depth, $t, $includeInvalid, $includeObservations, $projection, $limit, $offset, $direction, $entityType);
         }
 
-        return $this->readIndex($username, $t, $includeInvalid, $limit, $offset);
+        return $this->readIndex($username, $t, $includeInvalid, $limit, $offset, $entityType);
     }
 
     /**
@@ -772,6 +838,7 @@ final class MemoryStore {
         int $limit = 100,
         int $offset = 0,
         string $direction = 'both',
+        ?string $entityType = null,
     ): array {
         $depth = max(0, min(8, $depth));
         if (!in_array($projection, ['entities', 'edges', 'both'], true)) {
@@ -822,17 +889,16 @@ final class MemoryStore {
         $relations = [];
         if ($ids !== []) {
             $placeholders = implode(',', array_fill(0, $total, '?'));
+            $validCond = $includeInvalid ? '' : ' AND valid_from <= ? AND (valid_to IS NULL OR valid_to > ?)';
             $stmt = $this->pdo->prepare(
                 "SELECT from_entity, to_entity, relation_type, created_at, updated_at, valid_from, valid_to
                  FROM memory_relations
-                 WHERE username = ? AND from_entity IN ($placeholders) AND to_entity IN ($placeholders)
+                 WHERE username = ? AND from_entity IN ($placeholders) AND to_entity IN ($placeholders)$validCond
                  ORDER BY created_at"
             );
-            $stmt->execute([$username, ...$ids, ...$ids]);
+            $params = $includeInvalid ? [$username, ...$ids, ...$ids] : [$username, ...$ids, ...$ids, $t, $t];
+            $stmt->execute($params);
             foreach ($stmt->fetchAll() as $row) {
-                if (!$includeInvalid && !$this->isValidAt($row, $t)) {
-                    continue;
-                }
                 $relationCounts[$row['from_entity']]++;
                 $relationCounts[$row['to_entity']]++;
                 $relations[] = $includeObservations
@@ -860,6 +926,10 @@ final class MemoryStore {
         $nextOffset = null;
         if ($projection !== 'edges') {
             $rows = $this->fullEntitiesById($username, $ids);
+            if ($entityType !== null && $entityType !== '') {
+                $rows = array_values(array_filter($rows, static fn(array $e): bool => ($e['entity_type'] ?? '') === $entityType));
+                $total = count($rows);
+            }
             usort($rows, static function (array $a, array $b) use ($distances): int {
                 return $distances[$a['id']] <=> $distances[$b['id']]
                     ?: strcmp($a['id'], $b['id']);
@@ -870,7 +940,7 @@ final class MemoryStore {
                     'name' => $entity['name'],
                     'entityType' => $entity['entity_type'],
                     'distance' => $distances[$entity['id']],
-                    'relationCount' => $relationCounts[$entity['id']],
+                    'relationCount' => $relationCounts[$entity['id']] ?? 0,
                     'validFrom' => $this->formatTime($entity['valid_from']),
                     'validTo' => $this->formatTime($entity['valid_to']),
                 ];
@@ -902,6 +972,105 @@ final class MemoryStore {
         ];
         if ($warning !== null) {
             $result['warning'] = $warning;
+        }
+        return $result;
+    }
+
+    /**
+     * Generate a Mermaid flowchart diagram for the subgraph around root.
+     *
+     * @param string $username owner of the graph
+     * @param string $rootNameOrId root entity name or id
+     * @param int $depth relation hops (clamped 0..4)
+     * @param mixed $asOf Unix timestamp or ISO-8601 datetime
+     * @param bool $includeInvalid include historical/invalidated facts
+     * @param string $direction traversal direction: incoming, outgoing, or both
+     * @param string|null $entityType optional entityType to filter subgraph entities
+     * @return array{mermaid: string, rootId: string, nodeCount: int, edgeCount: int, warning?: string, error?: string}
+     */
+    public function visualizeSubgraph(
+        string $username,
+        string $rootNameOrId,
+        int $depth = 1,
+        mixed $asOf = null,
+        bool $includeInvalid = false,
+        string $direction = 'both',
+        ?string $entityType = null,
+    ): array {
+        $depth = max(0, min(4, $depth));
+        $subgraph = $this->readSubgraph(
+            $username,
+            $rootNameOrId,
+            $depth,
+            $this->toTimestamp($asOf) ?? time(),
+            $includeInvalid,
+            false,
+            'both',
+            1000,
+            0,
+            $direction,
+            $entityType
+        );
+
+        if (isset($subgraph['error'])) {
+            return [
+                'mermaid' => '',
+                'rootId' => '',
+                'nodeCount' => 0,
+                'edgeCount' => 0,
+                'error' => $subgraph['error'],
+            ];
+        }
+
+        $lines = ["flowchart TD"];
+        $lines[] = "    %% Nodes";
+
+        $nodeMap = [];
+        $nodeIndex = 1;
+        foreach ($subgraph['entities'] as $entity) {
+            $id = $entity['id'];
+            $varName = 'N' . $nodeIndex++;
+            $nodeMap[$id] = $varName;
+
+            $name = addcslashes($entity['name'], '"');
+            $type = addcslashes($entity['entityType'], '"');
+            $label = $type !== '' ? "{$name}\\n({$type})" : $name;
+
+            if ($id === $subgraph['rootId']) {
+                $lines[] = "    {$varName}[[\"★ {$label}\"]]:::rootNode";
+            } else {
+                $lines[] = "    {$varName}[\"{$label}\"]";
+            }
+        }
+
+        $lines[] = "";
+        $lines[] = "    %% Edges";
+        $edgeCount = 0;
+        foreach ($subgraph['relations'] as $rel) {
+            $from = $rel['from'];
+            $to = $rel['to'];
+            if (!isset($nodeMap[$from], $nodeMap[$to])) {
+                continue;
+            }
+            $fromVar = $nodeMap[$from];
+            $toVar = $nodeMap[$to];
+            $relType = addcslashes($rel['relationType'], '|"');
+            $lines[] = "    {$fromVar} -->|{$relType}| {$toVar}";
+            $edgeCount++;
+        }
+
+        $lines[] = "";
+        $lines[] = "    %% Styles";
+        $lines[] = "    classDef rootNode fill:#2563eb,stroke:#1d4ed8,stroke-width:2px,color:#fff,font-weight:bold;";
+
+        $result = [
+            'mermaid' => implode("\n", $lines),
+            'rootId' => $subgraph['rootId'],
+            'nodeCount' => count($subgraph['entities']),
+            'edgeCount' => $edgeCount,
+        ];
+        if (isset($subgraph['warning'])) {
+            $result['warning'] = $subgraph['warning'];
         }
         return $result;
     }
@@ -978,62 +1147,89 @@ final class MemoryStore {
      * Compact, paginated index of the graph — the default read. One entry per
      * entity with id, name, type, and its relation count (the number of
      * relations touching it, in or out, within the same snapshot), but no
-     * observations and no relation list. This is the cheap table of contents:
-     * full observations are loaded on demand via readEntity (one entity) or
-     * readSubgraph (a neighborhood).
+     * observations and no relation list. Entities are paginated first directly
+     * from memory_entities, and relation counts are counted only for the
+     * requested page slice, avoiding full-table OR-joins and Cartesian sorting.
      *
      * @return array<string, mixed>
      */
-    private function readIndex(string $username, int $t, bool $includeInvalid, int $limit, int $offset): array {
+    private function readIndex(string $username, int $t, bool $includeInvalid, int $limit, int $offset, ?string $entityType = null): array {
         $limit = max(1, min(1000, $limit));
         $offset = max(0, $offset);
 
+        $typeCond = ($entityType !== null && $entityType !== '') ? ' AND entity_type = :entity_type' : '';
+        $validCond = $includeInvalid ? '' : ' AND valid_from <= :asof AND (valid_to IS NULL OR valid_to > :asof)';
+
         $totalStmt = $this->pdo->prepare(
-            $includeInvalid
-                ? 'SELECT COUNT(*) FROM memory_entities WHERE username = :username'
-                : 'SELECT COUNT(*) FROM memory_entities
-                   WHERE username = :username AND valid_from <= :asof AND (valid_to IS NULL OR valid_to > :asof)'
+            "SELECT COUNT(*) FROM memory_entities WHERE username = :username$validCond$typeCond"
         );
-        $totalStmt->execute($includeInvalid
-            ? [':username' => $username]
-            : [':username' => $username, ':asof' => $t]);
+        $totalStmt->bindValue(':username', $username);
+        if (!$includeInvalid) {
+            $totalStmt->bindValue(':asof', $t);
+        }
+        if ($typeCond !== '') {
+            $totalStmt->bindValue(':entity_type', $entityType);
+        }
+        $totalStmt->execute();
         $total = (int) $totalStmt->fetchColumn();
 
-        $sql = 'SELECT e.id, e.name, e.entity_type, e.valid_from, e.valid_to,
-                       COUNT(DISTINCT r.rowid) AS relation_count
-                FROM memory_entities e
-                LEFT JOIN memory_relations r
-                  ON r.username = e.username
-                 AND (r.from_entity = e.id OR r.to_entity = e.id)'
-            . ($includeInvalid
-                ? ''
-                : ' AND r.valid_from <= :asof AND (r.valid_to IS NULL OR r.valid_to > :asof)')
-            . '
-                WHERE e.username = :username'
-            . ($includeInvalid
-                ? ''
-                : ' AND e.valid_from <= :asof AND (e.valid_to IS NULL OR e.valid_to > :asof)')
-            . '
-                GROUP BY e.id, e.name, e.entity_type, e.created_at, e.valid_from, e.valid_to
-                ORDER BY e.created_at, e.id
-                LIMIT :limit OFFSET :offset';
-
-        $stmt = $this->pdo->prepare($sql);
+        // 1. Paginate entities directly via indexed created_at, id
+        $entitySql = "SELECT id, name, entity_type, valid_from, valid_to
+                      FROM memory_entities
+                      WHERE username = :username$validCond$typeCond
+                      ORDER BY created_at, id
+                      LIMIT :limit OFFSET :offset";
+        $stmt = $this->pdo->prepare($entitySql);
         $stmt->bindValue(':username', $username);
         if (!$includeInvalid) {
             $stmt->bindValue(':asof', $t);
         }
+        if ($typeCond !== '') {
+            $stmt->bindValue(':entity_type', $entityType);
+        }
         $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
         $stmt->bindValue(':offset', $offset, PDO::PARAM_INT);
         $stmt->execute();
+        $pagedEntities = $stmt->fetchAll();
+
+        if ($pagedEntities === []) {
+            return [
+                'mode' => 'index',
+                'total' => $total,
+                'limit' => $limit,
+                'offset' => $offset,
+                'entities' => [],
+            ];
+        }
+
+        // 2. Count relations touching only these paginated entities
+        $pageIds = array_column($pagedEntities, 'id');
+        $placeholders = implode(',', array_fill(0, count($pageIds), '?'));
+        $relValidSql = $includeInvalid ? '' : ' AND valid_from <= ? AND (valid_to IS NULL OR valid_to > ?)';
+        $relStmt = $this->pdo->prepare(
+            "SELECT from_entity, to_entity FROM memory_relations
+             WHERE username = ? AND (from_entity IN ($placeholders) OR to_entity IN ($placeholders))$relValidSql"
+        );
+        $relParams = $includeInvalid ? [$username, ...$pageIds, ...$pageIds] : [$username, ...$pageIds, ...$pageIds, $t, $t];
+        $relStmt->execute($relParams);
+
+        $counts = array_fill_keys($pageIds, 0);
+        foreach ($relStmt->fetchAll() as $row) {
+            if (isset($counts[$row['from_entity']])) {
+                $counts[$row['from_entity']]++;
+            }
+            if (isset($counts[$row['to_entity']])) {
+                $counts[$row['to_entity']]++;
+            }
+        }
 
         $entities = [];
-        foreach ($stmt->fetchAll() as $row) {
+        foreach ($pagedEntities as $row) {
             $entities[] = [
                 'id' => $row['id'],
                 'name' => $row['name'],
                 'entityType' => $row['entity_type'],
-                'relationCount' => (int) $row['relation_count'],
+                'relationCount' => $counts[$row['id']] ?? 0,
                 'validFrom' => $this->formatTime($row['valid_from']),
                 'validTo' => $this->formatTime($row['valid_to']),
             ];
@@ -1075,6 +1271,7 @@ final class MemoryStore {
         mixed $asOf = null,
         bool $includeRelations = false,
         string $direction = 'both',
+        ?string $entityType = null,
     ): array {
         $topK = max(1, min(100, $topK));
         $hops = max(0, min(4, $hops));
@@ -1091,8 +1288,8 @@ final class MemoryStore {
         }
         $t = $this->toTimestamp($asOf) ?? time();
 
-        $keywordIds = $this->keywordSearch($username, $query, $t);
-        $semanticIds = $this->semanticSearch($username, $query, $t);
+        $keywordIds = $this->keywordSearch($username, $query, $t, $entityType);
+        $semanticIds = $this->semanticSearch($username, $query, $t, $entityType);
 
         $lists = [];
         if ($searchType === 'keyword' || $searchType === 'hybrid') {
@@ -1110,8 +1307,12 @@ final class MemoryStore {
         }
 
         $ranked = $this->rrf($lists);
-        $resultIds = array_slice(array_keys($ranked), 0, $topK);
-        $byId = $this->entitiesById($username, $resultIds);
+        $candidateIds = array_keys($ranked);
+        $byId = $this->entitiesById($username, array_slice($candidateIds, 0, max($topK * 4, 100)));
+        if ($entityType !== null && $entityType !== '') {
+            $candidateIds = array_values(array_filter($candidateIds, static fn(string $id): bool => isset($byId[$id]) && ($byId[$id]['entity_type'] ?? '') === $entityType));
+        }
+        $resultIds = array_slice($candidateIds, 0, $topK);
         $relations = $includeRelations ? $this->relationsForIds($username, $resultIds, $t) : [];
 
         $results = [];
@@ -1464,7 +1665,7 @@ final class MemoryStore {
     }
 
     /** @return string[] ids of valid entities matching the FTS5 query, best first */
-    private function keywordSearch(string $username, string $query, int $asOf): array {
+    private function keywordSearch(string $username, string $query, int $asOf, ?string $entityType = null): array {
         $match = $this->ftsMatchQuery($query);
         if ($match === '') {
             return [];
@@ -1486,11 +1687,17 @@ final class MemoryStore {
         $ids = array_column($stmt->fetchAll(), 'id');
 
         // FTS knows nothing about validity: keep only entities still valid at the snapshot.
+        $typeCond = ($entityType !== null && $entityType !== '') ? ' AND entity_type = :entity_type' : '';
         $valid = $this->pdo->prepare(
-            'SELECT id FROM memory_entities
-             WHERE username = :username AND valid_from <= :asof AND (valid_to IS NULL OR valid_to > :asof)'
+            "SELECT id FROM memory_entities
+             WHERE username = :username AND valid_from <= :asof AND (valid_to IS NULL OR valid_to > :asof)$typeCond"
         );
-        $valid->execute([':username' => $username, ':asof' => $asOf]);
+        $valid->bindValue(':username', $username);
+        $valid->bindValue(':asof', $asOf);
+        if ($typeCond !== '') {
+            $valid->bindValue(':entity_type', $entityType);
+        }
+        $valid->execute();
         $validIds = array_fill_keys(array_column($valid->fetchAll(), 'id'), true);
 
         return array_values(array_filter($ids, static fn(string $id): bool => isset($validIds[$id])));
@@ -1508,18 +1715,24 @@ final class MemoryStore {
      * drops trigram-coincidence noise (a nonsense query scores ~0.1) while
      * genuine fuzzy matches stay well above it.
      */
-    private function semanticSearch(string $username, string $query, int $asOf): array {
+    private function semanticSearch(string $username, string $query, int $asOf, ?string $entityType = null): array {
         $qGrams = $this->nGramSet($query);
         if ($qGrams === []) {
             return [];
         }
 
+        $typeCond = ($entityType !== null && $entityType !== '') ? ' AND entity_type = :entity_type' : '';
         $stmt = $this->pdo->prepare(
-            'SELECT id, name, entity_type, observations
+            "SELECT id, name, entity_type, observations
              FROM memory_entities
-             WHERE username = :username AND valid_from <= :asof AND (valid_to IS NULL OR valid_to > :asof)'
+             WHERE username = :username AND valid_from <= :asof AND (valid_to IS NULL OR valid_to > :asof)$typeCond"
         );
-        $stmt->execute([':username' => $username, ':asof' => $asOf]);
+        $stmt->bindValue(':username', $username);
+        $stmt->bindValue(':asof', $asOf);
+        if ($typeCond !== '') {
+            $stmt->bindValue(':entity_type', $entityType);
+        }
+        $stmt->execute();
 
         // Document frequency per gram (an entity is a document). Each entity's
         // gram set is the union over its name, type, and observations, so a
@@ -1587,7 +1800,8 @@ final class MemoryStore {
      * Distance of every valid entity reachable from the seeds via at most
      * `maxDepth` undirected relation hops (the seeds themselves are distance 0).
      * This is the shared BFS core behind both search_graph's `hops` expansion
-     * and read_graph's scoped root/depth read. When `includeInvalid` is set,
+     * and read_graph's scoped root/depth read. Level-by-level frontier queries
+     * avoid loading the full graph into memory. When `includeInvalid` is set,
      * validity is ignored so the traversal also reaches historical facts.
      *
      * @param string $username owner of the graph
@@ -1605,60 +1819,91 @@ final class MemoryStore {
             $direction = 'both';
         }
 
-        $valid = $this->pdo->prepare(
-            $includeInvalid
-                ? 'SELECT id FROM memory_entities WHERE username = :username'
-                : 'SELECT id FROM memory_entities
-                   WHERE username = :username AND valid_from <= :asof AND (valid_to IS NULL OR valid_to > :asof)'
-        );
-        $valid->execute($includeInvalid
-            ? [':username' => $username]
-            : [':username' => $username, ':asof' => $asOf]);
-        $validIds = array_fill_keys(array_column($valid->fetchAll(), 'id'), true);
-
-        $rels = $this->pdo->prepare(
-            $includeInvalid
-                ? 'SELECT from_entity, to_entity FROM memory_relations WHERE username = :username'
-                : 'SELECT from_entity, to_entity FROM memory_relations
-                   WHERE username = :username AND valid_from <= :asof AND (valid_to IS NULL OR valid_to > :asof)'
-        );
-        $rels->execute($includeInvalid
-            ? [':username' => $username]
-            : [':username' => $username, ':asof' => $asOf]);
-        $adjacency = [];
-        foreach ($rels->fetchAll() as $row) {
-            if ($direction === 'incoming') {
-                $adjacency[$row['to_entity']][] = $row['from_entity'];
-            } elseif ($direction === 'outgoing') {
-                $adjacency[$row['from_entity']][] = $row['to_entity'];
-            } else {
-                $adjacency[$row['from_entity']][] = $row['to_entity'];
-                $adjacency[$row['to_entity']][] = $row['from_entity'];
-            }
+        $seedPlaceholders = implode(',', array_fill(0, count($seeds), '?'));
+        $seedSql = "SELECT id FROM memory_entities WHERE username = ? AND id IN ($seedPlaceholders)";
+        $seedParams = [$username, ...$seeds];
+        if (!$includeInvalid) {
+            $seedSql .= ' AND valid_from <= ? AND (valid_to IS NULL OR valid_to > ?)';
+            $seedParams[] = $asOf;
+            $seedParams[] = $asOf;
         }
+        $seedStmt = $this->pdo->prepare($seedSql);
+        $seedStmt->execute($seedParams);
+        $validSeeds = array_column($seedStmt->fetchAll(), 'id');
 
         $distance = [];
-        $queue = new SplQueue();
-        foreach ($seeds as $seed) {
-            if (!isset($validIds[$seed]) || isset($distance[$seed])) {
-                continue;
+        $frontier = [];
+        foreach ($validSeeds as $seed) {
+            if (!isset($distance[$seed])) {
+                $distance[$seed] = 0;
+                $frontier[] = $seed;
             }
-            $distance[$seed] = 0;
-            $queue->enqueue($seed);
         }
-        while (!$queue->isEmpty()) {
-            $node = $queue->dequeue();
-            $d = $distance[$node];
-            if ($d >= $maxDepth) {
-                continue;
+
+        if ($maxDepth === 0 || $frontier === []) {
+            return $distance;
+        }
+
+        $relValiditySql = $includeInvalid ? '' : ' AND valid_from <= ? AND (valid_to IS NULL OR valid_to > ?)';
+
+        for ($depth = 0; $depth < $maxDepth && $frontier !== []; $depth++) {
+            $frontierPlaceholders = implode(',', array_fill(0, count($frontier), '?'));
+
+            if ($direction === 'outgoing') {
+                $sql = "SELECT to_entity AS neighbor FROM memory_relations
+                        WHERE username = ? AND from_entity IN ($frontierPlaceholders)$relValiditySql";
+                $params = $includeInvalid ? [$username, ...$frontier] : [$username, ...$frontier, $asOf, $asOf];
+            } elseif ($direction === 'incoming') {
+                $sql = "SELECT from_entity AS neighbor FROM memory_relations
+                        WHERE username = ? AND to_entity IN ($frontierPlaceholders)$relValiditySql";
+                $params = $includeInvalid ? [$username, ...$frontier] : [$username, ...$frontier, $asOf, $asOf];
+            } else {
+                $sql = "SELECT to_entity AS neighbor FROM memory_relations
+                        WHERE username = ? AND from_entity IN ($frontierPlaceholders)$relValiditySql
+                        UNION
+                        SELECT from_entity AS neighbor FROM memory_relations
+                        WHERE username = ? AND to_entity IN ($frontierPlaceholders)$relValiditySql";
+                $params = $includeInvalid
+                    ? [$username, ...$frontier, $username, ...$frontier]
+                    : [$username, ...$frontier, $asOf, $asOf, $username, ...$frontier, $asOf, $asOf];
             }
-            foreach ($adjacency[$node] ?? [] as $neighbor) {
-                if (isset($distance[$neighbor]) || !isset($validIds[$neighbor])) {
-                    continue;
+
+            $relStmt = $this->pdo->prepare($sql);
+            $relStmt->execute($params);
+            $rawNeighbors = array_column($relStmt->fetchAll(), 'neighbor');
+
+            $unvisited = [];
+            foreach ($rawNeighbors as $nbr) {
+                if (!isset($distance[$nbr])) {
+                    $unvisited[$nbr] = true;
                 }
-                $distance[$neighbor] = $d + 1;
-                $queue->enqueue($neighbor);
             }
+
+            if ($unvisited === []) {
+                break;
+            }
+
+            $unvisitedList = array_keys($unvisited);
+            $nbrPlaceholders = implode(',', array_fill(0, count($unvisitedList), '?'));
+            $nbrSql = "SELECT id FROM memory_entities WHERE username = ? AND id IN ($nbrPlaceholders)";
+            $nbrParams = [$username, ...$unvisitedList];
+            if (!$includeInvalid) {
+                $nbrSql .= ' AND valid_from <= ? AND (valid_to IS NULL OR valid_to > ?)';
+                $nbrParams[] = $asOf;
+                $nbrParams[] = $asOf;
+            }
+            $nbrStmt = $this->pdo->prepare($nbrSql);
+            $nbrStmt->execute($nbrParams);
+            $validNeighbors = array_column($nbrStmt->fetchAll(), 'id');
+
+            $nextFrontier = [];
+            foreach ($validNeighbors as $nbr) {
+                if (!isset($distance[$nbr])) {
+                    $distance[$nbr] = $depth + 1;
+                    $nextFrontier[] = $nbr;
+                }
+            }
+            $frontier = $nextFrontier;
         }
 
         return $distance;

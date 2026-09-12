@@ -355,6 +355,10 @@ readonly class MemoryTool {
                     'default' => 'both',
                     'description' => 'Subgraph mode only: traversal direction — `outgoing` follows from→to, `incoming` to→from, `both` traverses undirected (default).',
                 ],
+                'entity_type' => [
+                    'type' => 'string',
+                    'description' => 'Optional: filter entities by entityType (applies to index and subgraph modes).',
+                ],
             ],
         ]
     )]
@@ -368,6 +372,10 @@ readonly class MemoryTool {
         if (!is_string($entityId) || $entityId === '') {
             $entityId = null;
         }
+        $entityType = $arguments['entity_type'] ?? null;
+        if (!is_string($entityType) || $entityType === '') {
+            $entityType = null;
+        }
         $graph = (new MemoryStore())->readGraph(
             $user->username,
             $arguments['as_of'] ?? null,
@@ -380,6 +388,7 @@ readonly class MemoryTool {
             (bool) ($arguments['include_observations'] ?? false),
             (string) ($arguments['projection'] ?? 'both'),
             (string) ($arguments['direction'] ?? 'both'),
+            $entityType,
         );
 
         return [
@@ -430,12 +439,20 @@ readonly class MemoryTool {
                     'default' => 'both',
                     'description' => 'Traversal direction for `hops` graph expansion: outgoing/incoming/both (default).',
                 ],
+                'entity_type' => [
+                    'type' => 'string',
+                    'description' => 'Optional: filter results to a specific entityType (e.g. "class", "project", "decision").',
+                ],
             ],
             'required' => ['query'],
         ]
     )]
     public function searchGraph(array $arguments, ?UserContext $user = null): array {
         $user ??= UserContext::anonymous();
+        $entityType = $arguments['entity_type'] ?? null;
+        if (!is_string($entityType) || $entityType === '') {
+            $entityType = null;
+        }
         $result = (new MemoryStore())->searchGraph(
             $user->username,
             (string) ($arguments['query'] ?? ''),
@@ -445,6 +462,7 @@ readonly class MemoryTool {
             $arguments['as_of'] ?? null,
             (bool) ($arguments['include_relations'] ?? false),
             (string) ($arguments['direction'] ?? 'both'),
+            $entityType,
         );
 
         return [['type' => 'text', 'text' => json_encode($result, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)]];
@@ -626,5 +644,67 @@ readonly class MemoryTool {
                 'text' => "Invalidated relation '{$result['from']} -> {$result['to']} ({$result['relationType']})' (valid until {$result['validTo']}).",
             ],
         ];
+    }
+
+    #[McpFunction(
+        name: 'visualize_subgraph',
+        roles: self::REQUIRED_ROLES,
+        description: 'Generate a visual Mermaid flowchart diagram representing a subgraph around a root entity. Renders nodes (with entity types) and directed relation edges, highlighting the root node. Perfect for architecture and relationship visualization.',
+        schema: [
+            'type' => 'object',
+            'properties' => [
+                'root' => ['type' => 'string', 'description' => 'Root entity id or name.'],
+                'depth' => [
+                    'type' => 'integer',
+                    'default' => 1,
+                    'minimum' => 0,
+                    'maximum' => 4,
+                    'description' => 'Maximum relation hops from the root (0 = root only, default 1).',
+                ],
+                'direction' => [
+                    'type' => 'string',
+                    'enum' => ['incoming', 'outgoing', 'both'],
+                    'default' => 'both',
+                    'description' => 'Traversal direction: outgoing, incoming, or both (default).',
+                ],
+                'entity_type' => ['type' => 'string', 'description' => 'Optional: filter subgraph entities by entityType.'],
+                'as_of' => ['description' => 'Optional: Unix timestamp or ISO-8601 datetime. Defaults to now.'],
+                'includeInvalid' => ['type' => 'boolean', 'description' => 'Include historical/invalidated facts.'],
+            ],
+            'required' => ['root'],
+        ]
+    )]
+    public function visualizeSubgraph(array $arguments, ?UserContext $user = null): array {
+        $user ??= UserContext::anonymous();
+        $root = (string) ($arguments['root'] ?? '');
+        if ($root === '') {
+            return [['type' => 'text', 'text' => "Error: 'root' must be a non-empty string."]];
+        }
+        $entityType = $arguments['entity_type'] ?? null;
+        if (!is_string($entityType) || $entityType === '') {
+            $entityType = null;
+        }
+
+        $result = (new MemoryStore())->visualizeSubgraph(
+            $user->username,
+            $root,
+            (int) ($arguments['depth'] ?? 1),
+            $arguments['as_of'] ?? null,
+            (bool) ($arguments['includeInvalid'] ?? false),
+            (string) ($arguments['direction'] ?? 'both'),
+            $entityType
+        );
+
+        if (isset($result['error'])) {
+            return [['type' => 'text', 'text' => 'Error: ' . $result['error']]];
+        }
+
+        $output = "```mermaid\n" . $result['mermaid'] . "\n```\n\n"
+            . "Subgraph for '{$root}': {$result['nodeCount']} entities, {$result['edgeCount']} relations.";
+        if (isset($result['warning'])) {
+            $output .= "\nNote: " . $result['warning'];
+        }
+
+        return [['type' => 'text', 'text' => $output]];
     }
 }
