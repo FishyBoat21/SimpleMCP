@@ -5,10 +5,11 @@ declare(strict_types=1);
 /**
  * Global runtime configuration for the Stirling-PDF conversion tools.
  *
- * The PDF conversion MCP tools (`convert_markdown_to_pdf` / `convert_pdf_to_markdown`)
- * post documents to a Stirling-PDF server (`/api/v1/convert/markdown/pdf` and
- * `/api/v1/convert/pdf/markdown`). The server location and optional API key are
- * resolved as follows:
+ * The PDF and image conversion MCP tools (`convert_markdown_to_pdf`,
+ * `convert_pdf_to_markdown`, `convert_image_to_pdf`, `convert_pdf_to_image`)
+ * post documents to a Stirling-PDF server (`/api/v1/convert/markdown/pdf`,
+ * `/api/v1/convert/pdf/markdown`, `/api/v1/convert/img/pdf`, `/api/v1/convert/pdf/img`).
+ * The server location and optional API key are resolved as follows:
  *
  *   - stdio mode  → this file (the global default below).
  *   - HTTP mode   → the signed-in account's settings saved on the `/account`

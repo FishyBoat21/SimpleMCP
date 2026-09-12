@@ -9,13 +9,17 @@ use McpServer\Auth\SettingsStore;
 /**
  * Client for a Stirling-PDF server's document conversion API.
  *
- * Two conversions are supported, each a single-input (SISO) Stirling-PDF
- * operation that posts one file as the multipart field `fileInput`:
+ * Four conversions are supported, each a Stirling-PDF operation that posts
+ * a file as the multipart field `fileInput`:
  *
  *   - {@see self::convertMarkdownToPdf()} → POST /api/v1/convert/markdown/pdf,
  *     which returns the rendered PDF bytes.
  *   - {@see self::convertPdfToMarkdown()} → POST /api/v1/convert/pdf/markdown,
  *     which returns the extracted Markdown text.
+ *   - {@see self::convertImageToPdf()}    → POST /api/v1/convert/img/pdf,
+ *     which renders image(s) into a PDF document.
+ *   - {@see self::convertPdfToImage()}    → POST /api/v1/convert/pdf/img,
+ *     which renders a PDF into image file(s) or a ZIP archive.
  *
  * The server location and optional API key come from {@see self::forUser()}
  * resolution:
@@ -35,6 +39,12 @@ final class StirlingPdfClient {
 
     /** The Stirling-PDF endpoint that extracts Markdown text from a PDF. */
     private const PDF_TO_MARKDOWN_PATH = '/api/v1/convert/pdf/markdown';
+
+    /** The Stirling-PDF endpoint that renders image(s) to a PDF. */
+    private const IMG_TO_PDF_PATH = '/api/v1/convert/img/pdf';
+
+    /** The Stirling-PDF endpoint that converts a PDF to image(s). */
+    private const PDF_TO_IMG_PATH = '/api/v1/convert/pdf/img';
 
     /** Header the API key travels in (configurable on the Stirling-PDF side). */
     private const API_KEY_HEADER = 'X-API-KEY';
@@ -166,17 +176,186 @@ final class StirlingPdfClient {
     }
 
     /**
-     * POST a single file to one of Stirling-PDF's conversion endpoints.
+     * Convert an image into a PDF.
+     *
+     * @param string $imageData the raw image binary bytes
+     * @param string $filename uploaded filename (extension drives Stirling's format detection)
+     * @param string $fitOption fit option ('fillPage', 'fitToPage', 'maintainAspectRatio')
+     * @param string $colorType color type ('color', 'greyscale', 'black-and-white')
+     * @param bool $autoRotate whether to automatically rotate the image
+     * @return array<string, mixed> { ok: true, ... } with `pdf` (bytes), or
+     *         { ok: false, error } with a human-readable message
+     */
+    public function convertImageToPdf(
+        string $imageData,
+        string $filename = 'image.png',
+        string $fitOption = 'fillPage',
+        string $colorType = 'color',
+        bool $autoRotate = false,
+    ): array {
+        if (($error = $this->configurationError()) !== null) {
+            return ['ok' => false, 'error' => $error];
+        }
+        if ($imageData === '') {
+            return ['ok' => false, 'error' => 'image data must be non-empty.'];
+        }
+        if (strlen($imageData) > self::MAX_INPUT_BYTES) {
+            $mb = (int) (self::MAX_INPUT_BYTES / 1048576);
+            return ['ok' => false, 'error' => "The image is larger than the {$mb} MB limit."];
+        }
+
+        $upload = $filename !== '' ? $filename : 'image.png';
+        $ext = strtolower(pathinfo($upload, PATHINFO_EXTENSION));
+        $contentType = match ($ext) {
+            'png' => 'image/png',
+            'jpg', 'jpeg' => 'image/jpeg',
+            'webp' => 'image/webp',
+            'gif' => 'image/gif',
+            'bmp' => 'image/bmp',
+            'tiff', 'tif' => 'image/tiff',
+            'svg' => 'image/svg+xml',
+            default => 'application/octet-stream',
+        };
+
+        $fields = [
+            'fitOption' => $fitOption !== '' ? $fitOption : 'fillPage',
+            'colorType' => $colorType !== '' ? $colorType : 'color',
+            'autoRotate' => $autoRotate ? 'true' : 'false',
+        ];
+
+        $response = $this->postFile(self::IMG_TO_PDF_PATH, $upload, $contentType, $imageData, $fields);
+        if ($response === null) {
+            return ['ok' => false, 'error' => $this->unreachableError()];
+        }
+        if ($response['status'] >= 400) {
+            return ['ok' => false, 'error' => $this->httpError($response['status'], $response['body'])];
+        }
+
+        if ($response['body'] === '' || !str_contains(substr($response['body'], 0, 1024), '%PDF')) {
+            return ['ok' => false, 'error' => "Stirling-PDF did not return a PDF (HTTP {$response['status']})."];
+        }
+
+        return [
+            'ok' => true,
+            'pdf' => $response['body'],
+            'bytes' => strlen($response['body']),
+            'mimeType' => 'application/pdf',
+            'filename' => self::outputName($upload, 'pdf'),
+            'endpoint' => rtrim($this->endpoint, '/'),
+        ];
+    }
+
+    /**
+     * Convert a PDF document into image(s).
+     *
+     * @param string $pdf the raw PDF bytes
+     * @param string $filename uploaded filename (extension drives Stirling's PDF detection)
+     * @param string $imageFormat output image format ('png', 'jpeg', 'jpg', 'gif', 'webp')
+     * @param string $singleOrMultiple 'single' or 'multiple'
+     * @param string $pageNumbers page numbers or ranges, e.g. 'all', '1', '1,3,5-9'
+     * @param string $colorType 'color', 'greyscale', 'blackandwhite'
+     * @param int $dpi resolution in DPI
+     * @return array<string, mixed> { ok: true, ... } with `data` (image or zip bytes), or
+     *         { ok: false, error } with a human-readable message
+     */
+    public function convertPdfToImage(
+        string $pdf,
+        string $filename = 'document.pdf',
+        string $imageFormat = 'png',
+        string $singleOrMultiple = 'single',
+        string $pageNumbers = 'all',
+        string $colorType = 'color',
+        int $dpi = 300,
+    ): array {
+        if (($error = $this->configurationError()) !== null) {
+            return ['ok' => false, 'error' => $error];
+        }
+        if ($pdf === '') {
+            return ['ok' => false, 'error' => 'pdf must be non-empty PDF data.'];
+        }
+        if (strlen($pdf) > self::MAX_INPUT_BYTES) {
+            $mb = (int) (self::MAX_INPUT_BYTES / 1048576);
+            return ['ok' => false, 'error' => "The PDF is larger than the {$mb} MB limit."];
+        }
+        if (!str_contains(substr($pdf, 0, 1024), '%PDF')) {
+            return ['ok' => false, 'error' => 'Input does not look like a PDF (no %PDF header found).'];
+        }
+
+        $upload = $filename !== '' ? $filename : 'document.pdf';
+        $format = strtolower(trim($imageFormat));
+        if ($format === '') {
+            $format = 'png';
+        }
+
+        $fields = [
+            'imageFormat' => $format,
+            'singleOrMultiple' => $singleOrMultiple !== '' ? $singleOrMultiple : 'single',
+            'pageNumbers' => $pageNumbers !== '' ? $pageNumbers : 'all',
+            'colorType' => $colorType !== '' ? $colorType : 'color',
+            'dpi' => (string) ($dpi > 0 ? $dpi : 300),
+        ];
+
+        $response = $this->postFile(self::PDF_TO_IMG_PATH, $upload, 'application/pdf', $pdf, $fields);
+        if ($response === null) {
+            return ['ok' => false, 'error' => $this->unreachableError()];
+        }
+        if ($response['status'] >= 400) {
+            return ['ok' => false, 'error' => $this->httpError($response['status'], $response['body'])];
+        }
+
+        $body = $response['body'];
+        if ($body === '') {
+            return ['ok' => false, 'error' => "Stirling-PDF returned empty content (HTTP {$response['status']})."];
+        }
+
+        $isZip = str_starts_with($body, "PK\x03\x04");
+        $extension = $isZip ? 'zip' : $format;
+        $mimeType = match ($extension) {
+            'zip' => 'application/zip',
+            'png' => 'image/png',
+            'jpg', 'jpeg' => 'image/jpeg',
+            'webp' => 'image/webp',
+            'gif' => 'image/gif',
+            default => 'application/octet-stream',
+        };
+
+        return [
+            'ok' => true,
+            'data' => $body,
+            'bytes' => strlen($body),
+            'isZip' => $isZip,
+            'imageFormat' => $format,
+            'mimeType' => $mimeType,
+            'filename' => self::outputName($upload, $extension),
+            'endpoint' => rtrim($this->endpoint, '/'),
+        ];
+    }
+
+    /**
+     * POST a file and optional parameters to one of Stirling-PDF's conversion endpoints.
      *
      * file_get_contents()/streams can't assemble multipart/form-data for us, so
      * the body is built by hand; a random boundary keeps it from colliding with
      * the document content.
      *
+     * @param array<string, string> $extraFields key/value pairs sent as additional form fields
      * @return array{status: int, body: string}|null null when the server could not be reached
      */
-    private function postFile(string $path, string $filename, string $contentType, string $content): ?array {
+    private function postFile(string $path, string $filename, string $contentType, string $content, array $extraFields = []): ?array {
         $boundary = '----SimpleMCP' . bin2hex(random_bytes(12));
-        $body = '--' . $boundary . "\r\n"
+        $body = '';
+
+        foreach ($extraFields as $name => $value) {
+            if ($value === null || $value === '') {
+                continue;
+            }
+            $valStr = is_bool($value) ? ($value ? 'true' : 'false') : (string) $value;
+            $body .= '--' . $boundary . "\r\n"
+                . 'Content-Disposition: form-data; name="' . $name . "\"\r\n\r\n"
+                . $valStr . "\r\n";
+        }
+
+        $body .= '--' . $boundary . "\r\n"
             . 'Content-Disposition: form-data; name="fileInput"; filename="' . self::sanitizeFilename($filename) . "\"\r\n"
             . 'Content-Type: ' . $contentType . "\r\n"
             . "\r\n"

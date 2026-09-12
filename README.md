@@ -28,9 +28,9 @@ printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n{"jsonrpc":"
   `read_graph`) plus search, temporal invalidation, entity merging, and graph summaries.
 - **Documents & RAG** — ingest text documents into a per-user chunked store and retrieve them
   with keyword (BM25), semantic, or hybrid (RRF) strategies, optionally fused with graph search.
-- **Markdown ↔ PDF** — convert Markdown to a PDF and PDFs back to Markdown via a Stirling-PDF
-  server; the endpoint and optional API key are set per account on the `/account` page (HTTP
-  mode) or globally in [config/config.php](config/config.php) (stdio mode).
+- **Markdown & Image ↔ PDF** — convert Markdown or images to PDF and PDFs back to Markdown or
+  images via a Stirling-PDF server; the endpoint and optional API key are set per account on the
+  `/account` page (HTTP mode) or globally in [config/config.php](config/config.php) (stdio mode).
 - **Self-hosted OAuth 2.1** — interactive login page, token endpoint, RFC 7591 dynamic
   client registration, RFC 8414 / RFC 9728 discovery. Tokens are sha256-hashed at rest.
 - **User management page** (`/account`) — login, public onboarding, change password, logout.
@@ -127,9 +127,9 @@ Document ingestion and retrieval — same login requirement as the graph tools.
 | `get_document` | Fetch one document's full text, chunks in order. |
 | `delete_document` | Delete a document and its chunks. |
 
-### Markdown ⇄ PDF (Stirling-PDF) tools
+### Document & Image Conversion (Stirling-PDF) tools
 
-Document conversion via a configured Stirling-PDF server — login required like the graph/RAG
+Document and image conversion via a configured Stirling-PDF server — login required like the graph/RAG
 tools. The tools are only **listed and callable when a Stirling-PDF endpoint is configured**
 for the caller; with none set they are disabled entirely (hidden from `tools/list`, and a
 direct call is answered with tool-not-found).
@@ -138,6 +138,8 @@ direct call is answered with tool-not-found).
 |------|--------------|
 | `convert_markdown_to_pdf` | Render a Markdown file to a PDF via the Stirling-PDF `/api/v1/convert/markdown/pdf` endpoint. Accepts an input file path (`path`) and exports the resulting PDF to the same directory with the same name (`<name>.pdf`). |
 | `convert_pdf_to_markdown` | Extract Markdown text from a PDF file via the `/api/v1/convert/pdf/markdown` endpoint. Accepts an input file path (`path`), exports the extracted Markdown to the same directory with the same name (`<name>.md`), and returns the Markdown in the tool result. |
+| `convert_image_to_pdf` | Convert an image file (PNG, JPG, WEBP, GIF, BMP, TIFF, SVG) to a PDF via the Stirling-PDF `/api/v1/convert/img/pdf` endpoint. Accepts an input file path (`path`) and exports the resulting PDF to the same directory with the same name (`<name>.pdf`). |
+| `convert_pdf_to_image` | Convert a PDF file to image(s) via the Stirling-PDF `/api/v1/convert/pdf/img` endpoint. Accepts an input file path (`path`) and exports the resulting image (or ZIP archive for multiple pages) to the same directory (`<name>.<format>` or `<name>.zip`). |
 
 ## Markdown → PDF (Stirling-PDF)
 
@@ -236,15 +238,53 @@ curl -X POST "$ENDPOINT/api/v1/convert/pdf/markdown" \
   -F "fileInput=@document.pdf"
 ```
 
-Notes:
+## Image → PDF (Stirling-PDF)
 
-- Same access rules and connection settings as the Markdown → PDF tool: `user`/`admin` role
-  required, endpoint/API key resolved per account over HTTP and from `config/config.php` over
-  stdio.
-- A PDF with no extractable text layer (e.g. a scan without OCR) yields an explanatory error
-  rather than an empty result — enable Stirling-PDF's OCR before converting such documents.
-- The Markdown is returned in full, so a very large PDF produces a very large tool result;
-  prefer `path` for big files.
+`convert_image_to_pdf` posts an image (PNG, JPG, JPEG, WEBP, GIF, BMP, TIFF, SVG) to
+`{endpoint}/api/v1/convert/img/pdf` and writes the resulting PDF to `<dir>/<name>.pdf`.
+
+| Argument | Type | Default | Notes |
+|----------|------|---------|-------|
+| `path` | string | *required* | Path of the image file to convert. Writes `<dir>/<name>.pdf`. |
+| `input_file_path` | string | optional | Alias for `path`. |
+| `fit_option` | string | `'fillPage'` | Fit mode: `fillPage`, `fitToPage`, or `maintainAspectRatio`. |
+| `color_type` | string | `'color'` | Output color mode: `color`, `greyscale`, or `black-and-white`. |
+| `auto_rotate` | boolean | `false` | Whether to automatically rotate images to better fit the page. |
+
+Smoke test over stdio:
+
+```sh
+printf '%s\n%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"convert_image_to_pdf","arguments":{"path":"data/photo.png"}}}' \
+  | php index.php
+```
+
+## PDF → Image (Stirling-PDF)
+
+`convert_pdf_to_image` posts a PDF to `{endpoint}/api/v1/convert/pdf/img` and exports the converted
+image to `<dir>/<name>.<format>` (or `<dir>/<name>.zip` for multi-page extractions). When a ZIP archive
+is returned and PHP's `ZipArchive` extension is available, individual page images are also extracted
+directly into `<dir>`.
+
+| Argument | Type | Default | Notes |
+|----------|------|---------|-------|
+| `path` | string | *required* | Path of the PDF file to convert. |
+| `input_file_path` | string | optional | Alias for `path`. |
+| `image_format` | string | `'png'` | Output format: `png`, `jpeg`, `jpg`, `gif`, or `webp`. |
+| `single_or_multiple` | string | `'single'` | `'single'` merges all pages into one continuous image; `'multiple'` exports separate images per page (packaged as ZIP). |
+| `page_numbers` | string | `'all'` | Pages to convert: `'all'` or ranges/subsets like `'1'`, `'1,3,5-9'`. |
+| `color_type` | string | `'color'` | `'color'`, `'greyscale'`, or `'blackandwhite'`. |
+| `dpi` | integer | `300` | Resolution in dots per inch. |
+
+Smoke test over stdio:
+
+```sh
+printf '%s\n%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"convert_pdf_to_image","arguments":{"path":"data/report.pdf","image_format":"png"}}}' \
+  | php index.php
+```
 
 ## Knowledge graph & RAG
 
