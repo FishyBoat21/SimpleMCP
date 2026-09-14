@@ -41,6 +41,13 @@ readonly class MemoryTool {
      */
     private const REQUIRED_ROLES = ['user', 'admin'];
 
+    /**
+     * Results above this many bytes are stored on the clipboard and replaced by
+     * a receipt. Higher than the document tools' 8,000 because graph reads are
+     * the model's main reasoning surface — a typical one should stay inline.
+     */
+    private const OFFLOAD_BYTES = 16000;
+
     #[McpFunction(
         name: 'create_entities',
         roles: self::REQUIRED_ROLES,
@@ -301,7 +308,8 @@ readonly class MemoryTool {
     #[McpFunction(
         name: 'read_graph',
         roles: self::REQUIRED_ROLES,
-        description: 'Read the knowledge graph for the current user. Every mode returns compact entries by default (id, name, type, relation count — no observations) so routine reads stay small. Load full observations on demand: pass `entity_id` for a single entity (observations + its relations), or `root` + `depth` for the subgraph around an entity (each entity carries its distance), optionally with `include_observations: true` to also return observations. The no-arg form returns a paginated index (`limit`/`offset`). All modes respect `as_of` (facts valid at that time; default now) and `includeInvalid` (also show historical/invalidated facts).',
+        offloadAt: self::OFFLOAD_BYTES,
+        description: 'Read the knowledge graph for the current user. Every mode returns compact entries by default (id, name, type, relation count — no observations) so routine reads stay small. Load full observations on demand: pass `entity_id` for a single entity (observations + its relations), or `root` + `depth` for the subgraph around an entity (each entity carries its distance), optionally with `include_observations: true` to also return observations. The no-arg form returns a paginated index (`limit`/`offset`). All modes respect `as_of` (facts valid at that time; default now) and `includeInvalid` (also show historical/invalidated facts). A result over 16,000 bytes is stored on the server as a clipboard clip and replaced by a short receipt with a clip id — read it back with clipboard action=get id=<id>.',
         schema: [
             'type' => 'object',
             'properties' => [
@@ -402,7 +410,8 @@ readonly class MemoryTool {
     #[McpFunction(
         name: 'search_graph',
         roles: self::REQUIRED_ROLES,
-        description: 'Search the knowledge graph. keyword = BM25 via a built-in SQLite FTS5 index; semantic = fuzzy character n-gram similarity (a zero-dependency stand-in for embeddings, resilient to typos and CJK text); hybrid = both fused with Reciprocal Rank Fusion. When hops > 0, results are expanded by breadth-first traversal through up to `hops` relation hops from the matched entities. Only facts valid at `as_of` are searched.',
+        offloadAt: self::OFFLOAD_BYTES,
+        description: 'Search the knowledge graph. keyword = BM25 via a built-in SQLite FTS5 index; semantic = fuzzy character n-gram similarity (a zero-dependency stand-in for embeddings, resilient to typos and CJK text); hybrid = both fused with Reciprocal Rank Fusion. When hops > 0, results are expanded by breadth-first traversal through up to `hops` relation hops from the matched entities. Only facts valid at `as_of` are searched. A result over 16,000 bytes is stored on the server as a clipboard clip and replaced by a short receipt with a clip id — read it back with clipboard action=get id=<id>.',
         schema: [
             'type' => 'object',
             'properties' => [
@@ -516,7 +525,8 @@ readonly class MemoryTool {
     #[McpFunction(
         name: 'search_relations',
         roles: self::REQUIRED_ROLES,
-        description: 'Search relations directly. Filter by exact relationType and/or by an endpoint entity (matched by name first, then id), with direction choosing outgoing/incoming/either edges from that entity. With no filters, returns all edges (paginated).',
+        offloadAt: self::OFFLOAD_BYTES,
+        description: 'Search relations directly. Filter by exact relationType and/or by an endpoint entity (matched by name first, then id), with direction choosing outgoing/incoming/either edges from that entity. With no filters, returns all edges (paginated). A result over 16,000 bytes is stored on the server as a clipboard clip and replaced by a short receipt with a clip id — read it back with clipboard action=get id=<id>.',
         schema: [
             'type' => 'object',
             'properties' => [

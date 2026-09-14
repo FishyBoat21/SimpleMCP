@@ -3,7 +3,8 @@
 declare(strict_types=1);
 
 /**
- * Global runtime configuration for the Stirling-PDF conversion tools.
+ * Global runtime configuration for the Stirling-PDF conversion tools and the
+ * clipboard (tool-output offloading) store.
  *
  * The PDF and image conversion MCP tools (`convert_markdown_to_pdf`,
  * `convert_pdf_to_markdown`, `convert_image_to_pdf`, `convert_pdf_to_image`)
@@ -38,5 +39,51 @@ return [
         // (sent as the `X-API-KEY` header). Leave empty when your instance
         // has the API key feature disabled.
         'api_key' => '',
+    ],
+    // ---------------------------------------------------------------------
+    // Clipboard (tool output offloading)
+    //
+    // Every MCP tool result is injected verbatim into the model's context
+    // window. Tools that can produce a lot of text declare an `offloadAt`
+    // threshold on their #[McpFunction] attribute; a result larger than that
+    // is stored server-side as a "clip" and replaced by a short receipt with a
+    // clip id. The model can then read it back on demand, or hand the id to
+    // another tool (e.g. ingest_document's `clip_id`) so the bytes never enter
+    // the context window at all.
+    //
+    // Clips live in data/memory.sqlite (tables memory_clips and
+    // memory_clip_tombstones), are scoped per user, and are capped at
+    // `max_entries` with least-recently-used eviction. Pinned clips are exempt
+    // from eviction; `ttl_seconds` expires the rest.
+    //
+    // These values are deployment-varying overrides. src/Auth/ClipboardStore.php
+    // holds the built-in defaults and hard clamps, so a missing key or a
+    // nonsense value can never produce an unbounded clipboard.
+    // ---------------------------------------------------------------------
+    'clipboard' => [
+        // Maximum live clips per user. Pinned clips may push past this.
+        'max_entries' => 10,
+
+        // Longest TTL a caller may request (7 days), and the TTL applied to a
+        // put that does not specify one (24 hours). 0 means "never expires".
+        'max_ttl_seconds' => 604800,
+        'default_ttl_seconds' => 86400,
+
+        // Largest single clip. Anything bigger is refused (the tool result then
+        // stays inline).
+        'max_entry_bytes' => 1048576,
+
+        // Bytes returned by one `clipboard action=get`. `max_chars` is a byte
+        // budget despite the name: a byte cut is UTF-8-safe and errs
+        // conservative for multi-byte text.
+        'default_max_chars' => 20000,
+        'hard_max_chars' => 100000,
+
+        // Bytes of head+tail preview included in an automatic offload receipt.
+        'preview_bytes' => 2000,
+
+        // Whether a miss on an unknown clip id may say "this id belongs to a
+        // different account". Set false for strict per-user opacity.
+        'reveal_foreign_ids' => true,
     ],
 ];
