@@ -31,10 +31,6 @@ printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n{"jsonrpc":"
 - **Markdown & Image ↔ PDF** — convert Markdown or images to PDF and PDFs back to Markdown or
   images via a Stirling-PDF server; the endpoint and optional API key are set per account on the
   `/account` page (HTTP mode) or globally in [config/config.php](config/config.php) (stdio mode).
-- **Clipboard (context-window offloading)** — tools that can return bulky text declare an
-  `offloadAt` threshold; a larger result is kept server-side as a per-user *clip* and replaced
-  by a short receipt with a clip id, which other tools accept in place of the payload. Capped
-  at 10 clips per user with least-recently-used eviction.
 - **Self-hosted OAuth 2.1** — interactive login page, token endpoint, RFC 7591 dynamic
   client registration, RFC 8414 / RFC 9728 discovery. Tokens are sha256-hashed at rest.
 - **User management page** (`/account`) — login, public onboarding, change password, logout.
@@ -144,24 +140,6 @@ direct call is answered with tool-not-found).
 | `convert_pdf_to_markdown` | Extract Markdown text from a PDF file via the `/api/v1/convert/pdf/markdown` endpoint. Accepts an input file path (`path`), exports the extracted Markdown to the same directory with the same name (`<name>.md`), and returns the Markdown in the tool result. |
 | `convert_image_to_pdf` | Convert an image file (PNG, JPG, WEBP, GIF, BMP, TIFF, SVG) to a PDF via the Stirling-PDF `/api/v1/convert/img/pdf` endpoint. Accepts an input file path (`path`) and exports the resulting PDF to the same directory with the same name (`<name>.pdf`). |
 | `convert_pdf_to_image` | Convert a PDF file to image(s) via the Stirling-PDF `/api/v1/convert/pdf/img` endpoint. Accepts an input file path (`path`) and exports the resulting image (or ZIP archive for multiple pages) to the same directory (`<name>.<format>` or `<name>.zip`). |
-
-### Clipboard (tool output offloading)
-
-Every MCP tool result is fed to the model verbatim, so a single large payload can fill the
-context window. Tools that can produce a lot of text declare an `offloadAt` threshold on their
-`#[McpFunction]` attribute; a result above it is stored on the server as a **clip** and
-replaced by a short receipt carrying a clip id. The model then reads the clip back only when
-it actually needs the bytes — or hands the id to another tool that accepts `clip_id`, in which
-case the payload never enters the context window at all. Login required, like the graph/RAG
-tools.
-
-| Tool | What it does |
-|------|--------------|
-| `clipboard` | One tool, six actions. `put` stores text and returns a clip id; `list` shows what you hold (metadata only); `get` reads a clip back in byte windows (`offset` / `max_chars`); `delete` drops one; `pin` / `unpin` exempt a clip from eviction. |
-
-Clips are capped at 10 per user and evicted least-recently-used first, and a clip id that is
-gone reports *why* — deleted, evicted, or expired — rather than a bare "not found". See
-[Keeping bulk output out of the context window](#keeping-bulk-output-out-of-the-context-window).
 
 ## Markdown → PDF (Stirling-PDF)
 
@@ -367,61 +345,6 @@ run as the trusted `local` user).
 Documents carry `created_at`/`updated_at` but no validity window — document content is not a
 temporal fact, so there is no `as_of` / `invalidate` plumbing for them.
 
-### Keeping bulk output out of the context window
-
-[src/Auth/ClipboardStore.php](src/Auth/ClipboardStore.php) is a per-user, size-capped store
-(`memory_clips` / `memory_clip_tombstones` in `data/memory.sqlite`) that keeps bulky tool
-output on the server instead of in the model's context window.
-
-A tool opts in by declaring a threshold on its attribute:
-
-```php
-#[McpFunction(name: 'get_document', roles: self::REQUIRED_ROLES, offloadAt: self::OFFLOAD_BYTES)]
-```
-
-A text block larger than that is written to the clipboard and replaced, in the same response,
-by a receipt:
-
-```
-[offloaded] get_document produced 13,330 bytes of text, above the 8,000-byte inline limit for this tool.
-Stored as clip 2feb6c79d732fd47 — source get_document, expires 2026-09-11T08:20:03+00:00.
-The preview below is partial. Read the whole clip with: clipboard action=get id=2feb6c79d732fd47
-Preview (first 1,000 + last 1,000 of 13,330 bytes):
------8<-----
-<head 1,000 bytes>
-[... 11,330 bytes omitted ...]
-<tail 1,000 bytes>
------>8-----
-```
-
-The receipt is deliberately self-describing: it names the exact call that reads the clip back,
-because a handle the model does not know how to use is worse than no handle at all. It also
-reports the byte count it is hiding, and a head+tail preview — both ends matter, since tool
-output concentrates meaning at the start (JSON metadata, the first records) and at the end
-(totals, closing braces). Many questions can be answered from the preview alone.
-
-**Retention.** At most `clipboard.max_entries` (default 10) live clips per user. Eviction is
-true LRU on *last read*: `get` refreshes a clip's recency, while `list` deliberately does not —
-a table-of-contents read that refreshed all ten entries would collapse the ordering it exists
-to report. Pinned clips are exempt from eviction; `ttl_seconds` expires the rest, swept lazily
-on the next call since this codebase has no scheduler.
-
-**Dead handles stay diagnosable.** Eviction cannot leave the bytes behind, so it leaves a
-bounded record instead (metadata only, newest 32 per user). That turns a `get` on a dead id
-into an answer — *deleted at T*, *evicted at T by a later put of clip X*, *expired at T* —
-rather than a bare "not found". A caller told only "not found" for a clip it did hold will try
-to reconstruct the data; told what happened, it re-runs the tool that produced it.
-
-**Passing clips between tools.** This is where the real saving is. `ingest_document` and
-`convert_markdown_to_pdf` accept `clip_id` in place of their payload and resolve it
-server-side, so `convert_pdf_to_markdown` → 200 KB of Markdown → receipt →
-`ingest_document{"clip_id": ...}` costs a few dozen bytes of arguments instead of re-emitting
-the whole document as input tokens.
-
-Offloading is skipped for anonymous callers: the `clipboard` tool requires a role, and sharing
-one unknown-user clipboard between unrelated HTTP clients would not be safe. They keep
-receiving full results inline.
-
 The graph tools work in stdio mode too (the injected `local` user has full access):
 
 ```sh
@@ -497,24 +420,6 @@ public function getCurrentUser(array $arguments, ?UserContext $user = null): arr
 }
 ```
 
-### Offloading bulky results
-
-If a tool can return a lot of text, pass an `offloadAt` byte threshold. A text result larger
-than it is stored on the clipboard and the caller receives a receipt with a clip id instead of
-the payload (see [Clipboard](#clipboard-tool-output-offloading)). Nothing else changes:
-
-```php
-private const OFFLOAD_BYTES = 8000;
-
-#[McpFunction(name: 'get_document', roles: self::REQUIRED_ROLES, offloadAt: self::OFFLOAD_BYTES)]
-```
-
-The hook lives in the single `tools/call` funnel in [src/McpServer.php](src/McpServer.php), so
-it covers every tool without any per-tool plumbing — and it fails open: if the clipboard is
-unavailable or full, the result is returned inline exactly as before. Only `type: text`
-blocks are ever offloaded, the comparison is strict (`> offloadAt`), and a tool is never
-re-offered a result that is already a receipt.
-
 ## Users & access control
 
 Users are seeded from [config/users.php](config/users.php) into SQLite only when the `users`
@@ -584,13 +489,9 @@ OAuth handshake when `client_secret_basic` is offered, so DCR-registered clients
   as a dev fallback. `status: 'pending'` (or a missing password) marks a user for onboarding.
 - **[config/oauth.php](config/oauth.php)** — OAuth clients, token/code TTLs, whether plain
   PKCE is allowed, and an optional `registration_access_token` protecting `/oauth/register`.
-- **[config/config.php](config/config.php)** — global defaults, in two blocks.
-  `stirling_pdf.endpoint` / `stirling_pdf.api_key` configure the PDF tools, used in stdio mode
-  and as the fallback for HTTP accounts that left a field blank on the `/account` page. The
-  `clipboard` block tunes the output-offloading store: `max_entries`, `max_entry_bytes`,
-  `default_max_chars` / `hard_max_chars`, `preview_bytes`, `default_ttl_seconds` /
-  `max_ttl_seconds`, and `reveal_foreign_ids`. The built-in defaults and hard clamps live in
-  the stores themselves, so a missing key can never produce an unbounded clipboard.
+- **[config/config.php](config/config.php)** — global defaults for the PDF conversion tools
+  (`stirling_pdf.endpoint` / `stirling_pdf.api_key`), used in stdio mode and as the fallback
+  for HTTP accounts that left a field blank on the `/account` page.
 
 ## Project structure
 
@@ -599,31 +500,28 @@ index.php                     entry point — stdio loop, or HTTP router + auth 
 config/
   users.php                   seed users
   oauth.php                   OAuth clients, TTLs, registration token
-  config.php                  global defaults: PDF tools (endpoint + API key), clipboard limits
+  config.php                  global defaults for the PDF tools (endpoint + API key)
 src/
   McpServer.php               MCP core: tool registry, routing, access control, UserContext injection
   UserContext.php             immutable user value object (local() / anonymous() factories, * wildcard)
   StirlingPdfClient.php       Stirling-PDF client (both directions) + transport-aware config resolution
   PdfStore.php                saves generated PDFs under data/output + capability download URLs
-  Attributes/McpFunction.php  the #[McpFunction(name, description, schema, roles, permissions,
-                              offloadAt)] attribute
+  Attributes/McpFunction.php  the #[McpFunction(name, description, schema, roles, permissions)] attribute
   Tools/                      auto-discovered tool classes (CalculatorTool, AdminTool,
-                              MemoryTool, KnowledgeBaseTool, PdfTool, ClipboardTool, ...)
+                              MemoryTool, KnowledgeBaseTool, PdfTool, ...)
   Auth/
     Database.php              SQLite bootstrap + idempotent schema + user seeding
     UserStore.php             DB-backed accounts: auth, onboarding, change password
     SettingsStore.php         per-account settings editable on /account (Stirling-PDF endpoint + key)
     MemoryStore.php           per-user knowledge graph + FTS5 search (data/memory.sqlite)
     DocumentStore.php         per-user chunked document store + RAG retrieval
-    ClipboardStore.php         per-user clip store for bulky tool output (10-entry LRU + TTL)
     TokenStore.php            OAuth codes/access/refresh tokens (sha256-hashed, single-use, rotating)
     ClientStore.php           OAuth client registry: static config + RFC 7591 dynamic clients
     OAuthServer.php           authorize/token/register/discovery + resolveUser()
     AccountController.php     /account user-management pages (native sessions + CSRF)
     DebugLog.php              append-only diagnostics log to data/requests.log
 data/                         runtime-only, gitignored (app.sqlite, memory.sqlite,
-                              requests.log, sessions/, output/ for generated PDFs).
-                              memory.sqlite holds the graph, documents, and clips
+                              requests.log, sessions/, output/ for generated PDFs)
 ```
 
 ## Notes & gotchas
@@ -646,17 +544,6 @@ data/                         runtime-only, gitignored (app.sqlite, memory.sqlit
 - The HTTP server is stateless about MCP sessions: it mints an `Mcp-Session-Id` on
   `initialize` (needed by some clients, e.g. Cherry Studio) and echoes it back, but stores
   nothing.
-- A tool result over its `offloadAt` threshold comes back as an `[offloaded]` receipt instead
-  of the text. It is still `isError: false` — the call succeeded, and the result is retrievable
-  by clip id.
-- `clipboard action=get` pages in **bytes**, despite the `max_chars` argument name (a byte cut
-  is UTF-8-safe and errs conservative), so a CJK clip returns fewer characters than the number
-  you pass.
-- Clips are scoped to the account that created them. A clip stored over stdio (the `local`
-  user) is not visible to an HTTP account, and another account's clip id resolves to "not
-  found in this account" rather than leaking anything about it.
-- Eviction is real data loss. Pinned clips survive it; everything else is gone once an 11th
-  unpinned clip arrives, so treat a stale receipt as "re-run the producing tool".
 - `vendor/` contains unused leftovers (phpdotenv, extendorm) not declared in `composer.json`.
 
 ## License

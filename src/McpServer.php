@@ -9,17 +9,9 @@ use ReflectionMethod;
 use ReflectionNamedType;
 use Throwable;
 use McpServer\Attributes\McpFunction;
-use McpServer\Auth\ClipboardStore;
-use McpServer\Auth\DebugLog;
 
 class McpServer {
-    /**
-     * Marks a text block that is already an offload receipt, so the funnel never
-     * wraps a receipt in a second clip.
-     */
-    private const OFFLOAD_MARKER = '[offloaded]';
-
-    /** @var array<string, array{instance: object, method: string, name: string, description: string, schema: array|object, roles: string[], permissions: string[], userIndex: int|null, enabledCheck: (callable(?UserContext): bool)|null, offloadAt: int}> */
+    /** @var array<string, array{instance: object, method: string, name: string, description: string, schema: array|object, roles: string[], permissions: string[], userIndex: int|null, enabledCheck: (callable(?UserContext): bool)|null}> */
     private array $tools = [];
 
     /** The user for the current request; defaults to the trusted local user. */
@@ -48,7 +40,6 @@ class McpServer {
                 'enabledCheck' => method_exists($toolContainer, 'isAvailable')
                     ? [$toolContainer, 'isAvailable']
                     : null,
-                'offloadAt' => $mcpFunction->offloadAt,
             ];
         }
     }
@@ -173,10 +164,8 @@ class McpServer {
                         $callArgs[$tool['userIndex']] = $this->user;
                     }
 
-                    $content = $tool['instance']->{$tool['method']}(...$callArgs);
-
                     return $this->createSuccess($id, [
-                        'content' => $this->maybeOffload($content, $tool, $this->user ?? UserContext::local()),
+                        'content' => $tool['instance']->{$tool['method']}(...$callArgs),
                         'isError' => false
                     ]);
                 })(),
@@ -189,109 +178,6 @@ class McpServer {
             // error instead of killing the request with a 500 HTML page.
             return $this->createError($id, -32603, "Internal server error: " . $e->getMessage());
         }
-    }
-
-    /**
-     * Replace oversized text content blocks with clipboard receipts.
-     *
-     * Every MCP tool result is fed to the model verbatim, so a tool that returns a
-     * large payload fills the context window. A tool that declares `offloadAt`
-     * opts into having such a block stored as a clip and swapped for a short
-     * receipt carrying the clip id — the caller can read it back on demand, or
-     * pass the id to a tool that accepts `clip_id` so the bytes never enter the
-     * context window at all.
-     *
-     * This is purely an optimisation, and is written to fail open: any failure to
-     * store leaves the block untouched, so a broken, full, or absent clipboard
-     * degrades to the current behaviour rather than failing the tool call.
-     *
-     * @param array<int, array<string, mixed>> $content blocks returned by the tool
-     * @param array<string, mixed> $tool the registry entry for the tool
-     * @return array<int, array<string, mixed>>
-     */
-    private function maybeOffload(array $content, array $tool, UserContext $user): array {
-        $threshold = (int) ($tool['offloadAt'] ?? 0);
-        if ($threshold <= 0 || !$this->clipboardAvailable()) {
-            return $content;
-        }
-
-        foreach ($content as $index => $block) {
-            // Only plain text can occupy a clip's TEXT column; images, audio and
-            // resource blocks stay inline because the caller needs them as-is.
-            if (!is_array($block) || ($block['type'] ?? '') !== 'text') {
-                continue;
-            }
-
-            $text = $block['text'] ?? null;
-            // `offloadAt: 8000` reads as "up to 8,000 bytes inline", so the
-            // boundary is strict.
-            if (!is_string($text) || strlen($text) <= $threshold) {
-                continue;
-            }
-
-            if (str_starts_with($text, self::OFFLOAD_MARKER)) {
-                continue;
-            }
-
-            try {
-                $store = new ClipboardStore();
-                $stored = $store->put($user->username, $text, '', (string) $tool['name']);
-
-                if (isset($stored['error'])) {
-                    // A payload over the per-clip cap will never fit, so say why
-                    // it stayed inline instead of letting the caller assume the
-                    // offload happened.
-                    if (($stored['reason'] ?? '') === 'too_large') {
-                        $content[] = [
-                            'type' => 'text',
-                            'text' => 'Note: this result is ' . number_format(strlen($text))
-                                . " bytes, over the clipboard's per-clip limit, so it was returned inline. Consider ingest_document to store it.",
-                        ];
-                    }
-                    continue;
-                }
-
-                $receipt = $store->offloadReceipt((string) $tool['name'], $stored, $text, $threshold);
-                if ($receipt === null) {
-                    continue;
-                }
-
-                $content[$index] = $receipt;
-
-                // Replacing the block drops any pagination fields the result
-                // carried itself, so point the caller at the head of the clip.
-                if (self::looksLikeJson($text)) {
-                    $content[] = [
-                        'type' => 'text',
-                        'text' => 'Note: this result was a JSON document; its own pagination fields (limit/offset/nextOffset) are inside the clip'
-                            . ' — read the head of the clip (clipboard action=get id=' . $stored['id'] . ' max_chars=2000) to recover them.',
-                    ];
-                }
-
-                DebugLog::write('clipboard offload tool=' . $tool['name'] . ' bytes=' . strlen($text) . ' clip=' . $stored['id']);
-            } catch (Throwable $e) {
-                DebugLog::write('clipboard offload FAILED tool=' . $tool['name'] . ' error=' . $e->getMessage());
-                continue;
-            }
-        }
-
-        return $content;
-    }
-
-    /**
-     * Whether offloading is offered at all. It requires the `clipboard` tool to
-     * exist and the current caller to be allowed to use it, so anonymous HTTP
-     * callers keep receiving full results inline — they would otherwise share a
-     * single unknown username's clipboard between unrelated clients.
-     */
-    private function clipboardAvailable(): bool {
-        return isset($this->tools['clipboard']) && $this->canCall($this->tools['clipboard']);
-    }
-
-    /** A cheap "this looks like a JSON document" probe, for the receipt's hint. */
-    private static function looksLikeJson(string $text): bool {
-        $head = ltrim($text);
-        return str_starts_with($head, '{') || str_starts_with($head, '[');
     }
 
     /**

@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace McpServer\Tools;
 
 use McpServer\Attributes\McpFunction;
-use McpServer\Auth\ClipboardStore;
 use McpServer\Auth\DocumentStore;
 use McpServer\Auth\MemoryStore;
 use McpServer\UserContext;
@@ -30,23 +29,14 @@ readonly class KnowledgeBaseTool {
     /** @var string[] login required, mirroring MemoryTool::REQUIRED_ROLES */
     private const REQUIRED_ROLES = ['user', 'admin'];
 
-    /**
-     * Results above this many bytes are stored on the clipboard and replaced by
-     * a receipt, so reading a large document back never floods the context window.
-     */
-    private const OFFLOAD_BYTES = 8000;
-
-    /** Retrieval returns many small chunks; only a degenerate result is offloaded. */
-    private const OFFLOAD_RETRIEVAL_BYTES = 16000;
-
     #[McpFunction(
         name: 'ingest_document',
         roles: self::REQUIRED_ROLES,
-        description: 'Ingest a text-based document (txt, markdown, csv, json, html, code) into the knowledge base. The content is split into overlapping chunks for retrieval. Re-ingesting the same id (default: derived from the filename) replaces the previous version. Returns the document id, the chunk ids and the chunk count. Pass clip_id instead of content to ingest a payload the server already holds (e.g. an [offloaded] tool result) without re-sending it through the context window.',
+        description: 'Ingest a text-based document (txt, markdown, csv, json, html, code) into the knowledge base. The content is split into overlapping chunks for retrieval. Re-ingesting the same id (default: derived from the filename) replaces the previous version. Returns the document id, the chunk ids and the chunk count.',
         schema: [
             'type' => 'object',
             'properties' => [
-                'content' => ['type' => 'string', 'description' => 'The raw text of the document to ingest. Omit when using clip_id.'],
+                'content' => ['type' => 'string', 'description' => 'The raw text of the document to ingest.'],
                 'filename' => ['type' => 'string', 'description' => 'Name of the file (used for the default id and format inference).'],
                 'id' => ['type' => 'string', 'description' => 'Optional stable id for the document. Defaults to a slug of the filename; re-using an existing id replaces that document.'],
                 'format' => ['type' => 'string', 'enum' => ['text', 'markdown', 'csv', 'json', 'html', 'code'], 'description' => 'Optional file format. Defaults to a guess from the filename extension.'],
@@ -54,27 +44,12 @@ readonly class KnowledgeBaseTool {
                 'source' => ['type' => 'string', 'description' => 'Optional provenance note, e.g. a URL or file path.'],
                 'chunk_size' => ['type' => 'integer', 'default' => 1000, 'minimum' => 50, 'maximum' => 8000, 'description' => 'Target chunk length in characters.'],
                 'chunk_overlap' => ['type' => 'integer', 'default' => 150, 'minimum' => 0, 'maximum' => 2000, 'description' => 'Characters of overlap carried between consecutive chunks so context spans boundaries.'],
-                'clip_id' => ['type' => 'string', 'description' => 'Optional: id of a clipboard clip holding the document text. Use instead of content so a large payload never has to be re-sent. Takes precedence over content when both are given.'],
             ],
-            'required' => ['filename'],
+            'required' => ['content', 'filename'],
         ]
     )]
     public function ingestDocument(array $arguments, ?UserContext $user = null): array {
         $user ??= UserContext::anonymous();
-
-        // A clip_id is the cheap path: the bytes are already on this server, so
-        // the caller passes ~20 characters instead of re-emitting the payload.
-        $clipId = trim((string) ($arguments['clip_id'] ?? ''));
-        $fromClip = false;
-        if ($clipId !== '') {
-            $clip = (new ClipboardStore())->readContent($user->username, $clipId);
-            if (isset($clip['error'])) {
-                return [['type' => 'text', 'text' => 'Error: ' . $clip['error']]];
-            }
-            $arguments['content'] = $clip['content'];
-            $fromClip = true;
-        }
-
         $result = (new DocumentStore())->ingestDocument($user->username, $arguments);
         if (isset($result['error'])) {
             return [['type' => 'text', 'text' => 'Error: ' . $result['error']]];
@@ -88,19 +63,13 @@ readonly class KnowledgeBaseTool {
         }
         $text .= "\n\nChunks:\n" . implode("\n", $result['chunks']);
 
-        if ($fromClip) {
-            $text .= "\n\nNote: content came from clip $clipId; the clip is still stored"
-                . " (delete it with clipboard action=delete id=$clipId to free a slot).";
-        }
-
         return [['type' => 'text', 'text' => $text]];
     }
 
     #[McpFunction(
         name: 'retrieve',
         roles: self::REQUIRED_ROLES,
-        offloadAt: self::OFFLOAD_RETRIEVAL_BYTES,
-        description: 'Retrieve the most relevant document chunks for a query (RAG retrieval). keyword = BM25 via the SQLite FTS5 index; semantic = fuzzy character n-gram similarity (resilient to typos and CJK text); hybrid = both fused with Reciprocal Rank Fusion (default). Pass document_id to scope retrieval to one document, and include_graph to also fuse matching knowledge-graph entities into the result under an "entities" key. A result over 16,000 bytes is stored on the server as a clipboard clip and replaced by a short receipt with a clip id.',
+        description: 'Retrieve the most relevant document chunks for a query (RAG retrieval). keyword = BM25 via the SQLite FTS5 index; semantic = fuzzy character n-gram similarity (resilient to typos and CJK text); hybrid = both fused with Reciprocal Rank Fusion (default). Pass document_id to scope retrieval to one document, and include_graph to also fuse matching knowledge-graph entities into the result under an "entities" key.',
         schema: [
             'type' => 'object',
             'properties' => [
@@ -148,8 +117,7 @@ readonly class KnowledgeBaseTool {
     #[McpFunction(
         name: 'list_documents',
         roles: self::REQUIRED_ROLES,
-        offloadAt: self::OFFLOAD_BYTES,
-        description: 'List the documents ingested into the current user\'s knowledge base: id, filename, format, title, source, chunk count and timestamps. A result over 8,000 bytes is stored on the server as a clipboard clip and replaced by a short receipt with a clip id — read the full list with clipboard action=get id=<id>.',
+        description: 'List the documents ingested into the current user\'s knowledge base: id, filename, format, title, source, chunk count and timestamps.',
         schema: [
             'type' => 'object',
             'properties' => new \stdClass(), // encodes as {} so MCP clients accept it as a record
@@ -164,8 +132,7 @@ readonly class KnowledgeBaseTool {
     #[McpFunction(
         name: 'get_document',
         roles: self::REQUIRED_ROLES,
-        offloadAt: self::OFFLOAD_BYTES,
-        description: 'Get a document from the current user\'s knowledge base: its metadata plus the full text as chunks in document order. Results over 8,000 bytes are stored on the server as a clipboard clip and replaced by a short receipt with a clip id — read the full text with clipboard action=get id=<id> (in byte windows), or pass the id straight to ingest_document as clip_id.',
+        description: 'Get a document from the current user\'s knowledge base: its metadata plus the full text as chunks in document order.',
         schema: [
             'type' => 'object',
             'properties' => [

@@ -39,22 +39,10 @@ use McpServer\UserContext;
  * one the tools are disabled entirely — hidden from `tools/list`, and a
  * direct `tools/call` is answered with tool-not-found (-32601) as if the
  * tool didn't exist.
- *
- * Context window: an extracted document is unbounded, so `convert_pdf_to_markdown`
- * declares an `offloadAt` threshold — a result larger than it is stored as a
- * per-user clipboard clip and replaced by a short receipt (see
- * {@see \McpServer\Auth\ClipboardStore}).
  */
 readonly class PdfTool {
     /** @var string[] login required, mirroring MemoryTool::REQUIRED_ROLES */
     private const REQUIRED_ROLES = ['user', 'admin'];
-
-    /**
-     * An extracted document is unbounded, so the PDF -> Markdown result is the
-     * canonical case for offloading: above this size the Markdown is stored on
-     * the clipboard and the tool returns a receipt instead of the text.
-     */
-    private const OFFLOAD_BYTES = 8000;
 
     /**
      * Registration gate consulted by the MCP server: the tools exist only when
@@ -127,8 +115,7 @@ readonly class PdfTool {
     #[McpFunction(
         name: 'convert_pdf_to_markdown',
         roles: self::REQUIRED_ROLES,
-        offloadAt: self::OFFLOAD_BYTES,
-        description: 'Convert a PDF document into Markdown text using the configured Stirling-PDF server. Accepts an input file path and exports the resulting Markdown file with the same name and into the same directory as the input file, while returning the extracted Markdown content. The Markdown file is written alongside the input regardless; a returned result over 8,000 bytes is stored on the server as a clipboard clip and replaced by a short receipt with a clip id — read the Markdown back with clipboard action=get id=<id> (in byte windows), or pass the id straight to ingest_document as clip_id so it never enters the context window.',
+        description: 'Convert a PDF document into Markdown text using the configured Stirling-PDF server. Accepts an input file path and exports the resulting Markdown file with the same name and into the same directory as the input file, while returning the extracted Markdown content.',
         schema: [
             'type' => 'object',
             'properties' => [
@@ -388,4 +375,4 @@ readonly class PdfTool {
 
         return [['type' => 'text', 'text' => $text]];
     }
-}
+}
