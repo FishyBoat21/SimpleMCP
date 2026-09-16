@@ -59,6 +59,7 @@ final class DocumentStore {
             );
 
             CREATE INDEX IF NOT EXISTS idx_memory_documents_username ON memory_documents(username);
+            CREATE INDEX IF NOT EXISTS idx_memory_documents_filename ON memory_documents(username, filename);
 
             CREATE TABLE IF NOT EXISTS memory_chunks (
                 id          TEXT NOT NULL,
@@ -72,6 +73,7 @@ final class DocumentStore {
             );
 
             CREATE INDEX IF NOT EXISTS idx_memory_chunks_document ON memory_chunks(username, document_id);
+            CREATE INDEX IF NOT EXISTS idx_memory_chunks_username ON memory_chunks(username);
 
             CREATE VIRTUAL TABLE IF NOT EXISTS memory_chunks_fts USING fts5(
                 username    UNINDEXED,
