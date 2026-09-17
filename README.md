@@ -139,7 +139,7 @@ direct call is answered with tool-not-found).
 | `convert_markdown_to_pdf` | Render a Markdown file to a PDF via the Stirling-PDF `/api/v1/convert/markdown/pdf` endpoint. Accepts an input file path (`path`) and exports the resulting PDF to the same directory with the same name (`<name>.pdf`). |
 | `convert_pdf_to_markdown` | Extract Markdown text from a PDF file via the `/api/v1/convert/pdf/markdown` endpoint. Accepts an input file path (`path`), exports the extracted Markdown to the same directory with the same name (`<name>.md`), and returns the Markdown in the tool result. |
 | `convert_image_to_pdf` | Convert an image file (PNG, JPG, WEBP, GIF, BMP, TIFF, SVG) to a PDF via the Stirling-PDF `/api/v1/convert/img/pdf` endpoint. Accepts an input file path (`path`) and exports the resulting PDF to the same directory with the same name (`<name>.pdf`). |
-| `convert_pdf_to_image` | Convert a PDF file to image(s) via the Stirling-PDF `/api/v1/convert/pdf/img` endpoint. Accepts an input file path (`path`) and exports the resulting image (or ZIP archive for multiple pages) to the same directory (`<name>.<format>` or `<name>.zip`). |
+| `convert_pdf_to_image` | Convert a PDF file to image(s) via the Stirling-PDF `/api/v1/convert/pdf/img` endpoint. Accepts an input file path (`path`) and exports the resulting image(s) directly to the source directory (`<dir>/<name>.<format>` or unzipped page images `<dir>/<name>_<n>.<format>`). |
 
 ## Markdown → PDF (Stirling-PDF)
 
@@ -263,19 +263,22 @@ printf '%s\n%s\n' \
 ## PDF → Image (Stirling-PDF)
 
 `convert_pdf_to_image` posts a PDF to `{endpoint}/api/v1/convert/pdf/img` and exports the converted
-image to `<dir>/<name>.<format>` (or `<dir>/<name>.zip` for multi-page extractions). When a ZIP archive
-is returned and PHP's `ZipArchive` extension is available, individual page images are also extracted
-directly into `<dir>`.
+image(s) directly into the source directory (`<dir>/<name>.<format>` for single images, or unzipped
+individual page images `<dir>/<name>_<n>.<format>` for multi-page extractions). When a multi-page ZIP
+archive is returned, it is automatically unzipped directly into the source directory (`<dir>`), and the
+temporary ZIP file is removed (unless `keep_zip: true` is passed). Extraction supports PHP's `ZipArchive`
+with fallback to system tools (`tar`, `powershell`, or `unzip`).
 
 | Argument | Type | Default | Notes |
 |----------|------|---------|-------|
 | `path` | string | *required* | Path of the PDF file to convert. |
 | `input_file_path` | string | optional | Alias for `path`. |
 | `image_format` | string | `'png'` | Output format: `png`, `jpeg`, `jpg`, `gif`, or `webp`. |
-| `single_or_multiple` | string | `'single'` | `'single'` merges all pages into one continuous image; `'multiple'` exports separate images per page (packaged as ZIP). |
+| `single_or_multiple` | string | `'single'` | `'single'` merges all pages into one continuous image; `'multiple'` exports separate images per page (unzipped into source directory). |
 | `page_numbers` | string | `'all'` | Pages to convert: `'all'` or ranges/subsets like `'1'`, `'1,3,5-9'`. |
 | `color_type` | string | `'color'` | `'color'`, `'greyscale'`, or `'blackandwhite'`. |
 | `dpi` | integer | `300` | Resolution in dots per inch. |
+| `keep_zip` | boolean | `false` | Whether to retain the ZIP archive alongside unzipped images for multi-page conversions. |
 
 Smoke test over stdio:
 

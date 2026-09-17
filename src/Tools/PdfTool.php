@@ -21,7 +21,7 @@ use McpServer\UserContext;
  *   - `convert_image_to_pdf`: accepts an image file path (PNG, JPG, WEBP, GIF, etc.)
  *     and writes the rendered PDF to `<dir>/<name>.pdf`.
  *   - `convert_pdf_to_image`: accepts a PDF file path and writes the rendered
- *     image to `<dir>/<name>.<format>` (or `<dir>/<name>.zip` for multiple pages).
+ *     image(s) directly to the source directory `<dir>` (unzips multi-page archives).
  *
  * Connection settings are transport-aware ({@see StirlingPdfClient::forUser()}):
  *
@@ -265,11 +265,11 @@ readonly class PdfTool {
     #[McpFunction(
         name: 'convert_pdf_to_image',
         roles: self::REQUIRED_ROLES,
-        description: 'Convert a PDF document into image(s) using the configured Stirling-PDF server. Accepts an input file path and exports the resulting image file (or ZIP archive for multiple pages) with the same name and into the same directory as the input file.',
+        description: 'Convert a PDF document into image(s) using the configured Stirling-PDF server. Accepts an input file path and exports the resulting image file(s) into the source directory of the input file (automatically unzipping multi-page archives into the source directory).',
         schema: [
             'type' => 'object',
             'properties' => [
-                'path' => ['type' => 'string', 'description' => 'Path of the PDF file to convert. The resulting image is exported to the same directory with the same name (<name>.<format> or <name>.zip).'],
+                'path' => ['type' => 'string', 'description' => 'Path of the PDF file to convert. The resulting image(s) are exported to the source directory (<name>.<format> or unzipped page images).'],
                 'input_file_path' => ['type' => 'string', 'description' => 'Alias for path.'],
                 'image_format' => [
                     'type' => 'string',
@@ -278,7 +278,7 @@ readonly class PdfTool {
                 ],
                 'single_or_multiple' => [
                     'type' => 'string',
-                    'description' => 'Choose between "single" (single image containing all pages, default) or "multiple" (separate images per page, packaged into a ZIP archive).',
+                    'description' => 'Choose between "single" (single image containing all pages, default) or "multiple" (separate images per page, unzipped into the source directory).',
                     'enum' => ['single', 'multiple'],
                 ],
                 'page_numbers' => [
@@ -293,6 +293,10 @@ readonly class PdfTool {
                 'dpi' => [
                     'type' => 'integer',
                     'description' => 'The DPI (dots per inch) for the output image(s) (default: 300).',
+                ],
+                'keep_zip' => [
+                    'type' => 'boolean',
+                    'description' => 'Whether to retain the ZIP archive alongside the unzipped images when multiple pages are converted (default: false).',
                 ],
             ],
             'required' => ['path'],
@@ -332,6 +336,7 @@ readonly class PdfTool {
         $pageNumbers = (string) ($arguments['page_numbers'] ?? 'all');
         $colorType = (string) ($arguments['color_type'] ?? 'color');
         $dpi = (int) ($arguments['dpi'] ?? 300);
+        $keepZip = (bool) ($arguments['keep_zip'] ?? false);
 
         $settings = StirlingPdfClient::forUser($user);
         $client = new StirlingPdfClient($settings['endpoint'], $settings['api_key']);
@@ -346,33 +351,140 @@ readonly class PdfTool {
         }
 
         $isZip = (bool) ($result['isZip'] ?? false);
-        $ext = $isZip ? 'zip' : $imageFormat;
-        $outputFilename = ($baseName !== '' ? $baseName : 'document') . '.' . $ext;
         $sep = str_contains($path, '/') && !str_contains($path, '\\') ? '/' : DIRECTORY_SEPARATOR;
+
+        if ($isZip) {
+            $zipFilename = ($baseName !== '' ? $baseName : 'document') . '.zip';
+            $zipPath = ($dir === '.' ? '' : $dir . $sep) . $zipFilename;
+
+            if (@file_put_contents($zipPath, (string) $result['data']) === false) {
+                return [['type' => 'text', 'text' => "Error: could not write ZIP file to '{$zipPath}'."]];
+            }
+
+            $extractedFiles = $this->extractZip($zipPath, $dir);
+
+            if (!empty($extractedFiles)) {
+                if (!$keepZip) {
+                    @unlink($zipPath);
+                }
+
+                $outputPaths = array_map(fn(string $f): string => ($dir === '.' ? '' : $dir . $sep) . $f, $extractedFiles);
+                $outputDisplay = count($outputPaths) === 1
+                    ? $outputPaths[0]
+                    : implode(', ', $outputPaths);
+
+                $text = 'Converted PDF to Image via Stirling-PDF (' . $result['endpoint'] . ").\n"
+                    . 'Input: ' . $path . "\n"
+                    . 'Output: ' . $outputDisplay . "\n"
+                    . 'Extracted: ' . count($extractedFiles) . " image file(s) into source directory '{$dir}'." . "\n"
+                    . 'Size: ' . $result['bytes'] . " bytes\n"
+                    . 'MIME: image/' . $imageFormat
+                    . ($keepZip ? "\nArchive: " . $zipPath : '');
+
+                return [['type' => 'text', 'text' => $text]];
+            }
+
+            // Fallback if extraction failed: retain the zip and report it
+            $text = 'Converted PDF to Image via Stirling-PDF (' . $result['endpoint'] . ").\n"
+                . 'Input: ' . $path . "\n"
+                . 'Output: ' . $zipPath . "\n"
+                . 'Size: ' . $result['bytes'] . " bytes\n"
+                . 'MIME: application/zip' . "\n"
+                . "Warning: could not extract ZIP archive into directory '{$dir}'. The ZIP file has been retained.";
+
+            return [['type' => 'text', 'text' => $text]];
+        }
+
+        $outputFilename = ($baseName !== '' ? $baseName : 'document') . '.' . $imageFormat;
         $outputPath = ($dir === '.' ? '' : $dir . $sep) . $outputFilename;
 
         if (@file_put_contents($outputPath, (string) $result['data']) === false) {
             return [['type' => 'text', 'text' => "Error: could not write image file to '{$outputPath}'."]];
         }
 
-        // If a ZIP was returned and ZipArchive is available, extract pages alongside the zip
-        $extractedNote = '';
-        if ($isZip && class_exists(\ZipArchive::class)) {
-            $zip = new \ZipArchive();
-            if ($zip->open($outputPath) === true) {
-                $zip->extractTo($dir);
-                $extractedNote = "\nExtracted: " . $zip->numFiles . " image file(s) into directory '{$dir}'.";
-                $zip->close();
-            }
-        }
-
         $text = 'Converted PDF to Image via Stirling-PDF (' . $result['endpoint'] . ").\n"
             . 'Input: ' . $path . "\n"
             . 'Output: ' . $outputPath . "\n"
             . 'Size: ' . $result['bytes'] . " bytes\n"
-            . 'MIME: ' . $result['mimeType']
-            . $extractedNote;
+            . 'MIME: ' . $result['mimeType'];
 
         return [['type' => 'text', 'text' => $text]];
+    }
+
+    /**
+     * Extract a ZIP archive into a destination directory.
+     *
+     * Tries PHP's ZipArchive first, then falls back to system CLI tools (`tar`, `powershell`, or `unzip`).
+     *
+     * @return string[] list of relative file paths extracted, or empty array on failure
+     */
+    private function extractZip(string $zipPath, string $destinationDir): array {
+        $realDest = realpath($destinationDir) ?: $destinationDir;
+
+        // 1. Try PHP's ZipArchive if available
+        if (class_exists(\ZipArchive::class)) {
+            $zip = new \ZipArchive();
+            if ($zip->open($zipPath) === true) {
+                $files = [];
+                for ($i = 0; $i < $zip->numFiles; $i++) {
+                    $name = $zip->getNameIndex($i);
+                    if ($name !== false && !str_ends_with($name, '/') && !str_ends_with($name, '\\')) {
+                        $files[] = $name;
+                    }
+                }
+                if ($zip->extractTo($realDest)) {
+                    $zip->close();
+                    return $files;
+                }
+                $zip->close();
+            }
+        }
+
+        // 2. Fallback: tar (standard on Windows 10/11, macOS, and Linux)
+        if (function_exists('exec')) {
+            $cmd = 'tar -xf ' . escapeshellarg($zipPath) . ' -C ' . escapeshellarg($realDest);
+            $out = [];
+            $code = -1;
+            @exec($cmd, $out, $code);
+            if ($code === 0) {
+                $listCmd = 'tar -tf ' . escapeshellarg($zipPath);
+                $listOut = [];
+                @exec($listCmd, $listOut, $listCode);
+                $files = [];
+                foreach ($listOut as $line) {
+                    $line = trim($line);
+                    if ($line !== '' && !str_ends_with($line, '/') && !str_ends_with($line, '\\')) {
+                        $files[] = $line;
+                    }
+                }
+                return $files;
+            }
+        }
+
+        // 3. Fallback: PowerShell Expand-Archive (Windows)
+        if (PHP_OS_FAMILY === 'Windows' && function_exists('exec')) {
+            $psCmd = 'powershell.exe -NoProfile -NonInteractive -Command ' . escapeshellarg(
+                'Expand-Archive -LiteralPath ' . escapeshellarg($zipPath) . ' -DestinationPath ' . escapeshellarg($realDest) . ' -Force'
+            );
+            $out = [];
+            $code = -1;
+            @exec($psCmd, $out, $code);
+            if ($code === 0) {
+                return ['extracted'];
+            }
+        }
+
+        // 4. Fallback: unzip (Linux / macOS)
+        if (function_exists('exec')) {
+            $cmd = 'unzip -o ' . escapeshellarg($zipPath) . ' -d ' . escapeshellarg($realDest);
+            $out = [];
+            $code = -1;
+            @exec($cmd, $out, $code);
+            if ($code === 0) {
+                return ['extracted'];
+            }
+        }
+
+        return [];
     }
 }
