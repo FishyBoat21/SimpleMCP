@@ -16,7 +16,7 @@ namespace McpServer\Auth;
  */
 final class MountPath {
     /** Route segments that can only originate from this app. */
-    private const ROUTE_SEGMENTS = ['/.well-known/', '/oauth/', '/account'];
+    private const ROUTE_SEGMENTS = ['/.well-known/', '/oauth/', '/account', '/download/'];
 
     /**
      * The mount prefix for the current request (e.g. `/SimpleMCP`), or `''`
@@ -50,5 +50,20 @@ final class MountPath {
             $path = substr($path, strlen($mount));
         }
         return '/' . ltrim(rtrim($path, '/'), '/');
+    }
+
+    /**
+     * The absolute base URL of this app for the current request, including the
+     * mount prefix — e.g. `https://host/SimpleMCP`. Built from the request so
+     * links (OAuth metadata, generated-file downloads) work wherever the app is
+     * hosted.
+     *
+     * @param array<string, mixed> $server  $_SERVER
+     */
+    public static function origin(array $server): string {
+        $https = ($server['HTTPS'] ?? '') !== '' && ($server['HTTPS'] ?? '') !== 'off';
+        $scheme = $https ? 'https' : 'http';
+        $host = $server['HTTP_HOST'] ?? 'localhost';
+        return $scheme . '://' . $host . self::from($server);
     }
 }

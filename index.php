@@ -10,9 +10,11 @@ use McpServer\Auth\Database;
 use McpServer\Auth\DebugLog;
 use McpServer\Auth\MountPath;
 use McpServer\Auth\OAuthServer;
+use McpServer\Auth\SettingsStore;
 use McpServer\Auth\TokenStore;
 use McpServer\Auth\UserStore;
 use McpServer\McpServer;
+use McpServer\PdfStore;
 use McpServer\UserContext;
 
 $server = new McpServer();
@@ -70,7 +72,31 @@ if (php_sapi_name() === 'cli') {
 
         $post = [];
         parse_str(file_get_contents('php://input'), $post);
-        sendResponse((new AccountController($userStore, $mount))->handle($method, $path, $_GET, $post));
+        sendResponse((new AccountController($userStore, $mount, new SettingsStore($db)))->handle($method, $path, $_GET, $post));
+        exit;
+    }
+
+    // Generated-file downloads (markdown→PDF output). The URL carries an
+    // unguessable token (see PdfStore), so it works without a session while
+    // remaining non-enumerable; the resolver rejects anything outside
+    // data/output. data/ itself is never served statically.
+    if (str_starts_with($path, '/download/')) {
+        $parts = array_values(array_filter(
+            explode('/', substr($path, strlen('/download/'))),
+            static fn(string $s): bool => $s !== '',
+        ));
+        $file = count($parts) === 2 ? PdfStore::resolve($parts[0], $parts[1]) : null;
+        if ($file === null) {
+            http_response_code(404);
+            header('Content-Type: text/plain; charset=utf-8');
+            echo 'Not found.';
+            exit;
+        }
+        header('Content-Type: application/pdf');
+        header('Content-Disposition: inline; filename="' . basename($file) . '"');
+        header('Content-Length: ' . (string) filesize($file));
+        header('Cache-Control: private, no-store');
+        readfile($file);
         exit;
     }
 

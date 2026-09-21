@@ -19,7 +19,7 @@ return [
         'username' => 'admin',
         'name' => 'Administrator',
         'password' => '$2y$12$SykCZauQsdZmUCNyuXFzleOa5fsmOKW.94nFh40lnHnCiWzeaNw02', // admin123
-        'roles' => ['admin'],
+        'roles' => ['admin', 'user'],
         'permissions' => ['*'],
         'status' => 'active',
     ],

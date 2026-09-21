@@ -11,7 +11,7 @@ use Throwable;
 use McpServer\Attributes\McpFunction;
 
 class McpServer {
-    /** @var array<string, array{instance: object, method: string, name: string, description: string, schema: array|object, roles: string[], permissions: string[], userIndex: int|null}> */
+    /** @var array<string, array{instance: object, method: string, name: string, description: string, schema: array|object, roles: string[], permissions: string[], userIndex: int|null, enabledCheck: (callable(?UserContext): bool)|null}> */
     private array $tools = [];
 
     /** The user for the current request; defaults to the trusted local user. */
@@ -37,6 +37,9 @@ class McpServer {
                 'roles' => $mcpFunction->roles,
                 'permissions' => $mcpFunction->permissions,
                 'userIndex' => self::userParameterIndex($method),
+                'enabledCheck' => method_exists($toolContainer, 'isAvailable')
+                    ? [$toolContainer, 'isAvailable']
+                    : null,
             ];
         }
     }
@@ -142,6 +145,14 @@ class McpServer {
 
                     $tool = $this->tools[$name];
 
+                    // A disabled tool (its container reports itself unavailable,
+                    // e.g. backend not configured) is treated as if it never
+                    // existed — tool not found, not an access error.
+                    $enabledCheck = $tool['enabledCheck'] ?? null;
+                    if ($enabledCheck !== null && !$enabledCheck($this->user)) {
+                        return $this->createError($id, -32601, "Tool not found: $name");
+                    }
+
                     if (!$this->canCall($tool)) {
                         return $this->createError($id, -32001, "Access denied: insufficient permissions for tool: $name");
                     }
@@ -170,12 +181,20 @@ class McpServer {
     }
 
     /**
-     * Access rule: a tool that declares roles and/or permissions requires the
-     * caller to match within every declared category (any match within a
-     * category suffices). A tool with no requirements is public.
+     * Access rule: a tool whose container reports itself unavailable (see
+     * `isAvailable()` on the tool class, e.g. a missing backend config) is
+     * disabled for everyone — hidden from tools/list and not callable. A tool
+     * that declares roles and/or permissions further requires the caller to
+     * match within every declared category (any match within a category
+     * suffices). A tool with no requirements is public.
      */
     private function canCall(array $tool, ?UserContext $user = null): bool {
         $user ??= $this->user ?? UserContext::local();
+
+        if (($tool['enabledCheck'] ?? null) !== null && !($tool['enabledCheck'])($user)) {
+            return false;
+        }
+
         $roles = $tool['roles'] ?? [];
         $permissions = $tool['permissions'] ?? [];
 
