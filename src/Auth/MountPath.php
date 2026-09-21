@@ -16,7 +16,7 @@ namespace McpServer\Auth;
  */
 final class MountPath {
     /** Route segments that can only originate from this app. */
-    private const ROUTE_SEGMENTS = ['/.well-known/', '/oauth/', '/account', '/download/'];
+    private const ROUTE_SEGMENTS = ['/.well-known/', '/oauth/', '/account'];
 
     /**
      * The mount prefix for the current request (e.g. `/SimpleMCP`), or `''`

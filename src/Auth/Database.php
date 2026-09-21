@@ -86,16 +86,6 @@ final class Database {
                 client_id_issued_at          INTEGER NOT NULL,
                 created_at                   INTEGER NOT NULL
             );
-
-            -- Per-account preferences editable on the /account page (e.g. the
-            -- Stirling-PDF endpoint + API key used by the markdown→PDF tool).
-            -- `settings` is a JSON object; values are user-scoped like every
-            -- other per-user table.
-            CREATE TABLE IF NOT EXISTS user_settings (
-                username   TEXT PRIMARY KEY,
-                settings   TEXT NOT NULL DEFAULT '{}',
-                updated_at INTEGER NOT NULL
-            );
             SQL);
     }
 

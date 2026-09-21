@@ -127,168 +127,6 @@ Document ingestion and retrieval — same login requirement as the graph tools.
 | `get_document` | Fetch one document's full text, chunks in order. |
 | `delete_document` | Delete a document and its chunks. |
 
-### Document & Image Conversion (Stirling-PDF) tools
-
-Document and image conversion via a configured Stirling-PDF server — login required like the graph/RAG
-tools. The tools are only **listed and callable when a Stirling-PDF endpoint is configured**
-for the caller; with none set they are disabled entirely (hidden from `tools/list`, and a
-direct call is answered with tool-not-found).
-
-| Tool | What it does |
-|------|--------------|
-| `convert_markdown_to_pdf` | Render a Markdown file to a PDF via the Stirling-PDF `/api/v1/convert/markdown/pdf` endpoint. Accepts an input file path (`path`) and exports the resulting PDF to the same directory with the same name (`<name>.pdf`). |
-| `convert_pdf_to_markdown` | Extract Markdown text from a PDF file via the `/api/v1/convert/pdf/markdown` endpoint. Accepts an input file path (`path`), exports the extracted Markdown to the same directory with the same name (`<name>.md`), and returns the Markdown in the tool result. |
-| `convert_image_to_pdf` | Convert an image file (PNG, JPG, WEBP, GIF, BMP, TIFF, SVG) to a PDF via the Stirling-PDF `/api/v1/convert/img/pdf` endpoint. Accepts an input file path (`path`) and exports the resulting PDF to the same directory with the same name (`<name>.pdf`). |
-| `convert_pdf_to_image` | Convert a PDF file to image(s) via the Stirling-PDF `/api/v1/convert/pdf/img` endpoint. Accepts an input file path (`path`) and exports the resulting image(s) directly to the source directory (`<dir>/<name>.<format>` or unzipped page images `<dir>/<name>_<n>.<format>`). |
-
-## Markdown → PDF (Stirling-PDF)
-
-[src/StirlingPdfClient.php](src/StirlingPdfClient.php) converts a Markdown file to a PDF by
-reading the file at `path`, POSTing it — as a multipart form upload (field `fileInput`) — to
-`{endpoint}/api/v1/convert/markdown/pdf` on a Stirling-PDF instance, with the optional API key
-sent as an `X-API-KEY` header. The request uses PHP streams (`file_get_contents`), so no extra
-extension is needed.
-
-### Where the PDF goes
-
-The generated PDF is saved directly to the **same directory with the same base name** as the input file:
-**`<dir>/<name>.pdf`** (e.g. `path/to/notes.md` → `path/to/notes.pdf`).
-
-Connection settings are transport-aware:
-
-- **HTTP (streamable) mode** — the signed-in account's values, saved on the **`/account` page**
-  ("PDF conversion (Stirling-PDF)" section → `user_settings` table in `data/app.sqlite`). The API
-  key is stored once and never rendered back (only a trailing-4-char hint); leave the field blank
-  to keep the stored key. A blank endpoint clears the override and falls back to the global
-  default.
-- **stdio mode** — the global defaults from **[config/config.php](config/config.php)**
-  (`stirling_pdf.endpoint` / `stirling_pdf.api_key`). There is no account page over stdio, so a
-  blank endpoint **disables the tools** — they vanish from `tools/list` and a direct call is
-  answered with tool-not-found until an endpoint is set.
-
-Any field left blank on the account page falls back to `config/config.php`, so a server-wide
-default can be configured once and individual users may override just their endpoint or key.
-
-Smoke test over stdio (uses `config/config.php`):
-
-```sh
-printf '%s\n%s\n' \
-  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
-  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"convert_markdown_to_pdf","arguments":{"path":"data/example.md"}}}' \
-  | php index.php
-```
-
-By hand against Stirling-PDF the equivalent request is:
-
-```sh
-# Only include the X-API-KEY header if your Stirling-PDF instance requires it.
-curl -X POST "$ENDPOINT/api/v1/convert/markdown/pdf" \
-  -H "Accept: application/octet-stream" \
-  -H "X-API-KEY: $API_KEY" \
-  -F "fileInput=@document.md"
-```
-
-Notes:
-
-- The tool requires the `user` or `admin` role (like the memory tools), so only logged-in
-  accounts can call it; anonymous HTTP callers never see it. In stdio mode the trusted `local`
-  user passes.
-- With no endpoint configured for the caller the tools are disabled (see above) — they are
-  hidden from `tools/list` and a direct call returns tool-not-found, even for `admin`.
-- The endpoint is used verbatim apart from trimming a trailing `/` — include any path prefix your
-  Stirling-PDF deployment is served under. It must be reachable from the machine running SimpleMCP.
-- The API key is stored in plaintext in `data/app.sqlite` (never in git — `data/` is gitignored).
-  Treat it like other server credentials: it is the key your own Stirling-PDF deployment accepts.
-- No extra PHP extensions are required: the request is made with PHP streams
-  (`file_get_contents` + a hand-built `multipart/form-data` body), so `allow_url_fopen`
-  (on by default) is the only prerequisite — the cURL extension is not needed.
-
-## PDF → Markdown (Stirling-PDF)
-
-The inverse direction, `convert_pdf_to_markdown`, POSTs a PDF — again as a multipart upload
-(field `fileInput`) — to `{endpoint}/api/v1/convert/pdf/markdown`, writes the extracted Markdown
-to the **same directory with the same base name** (`<dir>/<name>.md`), and returns the Markdown
-**directly in the tool result**.
-
-### Supplying the PDF
-
-| Argument | Notes |
-|----------|-------|
-| `path` | Path of a PDF file to convert. The tool reads the file, exports the converted Markdown to `<dir>/<name>.md`, and returns the extracted text. |
-| `input_file_path` | Alias for `path`. |
-
-The input is rejected before any network call if the file does not exist, cannot be read, exceeds 100 MB, or has no `%PDF` header in its first 1 KiB.
-
-Smoke test over stdio (uses `config/config.php`):
-
-```sh
-printf '%s\n%s\n' \
-  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
-  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"convert_pdf_to_markdown","arguments":{"path":"/tmp/report.pdf"}}}' \
-  | php index.php
-```
-
-By hand against Stirling-PDF the equivalent request is:
-
-```sh
-# Only include the X-API-KEY header if your Stirling-PDF instance requires it.
-curl -X POST "$ENDPOINT/api/v1/convert/pdf/markdown" \
-  -H "Accept: application/octet-stream" \
-  -H "X-API-KEY: $API_KEY" \
-  -F "fileInput=@document.pdf"
-```
-
-## Image → PDF (Stirling-PDF)
-
-`convert_image_to_pdf` posts an image (PNG, JPG, JPEG, WEBP, GIF, BMP, TIFF, SVG) to
-`{endpoint}/api/v1/convert/img/pdf` and writes the resulting PDF to `<dir>/<name>.pdf`.
-
-| Argument | Type | Default | Notes |
-|----------|------|---------|-------|
-| `path` | string | *required* | Path of the image file to convert. Writes `<dir>/<name>.pdf`. |
-| `input_file_path` | string | optional | Alias for `path`. |
-| `fit_option` | string | `'fillPage'` | Fit mode: `fillPage`, `fitToPage`, or `maintainAspectRatio`. |
-| `color_type` | string | `'color'` | Output color mode: `color`, `greyscale`, or `black-and-white`. |
-| `auto_rotate` | boolean | `false` | Whether to automatically rotate images to better fit the page. |
-
-Smoke test over stdio:
-
-```sh
-printf '%s\n%s\n' \
-  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
-  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"convert_image_to_pdf","arguments":{"path":"data/photo.png"}}}' \
-  | php index.php
-```
-
-## PDF → Image (Stirling-PDF)
-
-`convert_pdf_to_image` posts a PDF to `{endpoint}/api/v1/convert/pdf/img` and exports the converted
-image(s) directly into the source directory (`<dir>/<name>.<format>` for single images, or unzipped
-individual page images `<dir>/<name>_<n>.<format>` for multi-page extractions). When a multi-page ZIP
-archive is returned, it is automatically unzipped directly into the source directory (`<dir>`), and the
-temporary ZIP file is removed (unless `keep_zip: true` is passed). Extraction supports PHP's `ZipArchive`
-with fallback to system tools (`tar`, `powershell`, or `unzip`).
-
-| Argument | Type | Default | Notes |
-|----------|------|---------|-------|
-| `path` | string | *required* | Path of the PDF file to convert. |
-| `input_file_path` | string | optional | Alias for `path`. |
-| `image_format` | string | `'png'` | Output format: `png`, `jpeg`, `jpg`, `gif`, or `webp`. |
-| `single_or_multiple` | string | `'single'` | `'single'` merges all pages into one continuous image; `'multiple'` exports separate images per page (unzipped into source directory). |
-| `page_numbers` | string | `'all'` | Pages to convert: `'all'` or ranges/subsets like `'1'`, `'1,3,5-9'`. |
-| `color_type` | string | `'color'` | `'color'`, `'greyscale'`, or `'blackandwhite'`. |
-| `dpi` | integer | `300` | Resolution in dots per inch. |
-| `keep_zip` | boolean | `false` | Whether to retain the ZIP archive alongside unzipped images for multi-page conversions. |
-
-Smoke test over stdio:
-
-```sh
-printf '%s\n%s\n' \
-  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
-  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"convert_pdf_to_image","arguments":{"path":"data/report.pdf","image_format":"png"}}}' \
-  | php index.php
-```
-
 ## Knowledge graph & RAG
 
 Beyond the sample tools, this branch adds a full **memory toolset**: a persistent, per-user
@@ -492,9 +330,6 @@ OAuth handshake when `client_secret_basic` is offered, so DCR-registered clients
   as a dev fallback. `status: 'pending'` (or a missing password) marks a user for onboarding.
 - **[config/oauth.php](config/oauth.php)** — OAuth clients, token/code TTLs, whether plain
   PKCE is allowed, and an optional `registration_access_token` protecting `/oauth/register`.
-- **[config/config.php](config/config.php)** — global defaults for the PDF conversion tools
-  (`stirling_pdf.endpoint` / `stirling_pdf.api_key`), used in stdio mode and as the fallback
-  for HTTP accounts that left a field blank on the `/account` page.
 
 ## Project structure
 
@@ -503,19 +338,15 @@ index.php                     entry point — stdio loop, or HTTP router + auth 
 config/
   users.php                   seed users
   oauth.php                   OAuth clients, TTLs, registration token
-  config.php                  global defaults for the PDF tools (endpoint + API key)
 src/
   McpServer.php               MCP core: tool registry, routing, access control, UserContext injection
   UserContext.php             immutable user value object (local() / anonymous() factories, * wildcard)
-  StirlingPdfClient.php       Stirling-PDF client (both directions) + transport-aware config resolution
-  PdfStore.php                saves generated PDFs under data/output + capability download URLs
   Attributes/McpFunction.php  the #[McpFunction(name, description, schema, roles, permissions)] attribute
   Tools/                      auto-discovered tool classes (CalculatorTool, AdminTool,
-                              MemoryTool, KnowledgeBaseTool, PdfTool, ...)
+                              MemoryTool, KnowledgeBaseTool, ...)
   Auth/
     Database.php              SQLite bootstrap + idempotent schema + user seeding
     UserStore.php             DB-backed accounts: auth, onboarding, change password
-    SettingsStore.php         per-account settings editable on /account (Stirling-PDF endpoint + key)
     MemoryStore.php           per-user knowledge graph + FTS5 search (data/memory.sqlite)
     DocumentStore.php         per-user chunked document store + RAG retrieval
     TokenStore.php            OAuth codes/access/refresh tokens (sha256-hashed, single-use, rotating)
@@ -524,7 +355,7 @@ src/
     AccountController.php     /account user-management pages (native sessions + CSRF)
     DebugLog.php              append-only diagnostics log to data/requests.log
 data/                         runtime-only, gitignored (app.sqlite, memory.sqlite,
-                              requests.log, sessions/, output/ for generated PDFs)
+                              requests.log, sessions/)
 ```
 
 ## Notes & gotchas
