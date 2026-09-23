@@ -48,6 +48,7 @@
             this.nodeGroup = new THREE.Group();
             this.edgeGroup = new THREE.Group();
             this.particleGroup = new THREE.Group();
+            this.orbitGroup = new THREE.Group();
             this.starfield = null;
 
             // Data State
@@ -89,6 +90,12 @@
 
             // Camera Fly-To Animation
             this.cameraAnimation = null;
+
+            // Solar System Layout State
+            this.solar = null;
+            this.orbitSpeed = 1;
+            this.lastFrameTime = performance.now();
+            this.tmpVec = new THREE.Vector3();
 
             // Bind UI & Init
             this.initThree();
@@ -150,6 +157,7 @@
             this.scene.add(this.edgeGroup);
             this.scene.add(this.nodeGroup);
             this.scene.add(this.particleGroup);
+            this.scene.add(this.orbitGroup);
         }
 
         /**
@@ -248,6 +256,7 @@
             // Pointer Down for Dragging
             this.canvas.addEventListener('mousedown', (e) => {
                 if (e.button !== 0) return; // Left click only
+                if (this.currentLayout === 'solar') return; // Orbits are analytical — no dragging
 
                 this.raycaster.setFromCamera(this.mouse, this.camera);
                 const intersects = this.raycaster.intersectObjects(this.nodeGroup.children);
@@ -482,6 +491,12 @@
             document.getElementById('slider-gravity').addEventListener('input', (e) => {
                 this.physicsParams.gravity = Number(e.target.value) / 1000;
                 document.getElementById('val-gravity').textContent = e.target.value;
+            });
+
+            // Solar System Orbit Speed
+            document.getElementById('slider-orbit-speed').addEventListener('input', (e) => {
+                this.orbitSpeed = Number(e.target.value);
+                document.getElementById('val-orbit-speed').textContent = e.target.value + '×';
             });
 
             // Reset Camera View Button
@@ -1045,15 +1060,27 @@
          */
         setLayout(layoutType) {
             this.currentLayout = layoutType;
+            const speedGroup = document.getElementById('orbit-speed-group');
+            if (speedGroup) speedGroup.style.display = layoutType === 'solar' ? '' : 'none';
             this.applyCurrentLayout();
         }
 
         applyCurrentLayout() {
             if (this.currentLayout === 'force') {
+                this.clearSolarSystem();
                 this.simulationRunning = true;
                 return;
             }
 
+            if (this.currentLayout === 'solar') {
+                // Live solar system: root project as the sun, hierarchy as orbiting planets & moons
+                this.buildSolarSystem();
+                this.simulationRunning = true;
+                this.syncEdgePositions();
+                return;
+            }
+
+            this.clearSolarSystem();
             this.simulationRunning = false;
             const nodes = this.nodes;
             const nodeCount = nodes.length;
@@ -1072,49 +1099,238 @@
                     );
                     nodes[i].mesh.position.copy(nodes[i].position);
                 }
-            } else if (this.currentLayout === 'solar') {
-                // Project Galaxies / Solar System
-                // Find project hubs
-                const projects = nodes.filter(n => n.entityType === 'project');
-                const hubs = projects.length > 0 ? projects : nodes.filter(n => n.degree > 12);
-                const hubCount = Math.max(1, hubs.length);
-
-                hubs.forEach((hub, idx) => {
-                    const angle = (idx / hubCount) * Math.PI * 2;
-                    const hubDist = 320;
-                    hub.position.set(Math.cos(angle) * hubDist, 0, Math.sin(angle) * hubDist);
-                    hub.mesh.position.copy(hub.position);
-                });
-
-                // Place other nodes in orbits around their closest hub
-                nodes.forEach(node => {
-                    if (hubs.includes(node)) return;
-
-                    // Find primary neighbor or random hub
-                    let targetHub = hubs[0];
-                    for (const n of node.neighbors) {
-                        const neighborNode = this.nodeMap.get(n.id);
-                        if (neighborNode && hubs.includes(neighborNode)) {
-                            targetHub = neighborNode;
-                            break;
-                        }
-                    }
-
-                    const orbitR = 60 + Math.random() * 180;
-                    const orbitAngle = Math.random() * Math.PI * 2;
-                    const orbitHeight = (Math.random() - 0.5) * 120;
-
-                    node.position.set(
-                        targetHub.position.x + Math.cos(orbitAngle) * orbitR,
-                        targetHub.position.y + orbitHeight,
-                        targetHub.position.z + Math.sin(orbitAngle) * orbitR
-                    );
-                    node.mesh.position.copy(node.position);
-                });
             }
 
             // Sync edge positions
             this.syncEdgePositions();
+        }
+
+        /**
+         * Build the Solar System layout: the root project sits at the origin as a glowing
+         * sun, its direct neighbors orbit it as planets, deeper graph levels orbit their
+         * BFS parent as moons, and disconnected nodes form a slow outer belt.
+         */
+        buildSolarSystem() {
+            this.clearSolarSystem();
+            const nodes = this.nodes;
+            if (nodes.length === 0) return;
+
+            // 1. Pick the sun — the dominant `project` node (root project), else the top hub
+            const projects = nodes.filter(n => n.entityType === 'project');
+            const pickMaxDegree = arr => arr.reduce((a, b) => (b.degree > a.degree ? b : a));
+            const sun = projects.length > 0 ? pickMaxDegree(projects) : pickMaxDegree(nodes);
+
+            // 2. BFS from the sun to establish the orbital hierarchy (distance + parent)
+            const adj = new Map(nodes.map(n => [n.id, []]));
+            this.edges.forEach(e => {
+                if (adj.has(e.sourceNode.id) && adj.has(e.targetNode.id)) {
+                    adj.get(e.sourceNode.id).push(e.targetNode);
+                    adj.get(e.targetNode.id).push(e.sourceNode);
+                }
+            });
+
+            const dist = new Map([[sun.id, 0]]);
+            const parentOf = new Map();
+            const childCountOf = new Map();
+            const queue = [sun];
+            while (queue.length) {
+                const cur = queue.shift();
+                const d = dist.get(cur.id);
+                for (const nb of adj.get(cur.id)) {
+                    if (!dist.has(nb.id)) {
+                        dist.set(nb.id, d + 1);
+                        parentOf.set(nb.id, cur);
+                        childCountOf.set(cur.id, (childCountOf.get(cur.id) || 0) + 1);
+                        queue.push(nb);
+                    }
+                }
+            }
+
+            // 3. Sun treatment: enlarged, brighter core, additive glow halo, warm point light
+            const sunRadius = Math.max(26, sun.radius * 1.9);
+            const glowTex = this.makeGlowTexture();
+            const glow = new THREE.Sprite(new THREE.SpriteMaterial({
+                map: glowTex,
+                transparent: true,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false
+            }));
+            glow.scale.set(sunRadius * 7, sunRadius * 7, 1);
+            this.orbitGroup.add(glow);
+
+            const sunLight = new THREE.PointLight(0xffd9a0, 1.5, 2400, 1);
+            this.orbitGroup.add(sunLight);
+
+            sun.position.set(0, 0, 0);
+            sun.mesh.position.set(0, 0, 0);
+            sun.mesh.scale.set(sunRadius, sunRadius, sunRadius);
+            sun.mesh.material.emissiveIntensity = 1.0;
+            if (sun.labelSprite) sun.labelSprite.position.set(0, sunRadius + 9, 0);
+
+            // 4. Assign orbits. Parents are always processed before children so moons
+            //    ride on freshly-updated parent positions each frame.
+            const rings = [];
+            const order = [sun];
+            const childIdx = new Map();
+
+            const randomTilt = () => new THREE.Quaternion().setFromEuler(
+                new THREE.Euler(
+                    (Math.random() - 0.5) * 0.22,
+                    Math.random() * Math.PI * 2,
+                    (Math.random() - 0.5) * 0.22
+                )
+            );
+
+            const addOrbit = (node, center, radius, speed, ringOpacity) => {
+                const q = randomTilt();
+                node.orbit = {
+                    center: center,
+                    radius: radius,
+                    angle: Math.random() * Math.PI * 2,
+                    speed: speed,
+                    q: q
+                };
+
+                // Faint orbit guide ring in the node's own color
+                const seg = 96;
+                const pts = new Float32Array((seg + 1) * 3);
+                for (let i = 0; i <= seg; i++) {
+                    const a = (i / seg) * Math.PI * 2;
+                    pts[i * 3] = Math.cos(a) * radius;
+                    pts[i * 3 + 1] = 0;
+                    pts[i * 3 + 2] = Math.sin(a) * radius;
+                }
+                const geo = new THREE.BufferGeometry();
+                geo.setAttribute('position', new THREE.BufferAttribute(pts, 3));
+                const mat = new THREE.LineBasicMaterial({
+                    color: node.colorHex,
+                    transparent: true,
+                    opacity: ringOpacity,
+                    depthWrite: false
+                });
+                const ring = new THREE.Line(geo, mat);
+                ring.quaternion.copy(q);
+                if (center !== sun) ring.position.copy(center.position);
+                this.orbitGroup.add(ring);
+                rings.push({ mesh: ring, center: center });
+                order.push(node);
+            };
+
+            // Planets: direct neighbors of the sun — biggest worlds closest in, Kepler-like speeds
+            const planets = nodes
+                .filter(n => dist.get(n.id) === 1)
+                .sort((a, b) => b.degree - a.degree);
+            let planetRadius = 120;
+            planets.forEach(p => {
+                addOrbit(p, sun, planetRadius, 0.35 * Math.pow(140 / planetRadius, 1.5), 0.2);
+                planetRadius += 58 + p.radius * 2;
+            });
+
+            // Moons: deeper nodes orbit their BFS parent; spacing tightens with sibling count
+            const rest = nodes
+                .filter(n => dist.has(n.id) && dist.get(n.id) >= 2)
+                .sort((a, b) => dist.get(a.id) - dist.get(b.id));
+            rest.forEach(m => {
+                const par = parentOf.get(m.id);
+                const idx = childIdx.get(par.id) || 0;
+                childIdx.set(par.id, idx + 1);
+                const cc = childCountOf.get(par.id) || 1;
+                const spacing = Math.max(7, Math.min(16, 120 / cc));
+                const orbitR = Math.min(par.radius + 14 + idx * spacing, par.radius + 240);
+                addOrbit(m, par, orbitR, 0.5 * Math.pow(45 / orbitR, 1.5), 0.12);
+            });
+
+            // Outer belt: nodes disconnected from the root project orbit far and slow
+            let beltIdx = 0;
+            nodes.forEach(n => {
+                if (n === sun || dist.has(n.id)) return;
+                const r = 560 + (beltIdx % 3) * 48;
+                addOrbit(n, sun, r, 0.35 * Math.pow(140 / r, 1.5), 0.08);
+                beltIdx++;
+            });
+
+            this.solar = { sun, rings, order, glow, light: sunLight, glowBase: sunRadius * 7, pulse: 0 };
+        }
+
+        clearSolarSystem() {
+            if (!this.solar) return;
+            const { sun, rings, glow, light } = this.solar;
+
+            rings.forEach(r => {
+                this.orbitGroup.remove(r.mesh);
+                r.mesh.geometry.dispose();
+                r.mesh.material.dispose();
+            });
+            if (glow) {
+                this.orbitGroup.remove(glow);
+                if (glow.material.map) glow.material.map.dispose();
+                glow.material.dispose();
+            }
+            if (light) this.orbitGroup.remove(light);
+
+            // Restore the former sun's normal appearance
+            if (sun && sun.mesh && sun.mesh.material) {
+                sun.mesh.scale.set(sun.radius, sun.radius, sun.radius);
+                sun.mesh.material.emissiveIntensity = sun.degree > 10 ? 0.45 : 0.25;
+                if (sun.labelSprite) sun.labelSprite.position.set(0, sun.radius + 5, 0);
+            }
+            this.nodes.forEach(n => { n.orbit = null; });
+            this.solar = null;
+        }
+
+        /**
+         * Advance every orbit one tick (dt in seconds)
+         */
+        stepSolar(dt) {
+            const s = this.solar;
+            if (!s) return;
+            const t = dt * this.orbitSpeed;
+            const tmp = this.tmpVec;
+
+            for (const node of s.order) {
+                const o = node.orbit;
+                if (!o) continue;
+                o.angle += o.speed * t;
+                tmp.set(Math.cos(o.angle) * o.radius, 0, Math.sin(o.angle) * o.radius)
+                    .applyQuaternion(o.q)
+                    .add(o.center.position);
+                node.position.copy(tmp);
+                node.mesh.position.copy(tmp);
+            }
+
+            // Moon orbit rings follow their (moving) parent
+            for (const ring of s.rings) {
+                if (ring.center !== s.sun) ring.mesh.position.copy(ring.center.position);
+            }
+
+            // Sun breathing + slow axial spin
+            s.pulse += t;
+            const g = 1 + 0.06 * Math.sin(s.pulse * 1.7);
+            s.glow.scale.set(s.glowBase * g, s.glowBase * g, 1);
+            s.sun.mesh.rotation.y += t * 0.12;
+
+            this.syncEdgePositions();
+        }
+
+        /**
+         * Radial gradient texture used for the sun's glow halo
+         */
+        makeGlowTexture() {
+            const size = 256;
+            const canvas = document.createElement('canvas');
+            canvas.width = size;
+            canvas.height = size;
+            const ctx = canvas.getContext('2d');
+            const grad = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+            grad.addColorStop(0.0, 'rgba(255, 244, 214, 0.95)');
+            grad.addColorStop(0.22, 'rgba(255, 206, 128, 0.55)');
+            grad.addColorStop(0.55, 'rgba(110, 160, 255, 0.16)');
+            grad.addColorStop(1.0, 'rgba(0, 0, 0, 0)');
+            ctx.fillStyle = grad;
+            ctx.fillRect(0, 0, size, size);
+            const tex = new THREE.CanvasTexture(canvas);
+            tex.minFilter = THREE.LinearFilter;
+            return tex;
         }
 
         syncEdgePositions() {
@@ -1130,7 +1346,9 @@
                     posArray[idx++] = edge.targetNode.position.y;
                     posArray[idx++] = edge.targetNode.position.z;
                 } else {
+                    // Collapse hidden edges to a degenerate point (no stale segments)
                     idx += 6;
+                    for (let k = idx - 6; k < idx; k++) posArray[k] = 0;
                 }
             }
             this.edgeLines.geometry.attributes.position.needsUpdate = true;
@@ -1204,7 +1422,8 @@
             this.selectedNode = null;
             document.getElementById('inspector-drawer').classList.remove('open');
             this.nodes.forEach(n => {
-                n.mesh.material.emissiveIntensity = n.degree > 10 ? 0.45 : 0.25;
+                const isSun = this.solar && this.solar.sun === n;
+                n.mesh.material.emissiveIntensity = isSun ? 1.0 : (n.degree > 10 ? 0.45 : 0.25);
             });
         }
 
@@ -1229,7 +1448,7 @@
          */
         pulseNode(node) {
             if (!node || !node.mesh) return;
-            const originalScale = node.radius;
+            const originalScale = node.mesh.scale.x; // current scale (sun is enlarged in solar layout)
             const startTime = performance.now();
             const duration = 650;
 
@@ -1368,8 +1587,15 @@
         animate() {
             requestAnimationFrame(this.animate);
 
-            // Step Physics
+            const now = performance.now();
+            const dt = Math.min(0.05, (now - this.lastFrameTime) / 1000);
+            this.lastFrameTime = now;
+
+            // Step Physics (force-directed) or orbits (solar system)
             this.stepPhysics();
+            if (this.currentLayout === 'solar' && this.solar && this.simulationRunning) {
+                this.stepSolar(dt);
+            }
 
             // Step Particles
             this.updateParticles();

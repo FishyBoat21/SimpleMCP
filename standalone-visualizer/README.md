@@ -22,7 +22,7 @@ You can drag and drop any SQLite file (`.sqlite`, `.db`) onto the screen at any 
 - **Dynamic 3D Force Simulation**: Real-time Coulomb repulsion, Hooke spring tension, and gravity physics.
 - **Alternative 3D Layouts**:
   - **3D Force**: Organic clustering based on relation topology.
-  - **Galaxies / Solar**: Projects act as primary suns with member components orbiting them.
+  - **Solar System**: The root project becomes a glowing sun at the origin. Direct neighbors orbit it as planets (larger worlds closer in, Kepler-like speeds), deeper graph levels circle their parent as moons, and disconnected nodes drift in an outer belt. Includes orbit rings, a pulsing corona, a warm point-light, and an adjustable Orbit Speed slider.
   - **Sphere**: Geodesic spherical distribution.
 - **Degree-Scaled Nodes**: Entities scale according to connection counts, with glowing emissive materials and cybernetic color-coding.
 - **Animated Energy Flows**: Photons travel along relation edges in the direction of the relationship (`from` → `to`).
@@ -54,7 +54,7 @@ You can drag and drop any SQLite file (`.sqlite`, `.db`) onto the screen at any 
 - **Double-click node**: View node (focuses, flies camera close, opens inspector, and pulses node)
 - **Double-click background**: Reset camera view
 - **Single-click node**: Select node and open inspector drawer
-- **Click-and-drag node**: Move node in 3D space
+- **Click-and-drag node**: Move node in 3D space (3D Force layout only; positions are analytical in Solar System)
 - `Space`: Pause / Resume physics simulation
 - `R`: Reset camera view
 - `Escape`: Deselect node / Close inspector drawer
