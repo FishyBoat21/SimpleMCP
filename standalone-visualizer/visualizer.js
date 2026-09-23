@@ -65,7 +65,7 @@
 
             // Physics & Layout
             this.simulationRunning = true;
-            this.currentLayout = 'force'; // 'force' | 'solar' | 'sphere'
+            this.currentLayout = 'force'; // 'force' | 'galaxy' | 'sphere'
             this.physicsParams = {
                 repulsion: 1200,
                 springLength: 70,
@@ -91,11 +91,14 @@
             // Camera Fly-To Animation
             this.cameraAnimation = null;
 
-            // Solar System Layout State
-            this.solar = null;
+            // Galaxy Layout State
+            this.galaxy = null;
             this.orbitSpeed = 1;
             this.lastFrameTime = performance.now();
             this.tmpVec = new THREE.Vector3();
+
+            // HUD idle-dim state (C4)
+            this.lastHudActivity = performance.now();
 
             // Bind UI & Init
             this.initThree();
@@ -256,7 +259,7 @@
             // Pointer Down for Dragging
             this.canvas.addEventListener('mousedown', (e) => {
                 if (e.button !== 0) return; // Left click only
-                if (this.currentLayout === 'solar') return; // Orbits are analytical — no dragging
+                if (this.currentLayout === 'galaxy') return; // Orbits are analytical — no dragging
 
                 this.raycaster.setFromCamera(this.mouse, this.camera);
                 const intersects = this.raycaster.intersectObjects(this.nodeGroup.children);
@@ -349,6 +352,15 @@
                     document.getElementById('search-input').focus();
                 }
             });
+
+            // HUD idle-dim (C4): any input wakes the chrome back up
+            const wakeHud = () => {
+                this.lastHudActivity = performance.now();
+                document.body.classList.remove('hud-dim');
+            };
+            window.addEventListener('pointermove', wakeHud);
+            window.addEventListener('pointerdown', wakeHud);
+            window.addEventListener('keydown', wakeHud);
         }
 
         /**
@@ -493,7 +505,7 @@
                 document.getElementById('val-gravity').textContent = e.target.value;
             });
 
-            // Solar System Orbit Speed
+            // Galaxy Rotation Speed
             document.getElementById('slider-orbit-speed').addEventListener('input', (e) => {
                 this.orbitSpeed = Number(e.target.value);
                 document.getElementById('val-orbit-speed').textContent = e.target.value + '×';
@@ -569,9 +581,18 @@
         loadGraphData(graphData) {
             this.updateStatus('Constructing 3D scene...');
 
-            // Clear existing scene elements
+            // Clear existing scene elements.
+            // NOTE: label sprites are children of the node meshes — dispose their
+            // material + canvas texture here (their geometry is a Three.js-wide
+            // shared sprite quad and must NOT be disposed).
             while (this.nodeGroup.children.length > 0) {
                 const obj = this.nodeGroup.children[0];
+                obj.children.forEach(child => {
+                    if (child.material) {
+                        if (child.material.map) child.material.map.dispose();
+                        child.material.dispose();
+                    }
+                });
                 this.nodeGroup.remove(obj);
                 if (obj.geometry) obj.geometry.dispose();
                 if (obj.material) obj.material.dispose();
@@ -880,6 +901,20 @@
                 node.mesh.visible = visible;
             });
 
+            // Galaxy star layer: additive black == invisible, so zero hidden stars' colors
+            if (this.galaxy && this.galaxy.starPts) {
+                const colArr = this.galaxy.starPts.geometry.attributes.color.array;
+                this.nodes.forEach(n => {
+                    if (n.galIdx === null || n.galIdx === undefined) return;
+                    const i3 = n.galIdx * 3;
+                    const c = n.visible && n.galColor ? n.galColor : null;
+                    colArr[i3] = c ? c[0] : 0;
+                    colArr[i3 + 1] = c ? c[1] : 0;
+                    colArr[i3 + 2] = c ? c[2] : 0;
+                });
+                this.galaxy.starPts.geometry.attributes.color.needsUpdate = true;
+            }
+
             // Update Edges
             const linePositions = this.edgeLines.geometry.attributes.position.array;
             let pIdx = 0;
@@ -1056,31 +1091,72 @@
         }
 
         /**
-         * Apply Alternative Layout Presets
+         * Apply Alternative Layout Presets (contextual controls: show only what acts)
          */
         setLayout(layoutType) {
+            const prev = this.currentLayout;
             this.currentLayout = layoutType;
+
             const speedGroup = document.getElementById('orbit-speed-group');
-            if (speedGroup) speedGroup.style.display = layoutType === 'solar' ? '' : 'none';
+            if (speedGroup) speedGroup.style.display = layoutType === 'galaxy' ? '' : 'none';
+
+            // The physics sliders only act on the force layout — hide dead controls
+            const physicsDetails = document.getElementById('physics-details');
+            if (physicsDetails) physicsDetails.hidden = layoutType !== 'force';
+
+            const labelsSelect = document.getElementById('labels-select');
+            if (layoutType === 'galaxy' && prev !== 'galaxy') {
+                // Cleanest first impression of the galaxy is label-free; remember the choice
+                this._preGalaxyLabels = this.showLabels;
+                this.showLabels = 'none';
+                if (labelsSelect) labelsSelect.value = 'none';
+                this.frameCamera(0, 560, 620); // ~42° elevation: the flattened disk needs altitude
+            } else if (prev === 'galaxy' && layoutType !== 'galaxy') {
+                // Restore the pre-galaxy choice only if the user didn't change it meanwhile
+                if (this._preGalaxyLabels && this.showLabels === 'none') {
+                    this.showLabels = this._preGalaxyLabels;
+                    if (labelsSelect) labelsSelect.value = this._preGalaxyLabels;
+                }
+                this.frameCamera(0, 350, 750);
+            }
+            this.updateLabelsVisibility();
+
             this.applyCurrentLayout();
         }
 
+        /** Fly the camera to a framing position with the origin as target */
+        frameCamera(x, y, z) {
+            this.cameraAnimation = {
+                startTime: performance.now(),
+                duration: 1400,
+                startPos: this.camera.position.clone(),
+                endPos: new THREE.Vector3(x, y, z),
+                startTarget: this.controls.target.clone(),
+                endTarget: new THREE.Vector3(0, 0, 0)
+            };
+        }
+
         applyCurrentLayout() {
+            // Relation lines are structural guides elsewhere, faint gas filaments here
+            if (this.edgeLines) {
+                this.edgeLines.material.opacity = this.currentLayout === 'galaxy' ? 0.10 : 0.35;
+            }
+
             if (this.currentLayout === 'force') {
-                this.clearSolarSystem();
+                this.clearGalaxy();
                 this.simulationRunning = true;
                 return;
             }
 
-            if (this.currentLayout === 'solar') {
-                // Live solar system: root project as the sun, hierarchy as orbiting planets & moons
-                this.buildSolarSystem();
+            if (this.currentLayout === 'galaxy') {
+                // Live galaxy: root project as the core, hierarchy as spiral-arm stars
+                this.buildGalaxy();
                 this.simulationRunning = true;
                 this.syncEdgePositions();
                 return;
             }
 
-            this.clearSolarSystem();
+            this.clearGalaxy();
             this.simulationRunning = false;
             const nodes = this.nodes;
             const nodeCount = nodes.length;
@@ -1106,21 +1182,33 @@
         }
 
         /**
-         * Build the Solar System layout: the root project sits at the origin as a glowing
-         * sun, its direct neighbors orbit it as planets, deeper graph levels orbit their
-         * BFS parent as moons, and disconnected nodes form a slow outer belt.
+         * Build the Galaxy layout: the root project burns at the origin as the
+         * galactic core (warm glow bulge + point light) and every other node is a
+         * star riding one of 2-3 logarithmic spiral arms derived from its BFS parent.
+         * The disk is tilted and turns under near-flat rotation (omega = V0/(r+R_CORE))
+         * so the arms shear gently but never wind themselves into mush.
          */
-        buildSolarSystem() {
-            this.clearSolarSystem();
+        buildGalaxy() {
+            this.clearGalaxy();
             const nodes = this.nodes;
             if (nodes.length === 0) return;
 
-            // 1. Pick the sun — the dominant `project` node (root project), else the top hub
+            // --- Spiral constants ---
+            const ARMS = nodes.length >= 80 ? 3 : 2;
+            const WIND = 1.9;      // arm pitch: radians of twist per ln(1 + r / R0)
+            const R0 = 130;        // log-spiral scale radius
+            const R_CORE = 700;    // rotation core radius: large = near-flat omega profile
+            const V0 = 80;         // angular speed factor: omega = V0 / (r + R_CORE)
+            const TILT = new THREE.Quaternion().setFromEuler(new THREE.Euler(0.38, 0.25, 0.12));
+            const gauss = () => Math.random() + Math.random() + Math.random() - 1.5; // ~N(0, 0.5)
+
+            // 1. Pick the core — the dominant `project` node (root project), else the top hub
             const projects = nodes.filter(n => n.entityType === 'project');
             const pickMaxDegree = arr => arr.reduce((a, b) => (b.degree > a.degree ? b : a));
-            const sun = projects.length > 0 ? pickMaxDegree(projects) : pickMaxDegree(nodes);
+            const core = projects.length > 0 ? pickMaxDegree(projects) : pickMaxDegree(nodes);
 
-            // 2. BFS from the sun to establish the orbital hierarchy (distance + parent)
+            // 2. BFS from the core to give each node a depth + parent (arm assignment
+            //    follows this skeleton so a family clumps along one arm)
             const adj = new Map(nodes.map(n => [n.id, []]));
             this.edges.forEach(e => {
                 if (adj.has(e.sourceNode.id) && adj.has(e.targetNode.id)) {
@@ -1129,10 +1217,9 @@
                 }
             });
 
-            const dist = new Map([[sun.id, 0]]);
+            const dist = new Map([[core.id, 0]]);
             const parentOf = new Map();
-            const childCountOf = new Map();
-            const queue = [sun];
+            const queue = [core];
             while (queue.length) {
                 const cur = queue.shift();
                 const d = dist.get(cur.id);
@@ -1140,182 +1227,224 @@
                     if (!dist.has(nb.id)) {
                         dist.set(nb.id, d + 1);
                         parentOf.set(nb.id, cur);
-                        childCountOf.set(cur.id, (childCountOf.get(cur.id) || 0) + 1);
                         queue.push(nb);
                     }
                 }
             }
 
-            // 3. Sun treatment: enlarged, brighter core, additive glow halo, warm point light
-            const sunRadius = Math.max(26, sun.radius * 1.9);
-            const glowTex = this.makeGlowTexture();
+            // 3. Assign every node an arm, a galactocentric radius, an azimuth and y.
+            //    The tilt is baked per-position at step time (NOT on a parent group)
+            //    because edge lines are rebuilt from world-space node positions.
+            const assign = (node, r, arm) => {
+                node.gal = {
+                    r: r,
+                    phi: arm * (Math.PI * 2 / ARMS) + WIND * Math.log(1 + r / R0) + gauss() * (0.30 + 0.25 * (r / 600)),
+                    y: gauss() * (52 / (1 + r / 150)),   // thick bulge, thin outer disk
+                    omega: V0 / (r + R_CORE),
+                    arm: arm
+                };
+            };
+
+            // Inner arm stars: direct neighbors of the core, biggest hubs closest in
+            const inner = nodes
+                .filter(n => dist.get(n.id) === 1)
+                .sort((a, b) => b.degree - a.degree);
+            inner.forEach((n, i) => {
+                const r = inner.length > 1 ? 140 + (i / (inner.length - 1)) * 400 : 170;
+                assign(n, r + gauss() * 14, i % ARMS);
+            });
+
+            // Deeper stars inherit their BFS parent's arm and sit a little further out
+            const rest = nodes
+                .filter(n => dist.has(n.id) && dist.get(n.id) >= 2)
+                .sort((a, b) => dist.get(a.id) - dist.get(b.id));
+            rest.forEach(n => {
+                const par = parentOf.get(n.id);
+                const pr = par.gal ? par.gal.r : 60;
+                const arm = (par.gal && par.gal.arm >= 0) ? par.gal.arm : Math.floor(Math.random() * ARMS);
+                assign(n, Math.min(pr + 62 + Math.abs(gauss()) * 30, 660), arm);
+            });
+
+            // Orphan nodes drift in a dim outer ring on spread-out arms
+            let beltIdx = 0;
+            nodes.forEach(n => {
+                if (n === core || dist.has(n.id)) return;
+                assign(n, 560 + Math.random() * 120, beltIdx % ARMS);
+                beltIdx++;
+            });
+
+            // 4. Core treatment: enlarged warm hub, breathing glow bulge, point light
+            const coreRadius = Math.max(22, core.radius * 1.6);
             const glow = new THREE.Sprite(new THREE.SpriteMaterial({
-                map: glowTex,
+                map: this.makeGlowTexture(),
                 transparent: true,
                 blending: THREE.AdditiveBlending,
                 depthWrite: false
             }));
-            glow.scale.set(sunRadius * 7, sunRadius * 7, 1);
+            glow.scale.set(coreRadius * 6, coreRadius * 6, 1);
             this.orbitGroup.add(glow);
 
-            const sunLight = new THREE.PointLight(0xffd9a0, 1.5, 2400, 1);
-            this.orbitGroup.add(sunLight);
+            const coreLight = new THREE.PointLight(0xffd9a0, 1.5, 2400, 1);
+            this.orbitGroup.add(coreLight);
 
-            sun.position.set(0, 0, 0);
-            sun.mesh.position.set(0, 0, 0);
-            sun.mesh.scale.set(sunRadius, sunRadius, sunRadius);
-            sun.mesh.material.emissiveIntensity = 1.0;
-            if (sun.labelSprite) sun.labelSprite.position.set(0, sunRadius + 9, 0);
+            core.position.set(0, 0, 0);
+            core.mesh.position.set(0, 0, 0);
+            core.mesh.scale.set(coreRadius, coreRadius, coreRadius);
+            core.mesh.material.emissiveIntensity = 1.0;
+            if (core.labelSprite) core.labelSprite.position.set(0, coreRadius + 9, 0);
+            core.gal = null;
 
-            // 4. Assign orbits. Parents are always processed before children so moons
-            //    ride on freshly-updated parent positions each frame.
-            const rings = [];
-            const order = [sun];
-            const childIdx = new Map();
+            // 5. Star layer — ALL node glows in ONE shared-texture Points draw call.
+            //    Filtering hides stars by zeroing their additive color (see applyFilters).
+            const starNodes = nodes.filter(n => n !== core);
+            const sPos = new Float32Array(starNodes.length * 3);
+            const sCol = new Float32Array(starNodes.length * 3);
+            starNodes.forEach((n, i) => {
+                n.galIdx = i;
+                const c = new THREE.Color(n.colorHex);
+                const b = 0.6 + Math.min(1, (n.degree || 0) / 12) * 0.9; // hubs burn brighter
+                n.galColor = [c.r * b, c.g * b, c.b * b];
+                // Respect filters active at build time (applyFilters re-syncs later)
+                const vis = n.visible !== false;
+                sCol[i * 3] = vis ? n.galColor[0] : 0;
+                sCol[i * 3 + 1] = vis ? n.galColor[1] : 0;
+                sCol[i * 3 + 2] = vis ? n.galColor[2] : 0;
+            });
+            const starGeo = new THREE.BufferGeometry();
+            starGeo.setAttribute('position', new THREE.BufferAttribute(sPos, 3));
+            starGeo.setAttribute('color', new THREE.BufferAttribute(sCol, 3));
+            const starPts = new THREE.Points(starGeo, new THREE.PointsMaterial({
+                size: 26,
+                map: this.makeStarTexture(),
+                vertexColors: true,
+                transparent: true,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false
+            }));
+            this.orbitGroup.add(starPts);
 
-            const randomTilt = () => new THREE.Quaternion().setFromEuler(
-                new THREE.Euler(
-                    (Math.random() - 0.5) * 0.22,
-                    Math.random() * Math.PI * 2,
-                    (Math.random() - 0.5) * 0.22
-                )
-            );
+            // 6. Dust haze — faint static-ish stars seeded from the same arm function,
+            //    selling disk volume for one extra draw call.
+            const DUST = 1400;
+            const dust = [];
+            const dPos = new Float32Array(DUST * 3);
+            const dCol = new Float32Array(DUST * 3);
+            for (let i = 0; i < DUST; i++) {
+                const r = 55 + Math.sqrt(Math.random()) * 625;
+                const arm = Math.floor(Math.random() * ARMS);
+                let phi = arm * (Math.PI * 2 / ARMS) + WIND * Math.log(1 + r / R0) + gauss() * 0.5;
+                if (Math.random() < 0.3) phi = Math.random() * Math.PI * 2; // inter-arm haze
+                dust.push({ r: r, phi: phi, y: gauss() * (70 / (1 + r / 160)), omega: V0 / (r + R_CORE) });
+                const t = Math.random();
+                const b = 0.10 + Math.random() * 0.16;
+                dCol[i * 3] = (0.6 + t * 0.4) * b;      // blue-white to faint violet
+                dCol[i * 3 + 1] = (0.7 + t * 0.2) * b;
+                dCol[i * 3 + 2] = 1.0 * b;
+            }
+            const dustGeo = new THREE.BufferGeometry();
+            dustGeo.setAttribute('position', new THREE.BufferAttribute(dPos, 3));
+            dustGeo.setAttribute('color', new THREE.BufferAttribute(dCol, 3));
+            const dustPts = new THREE.Points(dustGeo, new THREE.PointsMaterial({
+                size: 9,
+                map: this.makeStarTexture(),
+                vertexColors: true,
+                transparent: true,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false
+            }));
+            this.orbitGroup.add(dustPts);
 
-            const addOrbit = (node, center, radius, speed, ringOpacity) => {
-                const q = randomTilt();
-                node.orbit = {
-                    center: center,
-                    radius: radius,
-                    angle: Math.random() * Math.PI * 2,
-                    speed: speed,
-                    q: q
-                };
+            // 7. Shrink node meshes under their star glow so the disk reads as stars
+            starNodes.forEach(n => n.mesh.scale.setScalar(n.radius * 0.55));
 
-                // Faint orbit guide ring in the node's own color
-                const seg = 96;
-                const pts = new Float32Array((seg + 1) * 3);
-                for (let i = 0; i <= seg; i++) {
-                    const a = (i / seg) * Math.PI * 2;
-                    pts[i * 3] = Math.cos(a) * radius;
-                    pts[i * 3 + 1] = 0;
-                    pts[i * 3 + 2] = Math.sin(a) * radius;
-                }
-                const geo = new THREE.BufferGeometry();
-                geo.setAttribute('position', new THREE.BufferAttribute(pts, 3));
-                const mat = new THREE.LineBasicMaterial({
-                    color: node.colorHex,
-                    transparent: true,
-                    opacity: ringOpacity,
-                    depthWrite: false
-                });
-                const ring = new THREE.Line(geo, mat);
-                ring.quaternion.copy(q);
-                if (center !== sun) ring.position.copy(center.position);
-                this.orbitGroup.add(ring);
-                rings.push({ mesh: ring, center: center });
-                order.push(node);
+            this.galaxy = {
+                core: core, order: starNodes, starPts: starPts, dustPts: dustPts, dust: dust,
+                glow: glow, light: coreLight, tiltQ: TILT, glowBase: coreRadius * 6, pulse: 0
             };
 
-            // Planets: direct neighbors of the sun — biggest worlds closest in, Kepler-like speeds
-            const planets = nodes
-                .filter(n => dist.get(n.id) === 1)
-                .sort((a, b) => b.degree - a.degree);
-            let planetRadius = 120;
-            planets.forEach(p => {
-                addOrbit(p, sun, planetRadius, 0.35 * Math.pow(140 / planetRadius, 1.5), 0.2);
-                planetRadius += 58 + p.radius * 2;
-            });
-
-            // Moons: deeper nodes orbit their BFS parent; spacing tightens with sibling count
-            const rest = nodes
-                .filter(n => dist.has(n.id) && dist.get(n.id) >= 2)
-                .sort((a, b) => dist.get(a.id) - dist.get(b.id));
-            rest.forEach(m => {
-                const par = parentOf.get(m.id);
-                const idx = childIdx.get(par.id) || 0;
-                childIdx.set(par.id, idx + 1);
-                const cc = childCountOf.get(par.id) || 1;
-                const spacing = Math.max(7, Math.min(16, 120 / cc));
-                const orbitR = Math.min(par.radius + 14 + idx * spacing, par.radius + 240);
-                addOrbit(m, par, orbitR, 0.5 * Math.pow(45 / orbitR, 1.5), 0.12);
-            });
-
-            // Outer belt: nodes disconnected from the root project orbit far and slow
-            let beltIdx = 0;
-            nodes.forEach(n => {
-                if (n === sun || dist.has(n.id)) return;
-                const r = 560 + (beltIdx % 3) * 48;
-                addOrbit(n, sun, r, 0.35 * Math.pow(140 / r, 1.5), 0.08);
-                beltIdx++;
-            });
-
-            this.solar = { sun, rings, order, glow, light: sunLight, glowBase: sunRadius * 7, pulse: 0 };
+            this.stepGalaxy(0); // first frame already shows the galaxy, no pop-in
         }
 
-        clearSolarSystem() {
-            if (!this.solar) return;
-            const { sun, rings, glow, light } = this.solar;
+        clearGalaxy() {
+            if (!this.galaxy) return;
+            const g = this.galaxy;
 
-            rings.forEach(r => {
-                this.orbitGroup.remove(r.mesh);
-                r.mesh.geometry.dispose();
-                r.mesh.material.dispose();
+            [g.starPts, g.dustPts].forEach(p => {
+                this.orbitGroup.remove(p);
+                p.geometry.dispose();
+                p.material.dispose(); // map is the SHARED cached texture — never disposed here
             });
-            if (glow) {
-                this.orbitGroup.remove(glow);
-                if (glow.material.map) glow.material.map.dispose();
-                glow.material.dispose();
-            }
-            if (light) this.orbitGroup.remove(light);
+            this.orbitGroup.remove(g.glow);
+            g.glow.material.dispose(); // glow map is cached too — keep it
+            this.orbitGroup.remove(g.light);
 
-            // Restore the former sun's normal appearance
-            if (sun && sun.mesh && sun.mesh.material) {
-                sun.mesh.scale.set(sun.radius, sun.radius, sun.radius);
-                sun.mesh.material.emissiveIntensity = sun.degree > 10 ? 0.45 : 0.25;
-                if (sun.labelSprite) sun.labelSprite.position.set(0, sun.radius + 5, 0);
-            }
-            this.nodes.forEach(n => { n.orbit = null; });
-            this.solar = null;
+            // Undo every visual mutation on ALL nodes (core was enlarged, the rest shrunk)
+            this.nodes.forEach(n => {
+                n.gal = null;
+                n.galIdx = null;
+                n.galColor = null;
+                n.mesh.scale.setScalar(n.radius);
+                if (n.mesh.material) {
+                    n.mesh.material.emissiveIntensity = n.degree > 10 ? 0.45 : 0.25;
+                }
+                if (n.labelSprite) n.labelSprite.position.set(0, n.radius + 5, 0);
+            });
+
+            this.galaxy = null;
         }
 
         /**
-         * Advance every orbit one tick (dt in seconds)
+         * Advance the galaxy one tick (dt in seconds). Positions are analytical —
+         * every star computes its own tilted-disk coordinate, then edges re-sync.
          */
-        stepSolar(dt) {
-            const s = this.solar;
-            if (!s) return;
+        stepGalaxy(dt) {
+            const g = this.galaxy;
+            if (!g) return;
             const t = dt * this.orbitSpeed;
             const tmp = this.tmpVec;
 
-            for (const node of s.order) {
-                const o = node.orbit;
-                if (!o) continue;
-                o.angle += o.speed * t;
-                tmp.set(Math.cos(o.angle) * o.radius, 0, Math.sin(o.angle) * o.radius)
-                    .applyQuaternion(o.q)
-                    .add(o.center.position);
+            const posArr = g.starPts.geometry.attributes.position.array;
+            for (const node of g.order) {
+                const a = node.gal;
+                if (!a) continue;
+                a.phi += a.omega * t;
+                tmp.set(Math.cos(a.phi) * a.r, a.y, Math.sin(a.phi) * a.r).applyQuaternion(g.tiltQ);
                 node.position.copy(tmp);
                 node.mesh.position.copy(tmp);
+                const i3 = node.galIdx * 3;
+                posArr[i3] = tmp.x;
+                posArr[i3 + 1] = tmp.y;
+                posArr[i3 + 2] = tmp.z;
             }
+            g.starPts.geometry.attributes.position.needsUpdate = true;
 
-            // Moon orbit rings follow their (moving) parent
-            for (const ring of s.rings) {
-                if (ring.center !== s.sun) ring.mesh.position.copy(ring.center.position);
+            const dArr = g.dustPts.geometry.attributes.position.array;
+            for (let i = 0; i < g.dust.length; i++) {
+                const d = g.dust[i];
+                d.phi += d.omega * t;
+                tmp.set(Math.cos(d.phi) * d.r, d.y, Math.sin(d.phi) * d.r).applyQuaternion(g.tiltQ);
+                const i3 = i * 3;
+                dArr[i3] = tmp.x;
+                dArr[i3 + 1] = tmp.y;
+                dArr[i3 + 2] = tmp.z;
             }
+            g.dustPts.geometry.attributes.position.needsUpdate = true;
 
-            // Sun breathing + slow axial spin
-            s.pulse += t;
-            const g = 1 + 0.06 * Math.sin(s.pulse * 1.7);
-            s.glow.scale.set(s.glowBase * g, s.glowBase * g, 1);
-            s.sun.mesh.rotation.y += t * 0.12;
+            // Core breathing halo + slow axial spin
+            g.pulse += t;
+            const k = 1 + 0.05 * Math.sin(g.pulse * 1.5);
+            g.glow.scale.set(g.glowBase * k, g.glowBase * k, 1);
+            g.core.mesh.rotation.y += t * 0.06;
 
             this.syncEdgePositions();
         }
 
         /**
-         * Radial gradient texture used for the sun's glow halo
+         * Radial gradient texture for the galactic core's glow halo.
+         * Cached — clearGalaxy() must never dispose this map.
          */
         makeGlowTexture() {
+            if (this._glowTex) return this._glowTex;
             const size = 256;
             const canvas = document.createElement('canvas');
             canvas.width = size;
@@ -1330,6 +1459,31 @@
             ctx.fillRect(0, 0, size, size);
             const tex = new THREE.CanvasTexture(canvas);
             tex.minFilter = THREE.LinearFilter;
+            this._glowTex = tex;
+            return tex;
+        }
+
+        /**
+         * Soft white star dot shared by the galaxy's star + dust Points layers.
+         * One texture, two draw calls; per-star tint comes from vertex colors.
+         */
+        makeStarTexture() {
+            if (this._starTex) return this._starTex;
+            const size = 128;
+            const canvas = document.createElement('canvas');
+            canvas.width = size;
+            canvas.height = size;
+            const ctx = canvas.getContext('2d');
+            const grad = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+            grad.addColorStop(0.0, 'rgba(255, 255, 255, 1.0)');
+            grad.addColorStop(0.25, 'rgba(255, 255, 255, 0.5)');
+            grad.addColorStop(0.5, 'rgba(255, 255, 255, 0.12)');
+            grad.addColorStop(1.0, 'rgba(255, 255, 255, 0)');
+            ctx.fillStyle = grad;
+            ctx.fillRect(0, 0, size, size);
+            const tex = new THREE.CanvasTexture(canvas);
+            tex.minFilter = THREE.LinearFilter;
+            this._starTex = tex;
             return tex;
         }
 
@@ -1422,8 +1576,8 @@
             this.selectedNode = null;
             document.getElementById('inspector-drawer').classList.remove('open');
             this.nodes.forEach(n => {
-                const isSun = this.solar && this.solar.sun === n;
-                n.mesh.material.emissiveIntensity = isSun ? 1.0 : (n.degree > 10 ? 0.45 : 0.25);
+                const isCore = this.galaxy && this.galaxy.core === n;
+                n.mesh.material.emissiveIntensity = isCore ? 1.0 : (n.degree > 10 ? 0.45 : 0.25);
             });
         }
 
@@ -1448,7 +1602,7 @@
          */
         pulseNode(node) {
             if (!node || !node.mesh) return;
-            const originalScale = node.mesh.scale.x; // current scale (sun is enlarged in solar layout)
+            const originalScale = node.mesh.scale.x; // current scale (core is enlarged in galaxy layout)
             const startTime = performance.now();
             const duration = 650;
 
@@ -1537,17 +1691,14 @@
         }
 
         /**
-         * Reset View to Initial Framing
+         * Reset View to the framing appropriate for the active layout
          */
         resetView() {
-            this.cameraAnimation = {
-                startTime: performance.now(),
-                duration: 1000,
-                startPos: this.camera.position.clone(),
-                endPos: new THREE.Vector3(0, 350, 750),
-                startTarget: this.controls.target.clone(),
-                endTarget: new THREE.Vector3(0, 0, 0)
-            };
+            if (this.currentLayout === 'galaxy') {
+                this.frameCamera(0, 560, 620);
+            } else {
+                this.frameCamera(0, 350, 750);
+            }
         }
 
         togglePhysics() {
@@ -1591,10 +1742,15 @@
             const dt = Math.min(0.05, (now - this.lastFrameTime) / 1000);
             this.lastFrameTime = now;
 
-            // Step Physics (force-directed) or orbits (solar system)
+            // After 6s of no input the HUD fades and the galaxy owns the screen
+            if (now - this.lastHudActivity > 6000) {
+                document.body.classList.add('hud-dim');
+            }
+
+            // Step Physics (force-directed) or the galaxy's differential rotation
             this.stepPhysics();
-            if (this.currentLayout === 'solar' && this.solar && this.simulationRunning) {
-                this.stepSolar(dt);
+            if (this.currentLayout === 'galaxy' && this.galaxy && this.simulationRunning) {
+                this.stepGalaxy(dt);
             }
 
             // Step Particles

@@ -374,6 +374,43 @@ html, body {
     border-radius: 3px;
 }
 
+/* Collapsible sections (Physics Tuning) */
+details > summary {
+    cursor: pointer;
+    list-style: none;
+    user-select: none;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+details > summary::-webkit-details-marker { display: none; }
+details > summary::before {
+    content: '▸';
+    display: inline-block;
+    transition: transform 0.2s ease;
+}
+details[open] > summary::before { transform: rotate(90deg); }
+details > summary:hover { color: var(--text-primary); }
+
+/* HUD idle-dim: chrome fades so the galaxy dominates (C4) */
+/* Full transition list restated — `transition` is one property and a bare
+   opacity rule would kill the dock's collapse/border/hover animations. */
+#header-bar, #left-dock, #timeline-bar, #left-dock-toggle {
+    transition: opacity 0.8s ease, transform 0.3s cubic-bezier(0.16, 1, 0.3, 1), border-color 0.25s ease, box-shadow 0.25s ease;
+}
+body.hud-dim #header-bar:not(:hover),
+body.hud-dim #left-dock:not(:hover),
+body.hud-dim #timeline-bar:not(:hover),
+body.hud-dim #left-dock-toggle:not(:hover) {
+    opacity: 0.22;
+}
+body.hud-dim #header-bar:hover,
+body.hud-dim #left-dock:hover,
+body.hud-dim #timeline-bar:hover,
+body.hud-dim #left-dock-toggle:hover {
+    opacity: 1;
+}
+
 .section-label {
     font-size: 11px;
     font-weight: 600;

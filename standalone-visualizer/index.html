@@ -82,7 +82,7 @@
                 <div class="section-label">3D Layout Mode</div>
                 <div class="segmented-control">
                     <button class="segment-btn active" data-layout="force">3D Force</button>
-                    <button class="segment-btn" data-layout="solar">Solar System</button>
+                    <button class="segment-btn" data-layout="galaxy">Galaxy</button>
                     <button class="segment-btn" data-layout="sphere">Sphere</button>
                 </div>
             </div>
@@ -108,7 +108,7 @@
                 <div class="slider-group" id="orbit-speed-group" style="display: none; margin-top: 8px;">
                     <div class="slider-row">
                         <div class="slider-label-row">
-                            <span>Orbit Speed</span>
+                            <span>Rotation Speed</span>
                             <span id="val-orbit-speed" class="type-count">1×</span>
                         </div>
                         <input type="range" id="slider-orbit-speed" class="slider-input" min="0.1" max="3" step="0.1" value="1">
@@ -121,9 +121,9 @@
                 </div>
             </div>
 
-            <!-- Physics Tuning -->
-            <div>
-                <div class="section-label">Physics Tuning</div>
+            <!-- Physics Tuning (collapsible; hidden outside the force layout) -->
+            <details id="physics-details" open>
+                <summary class="section-label">Physics Tuning</summary>
                 <div class="slider-group">
                     <div class="slider-row">
                         <div class="slider-label-row">
@@ -147,7 +147,7 @@
                         <input type="range" id="slider-gravity" class="slider-input" min="1" max="50" step="1" value="15">
                     </div>
                 </div>
-            </div>
+            </details>
 
             <!-- Entity Types Filter Checklist -->
             <div>
