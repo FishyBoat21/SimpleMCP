@@ -121,7 +121,7 @@ Document ingestion and retrieval — same login requirement as the graph tools.
 
 | Tool | What it does |
 |------|--------------|
-| `ingest_document` | Chunk and store a text document (txt/markdown/csv/json/html/code); re-ingesting an existing id replaces that document. |
+| `ingest_document` | Chunk and store a text document (txt/markdown/csv/json/html/code), from raw content or directly from a file path; re-ingesting an existing id replaces that document. |
 | `retrieve` | RAG over chunks: keyword / semantic / hybrid (default); `include_graph` also fuses matching graph entities. |
 | `list_documents` | List ingested documents with metadata. |
 | `get_document` | Fetch one document's full text, chunks in order. |
@@ -173,7 +173,8 @@ run as the trusted `local` user).
 (txt/markdown/csv/json/html/code) into a per-user chunked store (`memory_documents` /
 `memory_chunks` + FTS5 mirror `memory_chunks_fts`) in the same `data/memory.sqlite`.
 
-- `ingest_document` chunks the text at paragraph then line boundaries, greedily packing to
+- `ingest_document` accepts raw text `content` or ingests directly from a file `path` / `file_path`
+  (e.g. a Markdown file), chunking the text at paragraph then line boundaries, greedily packing to
   `chunk_size` (default 1000 chars, clamped 50–8000) with `chunk_overlap` (default 150)
   characters carried across boundaries so context isn't cut off. Re-ingesting an existing id
   replaces that document.

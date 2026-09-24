@@ -32,20 +32,21 @@ readonly class KnowledgeBaseTool {
     #[McpFunction(
         name: 'ingest_document',
         roles: self::REQUIRED_ROLES,
-        description: 'Ingest a text-based document (txt, markdown, csv, json, html, code) into the knowledge base. The content is split into overlapping chunks for retrieval. Re-ingesting the same id (default: derived from the filename) replaces the previous version. Returns the document id, the chunk ids and the chunk count.',
+        description: 'Ingest a text-based document (txt, markdown, csv, json, html, code) into the knowledge base, directly from raw content or from a file path (e.g. a Markdown file). The content is split into overlapping chunks for retrieval. Re-ingesting the same id (default: derived from the filename) replaces the previous version. Returns the document id, the chunk ids and the chunk count.',
         schema: [
             'type' => 'object',
             'properties' => [
-                'content' => ['type' => 'string', 'description' => 'The raw text of the document to ingest.'],
-                'filename' => ['type' => 'string', 'description' => 'Name of the file (used for the default id and format inference).'],
+                'path' => ['type' => 'string', 'description' => 'Path of a document file (e.g. a Markdown file) to ingest directly from disk. If provided, content, filename, and source are automatically populated if omitted.'],
+                'file_path' => ['type' => 'string', 'description' => 'Alias for path.'],
+                'content' => ['type' => 'string', 'description' => 'The raw text of the document to ingest. Required if path is not specified.'],
+                'filename' => ['type' => 'string', 'description' => 'Name of the file (used for the default id and format inference). Optional if path is specified.'],
                 'id' => ['type' => 'string', 'description' => 'Optional stable id for the document. Defaults to a slug of the filename; re-using an existing id replaces that document.'],
                 'format' => ['type' => 'string', 'enum' => ['text', 'markdown', 'csv', 'json', 'html', 'code'], 'description' => 'Optional file format. Defaults to a guess from the filename extension.'],
                 'title' => ['type' => 'string', 'description' => 'Optional human-readable title for the document.'],
-                'source' => ['type' => 'string', 'description' => 'Optional provenance note, e.g. a URL or file path.'],
+                'source' => ['type' => 'string', 'description' => 'Optional provenance note, e.g. a URL or file path. Defaults to path when path is provided.'],
                 'chunk_size' => ['type' => 'integer', 'default' => 1000, 'minimum' => 50, 'maximum' => 8000, 'description' => 'Target chunk length in characters.'],
                 'chunk_overlap' => ['type' => 'integer', 'default' => 150, 'minimum' => 0, 'maximum' => 2000, 'description' => 'Characters of overlap carried between consecutive chunks so context spans boundaries.'],
             ],
-            'required' => ['content', 'filename'],
         ]
     )]
     public function ingestDocument(array $arguments, ?UserContext $user = null): array {

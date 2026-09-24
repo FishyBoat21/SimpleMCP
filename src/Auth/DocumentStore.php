@@ -197,10 +197,41 @@ final class DocumentStore {
      * @return array<string, mixed> {id, filename, format, title, source, chunkCount, replaced, chunks} or {error}
      */
     public function ingestDocument(string $username, array $params): array {
+        $path = trim((string) ($params['path'] ?? $params['file_path'] ?? ''));
+        if ($path !== '') {
+            $resolvedPath = $path;
+            if (!is_file($resolvedPath)) {
+                // If not found relative to current working directory or absolute, try relative to project root
+                $repoRelative = dirname(__DIR__, 2) . DIRECTORY_SEPARATOR . ltrim($path, '/\\');
+                if (is_file($repoRelative)) {
+                    $resolvedPath = $repoRelative;
+                }
+            }
+
+            if (!is_file($resolvedPath) || !is_readable($resolvedPath)) {
+                return ['error' => "No readable file at '{$path}'."];
+            }
+
+            $fileContent = @file_get_contents($resolvedPath);
+            if (!is_string($fileContent) || trim($fileContent) === '') {
+                return ['error' => "File at '{$path}' is empty or could not be read."];
+            }
+
+            if (!isset($params['content']) || trim((string) $params['content']) === '') {
+                $params['content'] = $fileContent;
+            }
+            if (!isset($params['filename']) || trim((string) $params['filename']) === '') {
+                $params['filename'] = basename($resolvedPath);
+            }
+            if (!isset($params['source']) || trim((string) $params['source']) === '') {
+                $params['source'] = $path;
+            }
+        }
+
         $content = trim((string) ($params['content'] ?? ''));
         $filename = trim((string) ($params['filename'] ?? ''));
         if ($content === '') {
-            return ['error' => 'content must be a non-empty string.'];
+            return ['error' => "Either 'path' pointing to a readable file, or 'content' and 'filename' must be provided."];
         }
         if ($filename === '') {
             return ['error' => 'filename must be a non-empty string.'];
@@ -214,6 +245,11 @@ final class DocumentStore {
         $format = (string) ($params['format'] ?? self::inferFormat($filename));
         if (!in_array($format, ['text', 'markdown', 'csv', 'json', 'html', 'code'], true)) {
             $format = 'text';
+        }
+
+        $title = trim((string) ($params['title'] ?? ''));
+        if ($title === '' && $format === 'markdown' && preg_match('/^#\s+(.+)$/m', $content, $matches)) {
+            $title = trim($matches[1]);
         }
 
         $chunkSize = max(50, min(8000, (int) ($params['chunk_size'] ?? 1000)));
@@ -241,7 +277,7 @@ final class DocumentStore {
             ':id' => $id,
             ':username' => $username,
             ':filename' => $filename,
-            ':title' => (string) ($params['title'] ?? ''),
+            ':title' => $title,
             ':source' => (string) ($params['source'] ?? ''),
             ':format' => $format,
             ':chunk_count' => count($chunks),
@@ -276,7 +312,7 @@ final class DocumentStore {
             'id' => $id,
             'filename' => $filename,
             'format' => $format,
-            'title' => (string) ($params['title'] ?? ''),
+            'title' => $title,
             'source' => (string) ($params['source'] ?? ''),
             'chunkCount' => count($chunks),
             'replaced' => $existing !== null,
