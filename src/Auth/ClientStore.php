@@ -194,4 +194,71 @@ final class ClientStore {
         }
         return $items;
     }
+
+    /**
+     * List all dynamically registered clients with their token counts and creation dates.
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    public function listDynamic(): array {
+        $stmt = $this->db->pdo()->query(
+            'SELECT c.client_id, c.client_name, c.token_endpoint_auth_method, c.redirect_uris, c.created_at,
+                    (SELECT COUNT(*) FROM access_tokens a WHERE a.client_id = c.client_id AND a.expires_at > strftime("%s","now")) as active_access_tokens,
+                    (SELECT COUNT(*) FROM refresh_tokens r WHERE r.client_id = c.client_id AND r.expires_at > strftime("%s","now")) as active_refresh_tokens
+             FROM clients c
+             ORDER BY c.created_at DESC'
+        );
+        $results = [];
+        while ($row = $stmt->fetch()) {
+            $results[] = [
+                'client_id' => (string) $row['client_id'],
+                'client_name' => (string) $row['client_name'],
+                'auth_method' => (string) $row['token_endpoint_auth_method'],
+                'redirect_uris' => json_decode((string) $row['redirect_uris'], true) ?: [],
+                'created_at' => (int) $row['created_at'],
+                'active_access_tokens' => (int) $row['active_access_tokens'],
+                'active_refresh_tokens' => (int) $row['active_refresh_tokens'],
+            ];
+        }
+        return $results;
+    }
+
+    /**
+     * Delete dynamic clients created more than $maxAgeSeconds ago that have no active tokens.
+     */
+    public function pruneInactiveClients(int $maxAgeSeconds = 30 * 86400): int {
+        $cutoff = time() - $maxAgeSeconds;
+        $pdo = $this->db->pdo();
+        $stmt = $pdo->prepare(
+            'DELETE FROM clients
+             WHERE created_at < :cutoff
+               AND client_id NOT IN (SELECT DISTINCT client_id FROM access_tokens WHERE expires_at > :now)
+               AND client_id NOT IN (SELECT DISTINCT client_id FROM refresh_tokens WHERE expires_at > :now)'
+        );
+        $stmt->execute([':cutoff' => $cutoff, ':now' => time()]);
+        return $stmt->rowCount();
+    }
+
+    /**
+     * Delete a dynamic client and all its associated tokens.
+     */
+    public function deleteDynamic(string $clientId): bool {
+        $pdo = $this->db->pdo();
+        $pdo->beginTransaction();
+        try {
+            $pdo->prepare('DELETE FROM access_tokens WHERE client_id = :id')->execute([':id' => $clientId]);
+            $pdo->prepare('DELETE FROM refresh_tokens WHERE client_id = :id')->execute([':id' => $clientId]);
+            $pdo->prepare('DELETE FROM auth_codes WHERE client_id = :id')->execute([':id' => $clientId]);
+            $stmt = $pdo->prepare('DELETE FROM clients WHERE client_id = :id');
+            $stmt->execute([':id' => $clientId]);
+            $deleted = $stmt->rowCount() > 0;
+            $pdo->commit();
+            return $deleted;
+        } catch (\Throwable $e) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            throw $e;
+        }
+    }
 }

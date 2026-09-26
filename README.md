@@ -38,14 +38,14 @@ printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n{"jsonrpc":"
 
 ### stdio mode (MCP clients)
 
-MCP clients launch the server directly. A typical client config:
+MCP clients launch the dedicated stdio script directly:
 
 ```json
 {
   "mcpServers": {
     "simplemcp": {
       "command": "php",
-      "args": ["D:\\Project\\SimpleMCP\\index.php"]
+      "args": ["D:\\Project\\SimpleMCP\\stdio.php"]
     }
   }
 }
@@ -54,18 +54,23 @@ MCP clients launch the server directly. A typical client config:
 Smoke test:
 
 ```sh
-printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n' | php index.php
+printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n' | php stdio.php
 ```
 
-### HTTP mode (OAuth + browser login)
+### HTTP mode (Isolated Document Root & Public Deployment)
+
+For local development:
 
 ```sh
-php -S localhost:8000 index.php
+php -S localhost:8000 -t public/
 ```
 
-`index.php` must be the router script so `data/` is never served statically. The server then
-exposes the OAuth endpoints, the `/account` page, and the MCP JSON-RPC endpoint (everything
-else).
+For production/public web servers (Nginx/Apache/Caddy):
+- Point your web server document root to the `public/` directory.
+- This isolates `data/` (SQLite databases, logs, sessions) and `config/` completely outside the web root.
+- All HTTP responses carry security headers (`X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`).
+- Cookies are hardened (`HttpOnly`, `SameSite=Lax`, and `Secure` on HTTPS).
+- Configure a canonical `issuer` in `config/oauth.php` to prevent Host-header poisoning.
 
 ## Included tools
 
@@ -211,34 +216,60 @@ OAuth handshake when `client_secret_basic` is offered, so DCR-registered clients
   client/redirect/PKCE) and exchange the resulting code normally; the client connects but
   only sees/calls public tools.
 
+### Passkey (WebAuthn / FIDO2) Authentication
+
+Users can log in passwordlessly with biometrics (Touch ID, Face ID, Windows Hello) or physical security keys (YubiKey):
+- **Registration**: Log into `/account` and click **"Add Passkey"**. The browser triggers `navigator.credentials.create()` and saves the public key in SQLite.
+- **Login**: Both `/account/login` and `/oauth/authorize` support **"Sign in with Passkey"** and browser WebAuthn Conditional UI (autofill).
+- **OAuth 2.1 Compatibility**: When an MCP client triggers the OAuth flow, the user authenticates with their passkey in the browser, and the server automatically issues the authorization code back to the MCP client.
+
+### Client & Token Housekeeping CLI
+
+SimpleMCP supports Dynamic Client Registration (RFC 7591) while keeping the database clean via a CLI housekeeping tool:
+
+```sh
+# View dynamically registered clients and expired token stats
+php cli/cleanup_clients.php
+
+# Prune expired tokens and inactive dynamic clients (older than 30 days)
+php cli/cleanup_clients.php --prune
+
+# Custom threshold (e.g. 7 days) or dry run
+php cli/cleanup_clients.php --prune --days=7 --dry-run
+```
+
 ## Configuration
 
-- **[config/users.php](config/users.php)** — seed users. `password` is a bcrypt hash (generate
-  with `php -r 'echo password_hash("pw", PASSWORD_BCRYPT);'`); a plaintext value is accepted
-  as a dev fallback. `status: 'pending'` (or a missing password) marks a user for onboarding.
-- **[config/oauth.php](config/oauth.php)** — OAuth clients, token/code TTLs, whether plain
-  PKCE is allowed, and an optional `registration_access_token` protecting `/oauth/register`.
+- **[config/users.php](config/users.php)** — seed users. `password` is a bcrypt hash; `status: 'pending'` marks a user for onboarding.
+- **[config/oauth.php](config/oauth.php)** — OAuth clients, token/code TTLs, `registration_access_token`, and canonical `issuer` for public deployment.
 
 ## Project structure
 
 ```
-index.php                     entry point — stdio loop, or HTTP router + auth bootstrap
+stdio.php                     dedicated stdio JSON-RPC loop for MCP clients
+public/
+  index.php                   isolated HTTP document root (OAuth, Account, Passkey, MCP JSON-RPC)
+cli/
+  cleanup_clients.php         housekeeping CLI for dynamic clients and expired tokens
+index.php                     root delegator (CLI -> stdio.php, HTTP -> public/index.php)
 config/
   users.php                   seed users
-  oauth.php                   OAuth clients, TTLs, registration token
+  oauth.php                   OAuth clients, TTLs, issuer, registration token
 src/
   McpServer.php               MCP core: tool registry, routing, access control, UserContext injection
-  UserContext.php             immutable user value object (local() / anonymous() factories, * wildcard)
-  Attributes/McpFunction.php  the #[McpFunction(name, description, schema, roles, permissions)] attribute
-  Tools/                      auto-discovered tool classes (CalculatorTool, AdminTool, ...)
+  UserContext.php             immutable user value object (local() / anonymous() factories)
+  Attributes/McpFunction.php  the #[McpFunction] attribute
+  Tools/                      auto-discovered tool classes
   Auth/
-    Database.php              SQLite bootstrap + idempotent schema + user seeding
+    Database.php              SQLite bootstrap + schema (users, clients, tokens, passkeys)
     UserStore.php             DB-backed accounts: auth, onboarding, change password
     TokenStore.php            OAuth codes/access/refresh tokens (sha256-hashed, single-use, rotating)
     ClientStore.php           OAuth client registry: static config + RFC 7591 dynamic clients
-    OAuthServer.php           authorize/token/register/discovery + resolveUser()
-    AccountController.php     /account user-management pages (native sessions + CSRF)
-    DebugLog.php              append-only diagnostics log to data/requests.log
+    PasskeyStore.php          WebAuthn passkey credential persistence & counter tracking
+    WebAuthn.php              pure-PHP WebAuthn engine (ES256, RS256, CBOR decoding)
+    OAuthServer.php           OAuth 2.1 AS + PKCE + passkey login + discovery
+    AccountController.php     /account pages (passkey management, change password, login)
+    DebugLog.php              append-only diagnostics log
 data/                         runtime-only, gitignored (app.sqlite, requests.log, sessions/)
 ```
 

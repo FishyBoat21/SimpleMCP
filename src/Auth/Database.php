@@ -86,6 +86,20 @@ final class Database {
                 client_id_issued_at          INTEGER NOT NULL,
                 created_at                   INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS passkey_credentials (
+                id            TEXT PRIMARY KEY,
+                username      TEXT NOT NULL,
+                public_key    TEXT NOT NULL,
+                sign_count    INTEGER NOT NULL DEFAULT 0,
+                aaguid        TEXT,
+                name          TEXT NOT NULL DEFAULT 'Passkey',
+                created_at    INTEGER NOT NULL,
+                last_used_at  INTEGER,
+                FOREIGN KEY(username) REFERENCES users(username) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_passkeys_username ON passkey_credentials(username);
             SQL);
     }
 
