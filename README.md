@@ -33,8 +33,10 @@ printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n{"jsonrpc":"
   `/account` page (HTTP mode) or globally in [config/config.php](config/config.php) (stdio mode).
 - **Self-hosted OAuth 2.1** — interactive login page, token endpoint, RFC 7591 dynamic
   client registration, RFC 8414 / RFC 9728 discovery. Tokens are sha256-hashed at rest.
-- **User management page** (`/account`) — login, public onboarding, change password, logout.
-- **SQLite storage** — users, OAuth clients, and tokens in `data/app.sqlite` (gitignored),
+- **WebAuthn Passkeys** — passwordless biometric and hardware security key logins (FIDO2 / WebAuthn).
+- **Email Two-Factor Authentication (2FA)** — 6-digit OTP verification for new devices, with trusted device cookies (90-day persistence) and zero external dependencies. Copy [config/mail.example.php](config/mail.example.php) to `config/mail.php` to configure SMTP or log driver.
+- **User management page** (`/account`) — login, public onboarding, change password, passkey registration, email management, trusted devices, and logout.
+- **SQLite storage** — users, OAuth clients, passkeys, trusted devices, and tokens in `data/app.sqlite` (gitignored),
   seeded from [config/users.php](config/users.php) on first run; the knowledge graph and
   document store live in their own `data/memory.sqlite`.
 - **No dependencies** — `composer.json` declares only `php >= 8.4`.
@@ -47,14 +49,14 @@ printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n{"jsonrpc":"
 
 ### stdio mode (MCP clients)
 
-MCP clients launch the server directly. A typical client config:
+MCP clients launch the dedicated stdio script directly:
 
 ```json
 {
   "mcpServers": {
     "simplemcp": {
       "command": "php",
-      "args": ["D:\\Project\\SimpleMCP\\index.php"]
+      "args": ["D:\\Project\\SimpleMCP\\stdio.php"]
     }
   }
 }
@@ -63,18 +65,23 @@ MCP clients launch the server directly. A typical client config:
 Smoke test:
 
 ```sh
-printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n' | php index.php
+printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n' | php stdio.php
 ```
 
-### HTTP mode (OAuth + browser login)
+### HTTP mode (Isolated Document Root & Public Deployment)
+
+For local development:
 
 ```sh
-php -S localhost:8000 index.php
+php -S localhost:8000 -t public/
 ```
 
-`index.php` must be the router script so `data/` is never served statically. The server then
-exposes the OAuth endpoints, the `/account` page, and the MCP JSON-RPC endpoint (everything
-else).
+For production/public web servers (Nginx/Apache/Caddy):
+- Point your web server document root to the `public/` directory.
+- This isolates `data/` (SQLite databases, logs, sessions) and `config/` completely outside the web root.
+- All HTTP responses carry security headers (`X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`).
+- Cookies are hardened (`HttpOnly`, `SameSite=Lax`, and `Secure` on HTTPS).
+- Configure a canonical `issuer` in `config/oauth.php` to prevent Host-header poisoning.
 
 ## Included tools
 
@@ -323,21 +330,45 @@ OAuth handshake when `client_secret_basic` is offered, so DCR-registered clients
   client/redirect/PKCE) and exchange the resulting code normally; the client connects but
   only sees/calls public tools.
 
+### Passkey (WebAuthn / FIDO2) Authentication
+
+Users can log in passwordlessly with biometrics (Touch ID, Face ID, Windows Hello) or physical security keys (YubiKey):
+- **Registration**: Log into `/account` and click **"Add Passkey"**. The browser triggers `navigator.credentials.create()` and saves the public key in SQLite.
+- **Login**: Both `/account/login` and `/oauth/authorize` support **"Sign in with Passkey"** and browser WebAuthn Conditional UI (autofill).
+- **OAuth 2.1 Compatibility**: When an MCP client triggers the OAuth flow, the user authenticates with their passkey in the browser, and the server automatically issues the authorization code back to the MCP client.
+
+### Client & Token Housekeeping CLI
+
+SimpleMCP supports Dynamic Client Registration (RFC 7591) while keeping the database clean via a CLI housekeeping tool:
+
+```sh
+# View dynamically registered clients and expired token stats
+php cli/cleanup_clients.php
+
+# Prune expired tokens and inactive dynamic clients (older than 30 days)
+php cli/cleanup_clients.php --prune
+
+# Custom threshold (e.g. 7 days) or dry run
+php cli/cleanup_clients.php --prune --days=7 --dry-run
+```
+
 ## Configuration
 
-- **[config/users.php](config/users.php)** — seed users. `password` is a bcrypt hash (generate
-  with `php -r 'echo password_hash("pw", PASSWORD_BCRYPT);'`); a plaintext value is accepted
-  as a dev fallback. `status: 'pending'` (or a missing password) marks a user for onboarding.
-- **[config/oauth.php](config/oauth.php)** — OAuth clients, token/code TTLs, whether plain
-  PKCE is allowed, and an optional `registration_access_token` protecting `/oauth/register`.
+- **[config/users.php](config/users.php)** — seed users. `password` is a bcrypt hash; `status: 'pending'` marks a user for onboarding.
+- **[config/oauth.php](config/oauth.php)** — OAuth clients, token/code TTLs, `registration_access_token`, and canonical `issuer` for public deployment.
 
 ## Project structure
 
 ```
-index.php                     entry point — stdio loop, or HTTP router + auth bootstrap
+stdio.php                     dedicated stdio JSON-RPC loop for MCP clients
+public/
+  index.php                   isolated HTTP document root (OAuth, Account, Passkey, MCP JSON-RPC)
+cli/
+  cleanup_clients.php         housekeeping CLI for dynamic clients and expired tokens
+index.php                     root delegator (CLI -> stdio.php, HTTP -> public/index.php)
 config/
   users.php                   seed users
-  oauth.php                   OAuth clients, TTLs, registration token
+  oauth.php                   OAuth clients, TTLs, issuer, registration token
 src/
   McpServer.php               MCP core: tool registry, routing, access control, UserContext injection
   UserContext.php             immutable user value object (local() / anonymous() factories, * wildcard)
@@ -345,14 +376,18 @@ src/
   Tools/                      auto-discovered tool classes (CalculatorTool, AdminTool,
                               MemoryTool, KnowledgeBaseTool, ...)
   Auth/
-    Database.php              SQLite bootstrap + idempotent schema + user seeding
-    UserStore.php             DB-backed accounts: auth, onboarding, change password
+    Database.php              SQLite bootstrap + schema (users, clients, tokens, passkeys, 2FA)
+    UserStore.php             DB-backed accounts: auth, onboarding, change password, email
     MemoryStore.php           per-user knowledge graph + FTS5 search (data/memory.sqlite)
     DocumentStore.php         per-user chunked document store + RAG retrieval
     TokenStore.php            OAuth codes/access/refresh tokens (sha256-hashed, single-use, rotating)
     ClientStore.php           OAuth client registry: static config + RFC 7591 dynamic clients
-    OAuthServer.php           authorize/token/register/discovery + resolveUser()
-    AccountController.php     /account user-management pages (native sessions + CSRF)
+    PasskeyStore.php          WebAuthn passkey credential persistence & counter tracking
+    WebAuthn.php              pure-PHP WebAuthn engine (ES256, RS256, CBOR decoding)
+    EmailService.php          zero-dependency SMTP / native mail / log driver email sender
+    TwoFactorService.php      email OTP generation, verification, and trusted device manager
+    OAuthServer.php           OAuth 2.1 AS + PKCE + passkey login + discovery + resolveUser()
+    AccountController.php     /account pages (passkey management, 2FA, change password, login)
     DebugLog.php              append-only diagnostics log to data/requests.log
 data/                         runtime-only, gitignored (app.sqlite, memory.sqlite,
                               requests.log, sessions/)
@@ -382,4 +417,4 @@ data/                         runtime-only, gitignored (app.sqlite, memory.sqlit
 
 ## License
 
-Not specified.
+This project is licensed under the [MIT License](LICENSE).

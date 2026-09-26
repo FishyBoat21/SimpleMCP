@@ -58,4 +58,9 @@ return [
 
     // Set to a non-empty value to protect POST /oauth/register (RFC 7591 DCR).
     'registration_access_token' => null,
+
+    // Canonical issuer URL for public deployment (e.g. 'https://mcp.yourdomain.com').
+    // When set, this takes precedence over the Host header to prevent Host-header poisoning.
+    // Leave null to automatically detect from $_SERVER during local development.
+    'issuer' => null,
 ];

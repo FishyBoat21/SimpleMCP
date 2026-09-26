@@ -57,10 +57,15 @@ final class UserStore {
      *        when onboarding an existing row, or null for brand-new public onboarding.
      * @param string $username the username a brand-new user chose; ignored when
      *        `$existingUsername` is set (a pending user keeps their provisioned name).
+     * @param string|null $email the user's email address (required for 2FA).
      * @return UserContext|null null when the username is taken or invalid.
      */
-    public function onboardUser(?string $existingUsername, string $username, string $password, string $name = ''): ?UserContext {
+    public function onboardUser(?string $existingUsername, string $username, string $password, string $name = '', ?string $email = null): ?UserContext {
         if (!$this->validateNewPassword($password)) {
+            return null;
+        }
+
+        if ($email !== null && $email !== '' && !filter_var($email, FILTER_VALIDATE_EMAIL)) {
             return null;
         }
 
@@ -71,14 +76,16 @@ final class UserStore {
             }
             // A pending user keeps their provisioned username; it is not editable.
             $username = (string) $row['username'];
+            $resolvedEmail = ($email !== null && $email !== '') ? trim($email) : (string) ($row['email'] ?? '');
             // Grant the `user` role when none was provisioned, so the account can
             // use the role-gated memory tools once it is active.
             $this->db->pdo()->prepare(
-                "UPDATE users SET name = :name, password_hash = :hash,
+                "UPDATE users SET name = :name, email = :email, password_hash = :hash,
                     roles = CASE WHEN roles = '[]' THEN '[\"user\"]' ELSE roles END,
                     status = :status, updated_at = :updated_at WHERE username = :username"
             )->execute([
                 ':name' => $name !== '' ? $name : (string) $row['name'],
+                ':email' => $resolvedEmail !== '' ? $resolvedEmail : null,
                 ':hash' => $this->hashPassword($password),
                 ':status' => 'active',
                 ':updated_at' => time(),
@@ -96,11 +103,12 @@ final class UserStore {
             return null;
         }
         $this->db->pdo()->prepare(
-            'INSERT INTO users (username, name, password_hash, roles, permissions, status, created_at, updated_at)
-             VALUES (:username, :name, :hash, :roles, :permissions, :status, :created_at, :updated_at)'
+            'INSERT INTO users (username, name, email, password_hash, roles, permissions, status, created_at, updated_at)
+             VALUES (:username, :name, :email, :hash, :roles, :permissions, :status, :created_at, :updated_at)'
         )->execute([
             ':username' => $username,
             ':name' => $name,
+            ':email' => ($email !== null && $email !== '') ? trim($email) : null,
             ':hash' => $this->hashPassword($password),
             // New accounts are granted the `user` role so they can use the
             // role-gated memory tools after logging in.
@@ -111,6 +119,33 @@ final class UserStore {
             ':updated_at' => time(),
         ]);
         return $this->toUserContext($this->getByUsername($username) ?? []);
+    }
+
+    public function updateEmail(string $username, string $email): bool {
+        $email = trim($email);
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            return false;
+        }
+        $stmt = $this->db->pdo()->prepare('UPDATE users SET email = :email, updated_at = :updated_at WHERE username = :username');
+        $stmt->execute([
+            ':email' => $email,
+            ':updated_at' => time(),
+            ':username' => $username,
+        ]);
+        return $stmt->rowCount() > 0;
+    }
+
+    public function getEmail(string $username): ?string {
+        $row = $this->getByUsername($username);
+        if ($row === null) {
+            return null;
+        }
+        $email = trim((string) ($row['email'] ?? ''));
+        return $email !== '' ? $email : null;
+    }
+
+    public function hasEmail(string $username): bool {
+        return $this->getEmail($username) !== null;
     }
 
     public function changePassword(string $username, string $oldPassword, string $newPassword): bool {
@@ -137,6 +172,7 @@ final class UserStore {
             name: (string) ($row['name'] ?? ''),
             roles: $this->decodeList($row['roles'] ?? '[]'),
             permissions: $this->decodeList($row['permissions'] ?? '[]'),
+            attributes: ['email' => (string) ($row['email'] ?? '')],
         );
     }
 

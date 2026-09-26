@@ -2,3 +2,6 @@
 .mcp.json
 CLAUDE.md
 /data/*
+/config/mail.php
+/config/*.local.php
+/.agents/
