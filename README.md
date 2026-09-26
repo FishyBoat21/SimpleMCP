@@ -299,4 +299,4 @@ data/                         runtime-only, gitignored (app.sqlite, requests.log
 
 ## License
 
-Not specified.
+This project is licensed under the [MIT License](LICENSE).

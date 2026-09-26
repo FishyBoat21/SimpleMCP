@@ -1,6 +1,7 @@
 {
     "name": "local/mcp-server",
     "description": "Simple PHP MCP Server",
+    "license": "MIT",
     "type": "project",
     "autoload": {
         "psr-4": {
