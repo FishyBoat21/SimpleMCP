@@ -25,8 +25,10 @@ printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n{"jsonrpc":"
   for it. In stdio mode every request runs as a trusted `local` user with full access.
 - **Self-hosted OAuth 2.1** — interactive login page, token endpoint, RFC 7591 dynamic
   client registration, RFC 8414 / RFC 9728 discovery. Tokens are sha256-hashed at rest.
-- **User management page** (`/account`) — login, public onboarding, change password, logout.
-- **SQLite storage** — users, OAuth clients, and tokens in `data/app.sqlite` (gitignored),
+- **WebAuthn Passkeys** — passwordless biometric and hardware security key logins (FIDO2 / WebAuthn).
+- **Email Two-Factor Authentication (2FA)** — 6-digit OTP verification for new devices, with trusted device cookies (90-day persistence) and zero external dependencies. Copy [config/mail.example.php](config/mail.example.php) to `config/mail.php` to configure SMTP or log driver.
+- **User management page** (`/account`) — login, public onboarding, change password, passkey registration, email management, trusted devices, and logout.
+- **SQLite storage** — users, OAuth clients, passkeys, trusted devices, and tokens in `data/app.sqlite` (gitignored),
   seeded from [config/users.php](config/users.php) on first run.
 - **No dependencies** — `composer.json` declares only `php >= 8.4`.
 

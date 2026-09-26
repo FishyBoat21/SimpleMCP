@@ -28,6 +28,7 @@ final class OAuthServer {
         private readonly ClientStore $clients,
         private readonly array $config,
         private readonly ?PasskeyStore $passkeys = null,
+        private readonly ?TwoFactorService $twoFactor = null,
     ) {}
 
     /** Resolve a Bearer access token to a user, or null when absent/invalid/expired. */
@@ -64,7 +65,7 @@ final class OAuthServer {
 
         return match ($path) {
             '/oauth/authorize' => $method === 'GET' || $method === 'POST'
-                ? $this->handleAuthorize($method, $get, $post)
+                ? $this->handleAuthorize($method, $server, $get, $post)
                 : $this->methodNotAllowed(),
             '/oauth/passkey/options' => $method === 'POST'
                 ? $this->handlePasskeyOptions($server, $post)
@@ -90,7 +91,7 @@ final class OAuthServer {
 
     // ---- authorize ----------------------------------------------------------
 
-    private function handleAuthorize(string $method, array $get, array $post): array {
+    private function handleAuthorize(string $method, array $server, array $get, array $post): array {
         $params = $method === 'POST' ? $post : $get;
 
         $clientId = (string) ($params['client_id'] ?? '');
@@ -116,6 +117,73 @@ final class OAuthServer {
             return $this->page(400, 'Invalid request', '<p>Missing or invalid <code>code_challenge</code>.</p>');
         }
 
+        // 2FA Verification Form Submitted
+        if (($params['verify_2fa'] ?? '') === '1') {
+            $identifier = (string) ($params['username'] ?? '');
+            $otp = trim((string) ($params['otp'] ?? ''));
+            $trust = !empty($params['trust_device']);
+            $user = $this->users->getByUsername($identifier);
+
+            if ($this->twoFactor !== null) {
+                $res = $this->twoFactor->verifyOtp($identifier, $otp);
+                if (!$res['success']) {
+                    return $this->twoFactorPage($user ?? ['username' => $identifier], $clientId, $redirectUri, $challenge, $challengeMethod, $state, $scope, $res['error']);
+                }
+                if ($trust) {
+                    $ua = $server['HTTP_USER_AGENT'] ?? '';
+                    $ip = $server['REMOTE_ADDR'] ?? '';
+                    $token = $this->twoFactor->trustDevice($identifier, $ua, $ip);
+                    $this->twoFactor->setDeviceCookie($token, $this->isHttps($server));
+                }
+            }
+
+            return $this->issueCodeAndRedirect($user ?? ['username' => $identifier], $clientId, $redirectUri, $challenge, $challengeMethod, $state);
+        }
+
+        // 2FA Resend Requested
+        if (($params['resend_2fa'] ?? '') === '1') {
+            $identifier = (string) ($params['username'] ?? '');
+            $user = $this->users->getByUsername($identifier);
+            $email = (string) ($user['email'] ?? '');
+            if ($this->twoFactor !== null && $email !== '') {
+                $ua = $server['HTTP_USER_AGENT'] ?? '';
+                $ip = $server['REMOTE_ADDR'] ?? '';
+                $this->twoFactor->sendOtp($identifier, $email, $ua, $ip);
+            }
+            return $this->twoFactorPage($user ?? ['username' => $identifier], $clientId, $redirectUri, $challenge, $challengeMethod, $state, $scope, null, 'A new verification code has been sent.');
+        }
+
+        // 2FA Set Missing Email
+        if (($params['set_email_2fa'] ?? '') === '1') {
+            $identifier = (string) ($params['username'] ?? '');
+            $email = trim((string) ($params['email'] ?? ''));
+            $user = $this->users->getByUsername($identifier);
+            if ($email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                return $this->setEmailPage($user ?? ['username' => $identifier], $clientId, $redirectUri, $challenge, $challengeMethod, $state, $scope, 'Please enter a valid email address.');
+            }
+            $this->users->updateEmail($identifier, $email);
+            $user = $this->users->getByUsername($identifier);
+            if ($this->twoFactor !== null) {
+                $ua = $server['HTTP_USER_AGENT'] ?? '';
+                $ip = $server['REMOTE_ADDR'] ?? '';
+                $this->twoFactor->sendOtp($identifier, $email, $ua, $ip);
+            }
+            return $this->twoFactorPage($user ?? ['username' => $identifier], $clientId, $redirectUri, $challenge, $challengeMethod, $state, $scope);
+        }
+
+        // Direct GET 2FA step (e.g. redirected from passkey)
+        if ($method === 'GET' && ($get['step'] ?? '') === '2fa') {
+            $identifier = (string) ($get['username'] ?? '');
+            $user = $this->users->getByUsername($identifier);
+            if ($user !== null) {
+                $email = (string) ($user['email'] ?? '');
+                if ($email === '') {
+                    return $this->setEmailPage($user, $clientId, $redirectUri, $challenge, $challengeMethod, $state, $scope);
+                }
+                return $this->twoFactorPage($user, $clientId, $redirectUri, $challenge, $challengeMethod, $state, $scope);
+            }
+        }
+
         if ($method === 'GET') {
             return $this->usernamePage(null, '', $clientId, $redirectUri, $challenge, $challengeMethod, $state, $scope);
         }
@@ -130,7 +198,7 @@ final class OAuthServer {
 
         // Login form submitted with an onboarding payload.
         if (($params['onboard'] ?? '') === '1') {
-            return $this->completeOnboarding($params, $clientId, $redirectUri, $challenge, $challengeMethod, $state, $scope);
+            return $this->completeOnboarding($server, $params, $clientId, $redirectUri, $challenge, $challengeMethod, $state, $scope);
         }
 
         // Step 1 of the two-step login: only a username was submitted. Route to
@@ -156,17 +224,33 @@ final class OAuthServer {
             return $this->passwordPage('Incorrect password.', $identifier, $clientId, $redirectUri, $challenge, $challengeMethod, $state, $scope);
         }
 
+        $email = (string) ($user['email'] ?? '');
+        if ($email === '') {
+            return $this->setEmailPage($user, $clientId, $redirectUri, $challenge, $challengeMethod, $state, $scope);
+        }
+
+        $rawCookie = $_COOKIE[TwoFactorService::DEVICE_COOKIE_NAME] ?? null;
+        if ($this->twoFactor !== null && !$this->twoFactor->isTrustedDevice((string) $user['username'], $rawCookie)) {
+            $ua = $server['HTTP_USER_AGENT'] ?? '';
+            $ip = $server['REMOTE_ADDR'] ?? '';
+            $this->twoFactor->sendOtp((string) $user['username'], $email, $ua, $ip);
+            return $this->twoFactorPage($user, $clientId, $redirectUri, $challenge, $challengeMethod, $state, $scope);
+        }
+
         return $this->issueCodeAndRedirect($user, $clientId, $redirectUri, $challenge, $challengeMethod, $state);
     }
 
-    private function completeOnboarding(array $params, string $clientId, string $redirectUri, string $challenge, string $challengeMethod, string $state, string $scope): array {
+    private function completeOnboarding(array $server, array $params, string $clientId, string $redirectUri, string $challenge, string $challengeMethod, string $state, string $scope): array {
         $existingUsername = (string) ($params['existing_username'] ?? '');
         $newUsername = (string) ($params['new_username'] ?? '');
+        $email = trim((string) ($params['email'] ?? ''));
         $newPassword = (string) ($params['new_password'] ?? '');
         $confirm = (string) ($params['confirm_password'] ?? '');
         $error = '';
 
-        if ($newPassword !== $confirm) {
+        if ($email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            $error = 'A valid email address is required for two-factor security.';
+        } elseif ($newPassword !== $confirm) {
             $error = 'Passwords do not match.';
         } elseif ($newPassword === '' || strlen($newPassword) < 8) {
             $error = 'Password must be at least 8 characters.';
@@ -174,10 +258,14 @@ final class OAuthServer {
             // Only brand-new users pick a username; pending users keep theirs.
             $error = 'Username is required.';
         } else {
-            $user = $this->users->onboardUser($existingUsername !== '' ? $existingUsername : null, $newUsername, $newPassword);
+            $user = $this->users->onboardUser($existingUsername !== '' ? $existingUsername : null, $newUsername, $newPassword, '', $email);
             if ($user === null) {
                 $error = $existingUsername !== '' ? 'Account is not pending.' : 'Username is already taken.';
             } else {
+                if ($this->twoFactor !== null) {
+                    $token = $this->twoFactor->trustDevice($user->username, $server['HTTP_USER_AGENT'] ?? '', $server['REMOTE_ADDR'] ?? '');
+                    $this->twoFactor->setDeviceCookie($token, $this->isHttps($server));
+                }
                 $row = $this->users->getByUsername($user->username) ?? [];
                 return $this->issueCodeAndRedirect($row, $clientId, $redirectUri, $challenge, $challengeMethod, $state);
             }
@@ -185,7 +273,7 @@ final class OAuthServer {
 
         // Re-render. Pending users keep their provisioned username.
         $row = $this->users->getByUsername($existingUsername);
-        return $this->onboardingPage($row !== null ? $row : ['username' => $existingUsername !== '' ? $existingUsername : $newUsername], $clientId, $redirectUri, $challenge, $challengeMethod, $state, $scope, $error);
+        return $this->onboardingPage($row !== null ? $row : ['username' => $existingUsername !== '' ? $existingUsername : $newUsername, 'email' => $email], $clientId, $redirectUri, $challenge, $challengeMethod, $state, $scope, $error);
     }
 
     /**
@@ -292,10 +380,34 @@ final class OAuthServer {
         $challenge = (string) ($post['code_challenge'] ?? '');
         $challengeMethod = (string) ($post['code_challenge_method'] ?? 'S256');
         $state = (string) ($post['state'] ?? '');
+        $scope = (string) ($post['scope'] ?? '');
 
         $client = $this->clients->find($clientId);
         if ($client === null || !in_array($redirectUri, $client['redirect_uris'], true) || !ClientStore::isValidRedirectUri($redirectUri)) {
             return $this->json(400, ['error' => 'Invalid client_id or redirect_uri.']);
+        }
+
+        $username = (string) $user['username'];
+        $email = (string) ($user['email'] ?? '');
+
+        $rawCookie = $_COOKIE[TwoFactorService::DEVICE_COOKIE_NAME] ?? null;
+        if ($this->twoFactor !== null && !$this->twoFactor->isTrustedDevice($username, $rawCookie)) {
+            $ua = $server['HTTP_USER_AGENT'] ?? '';
+            $ip = $server['REMOTE_ADDR'] ?? '';
+            if ($email !== '') {
+                $this->twoFactor->sendOtp($username, $email, $ua, $ip);
+            }
+            $twoFactorUrl = '/oauth/authorize?' . http_build_query([
+                'step' => '2fa',
+                'username' => $username,
+                'client_id' => $clientId,
+                'redirect_uri' => $redirectUri,
+                'code_challenge' => $challenge,
+                'code_challenge_method' => $challengeMethod,
+                'state' => $state,
+                'scope' => $scope,
+            ]);
+            return $this->json(200, ['redirect_url' => $twoFactorUrl]);
         }
 
         $code = $this->tokens->createAuthCode(
@@ -793,6 +905,7 @@ final class OAuthServer {
      */
     private function onboardingPage(array $row, string $clientId, string $redirectUri, string $challenge, string $challengeMethod, string $state, string $scope, string $error = ''): array {
         $username = (string) ($row['username'] ?? '');
+        $email = (string) ($row['email'] ?? '');
         // Pending users keep their provisioned username (read-only display).
         $usernameField = $username !== ''
             ? '<p class="hint">Username <strong>' . htmlspecialchars($username, ENT_QUOTES) . '</strong> — cannot be changed.</p>'
@@ -804,12 +917,92 @@ final class OAuthServer {
             ' . $this->hidden('onboard', '1') . $this->hidden('existing_username', $username)
             . $this->oauthFields($clientId, $redirectUri, $challenge, $challengeMethod, $state, $scope) . '
             ' . $usernameField . '
+            <label>Email address <input type="email" name="email" value="' . htmlspecialchars($email, ENT_QUOTES) . '" required placeholder="you@example.com"></label>
+            <p class="hint" style="margin-top:-0.5rem;margin-bottom:0.8rem;">Required for two-factor verification on new devices.</p>
             <label>Password <input type="password" name="new_password" minlength="8" required></label>
             <label>Confirm password <input type="password" name="confirm_password" minlength="8" required></label>
             <button type="submit">Set up my account</button>
         </form>' .
         $this->anonymousForm($clientId, $redirectUri, $challenge, $challengeMethod, $state, $scope);
         return $this->page(200, 'Set up your account', $body);
+    }
+
+    private function twoFactorPage(array $user, string $clientId, string $redirectUri, string $challenge, string $challengeMethod, string $state, string $scope, ?string $error = null, ?string $msg = null): array {
+        $username = (string) ($user['username'] ?? '');
+        $email = (string) ($user['email'] ?? '');
+        $maskedEmail = $this->twoFactor !== null ? $this->twoFactor->maskEmail($email) : $email;
+
+        $msgHtml = $msg !== null && $msg !== '' ? '<div class="ok" style="color:#15803d;background:#f0fdf4;border:1px solid #bbf7d0;padding:.5rem .75rem;border-radius:6px;margin-bottom:1rem;font-size:.9rem;">' . htmlspecialchars($msg) . '</div>' : '';
+
+        $body = $msgHtml . $this->errorHtml($error) . '
+        <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:1rem;margin-bottom:1.2rem;">
+            <p style="margin:0 0 0.5rem;font-weight:600;color:#1e40af;">🛡️ New Device Detected</p>
+            <p style="margin:0;font-size:0.9rem;color:#1e3a8a;">Logging in as <strong>' . htmlspecialchars($username) . '</strong>. A 6-digit verification code has been sent to <strong>' . htmlspecialchars($maskedEmail) . '</strong>.</p>
+        </div>
+        <form method="post" action="/oauth/authorize">
+            ' . $this->oauthFields($clientId, $redirectUri, $challenge, $challengeMethod, $state, $scope)
+            . $this->hidden('verify_2fa', '1')
+            . $this->hidden('username', $username) . '
+            <label>6-Digit Verification Code
+                <input type="text" name="otp" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autofocus required placeholder="000000" style="letter-spacing:6px;font-size:1.5rem;text-align:center;font-weight:bold;">
+            </label>
+            <label style="display:flex;align-items:center;gap:8px;font-weight:normal;margin:1rem 0;font-size:0.9rem;cursor:pointer;">
+                <input type="checkbox" name="trust_device" value="1" checked style="width:auto;margin:0;"> Trust this device for 90 days
+            </label>
+            <button type="submit">Verify & Authorize</button>
+        </form>
+        <div style="margin-top:1.2rem;display:flex;justify-content:space-between;align-items:center;">
+            <form method="post" action="/oauth/authorize" style="margin:0;">
+                ' . $this->oauthFields($clientId, $redirectUri, $challenge, $challengeMethod, $state, $scope)
+                . $this->hidden('resend_2fa', '1')
+                . $this->hidden('username', $username) . '
+                <button type="submit" style="background:#475569;width:auto;padding:0.4rem 0.8rem;font-size:0.85rem;">Resend Code</button>
+            </form>
+            <a href="/oauth/authorize?' . htmlspecialchars(http_build_query([
+                'client_id' => $clientId,
+                'redirect_uri' => $redirectUri,
+                'code_challenge' => $challenge,
+                'code_challenge_method' => $challengeMethod,
+                'state' => $state,
+                'scope' => $scope,
+            ]), ENT_QUOTES) . '" style="font-size:0.9rem;">Cancel</a>
+        </div>';
+
+        return $this->page(200, 'Two-Factor Verification', $body);
+    }
+
+    private function setEmailPage(array $user, string $clientId, string $redirectUri, string $challenge, string $challengeMethod, string $state, string $scope, ?string $error = null): array {
+        $username = (string) ($user['username'] ?? '');
+
+        $body = $this->errorHtml($error) . '
+        <div style="background:#fef3c7;border:1px solid #fde68a;border-radius:8px;padding:1rem;margin-bottom:1.2rem;">
+            <p style="margin:0 0 0.4rem;font-weight:600;color:#92400e;">✉️ Email Address Required</p>
+            <p style="margin:0;font-size:0.9rem;color:#78350f;">Every user must have an email set for two-factor authentication on new devices. Please enter your email address to continue.</p>
+        </div>
+        <form method="post" action="/oauth/authorize">
+            ' . $this->oauthFields($clientId, $redirectUri, $challenge, $challengeMethod, $state, $scope)
+            . $this->hidden('set_email_2fa', '1')
+            . $this->hidden('username', $username) . '
+            <label>Email address
+                <input type="email" name="email" required autofocus autocomplete="email" placeholder="you@example.com">
+            </label>
+            <button type="submit">Save Email & Send Code</button>
+        </form>
+        <p class="hint" style="margin-top:1.2rem;"><a href="/oauth/authorize?' . htmlspecialchars(http_build_query([
+            'client_id' => $clientId,
+            'redirect_uri' => $redirectUri,
+            'code_challenge' => $challenge,
+            'code_challenge_method' => $challengeMethod,
+            'state' => $state,
+            'scope' => $scope,
+        ]), ENT_QUOTES) . '">Cancel</a></p>';
+
+        return $this->page(200, 'Set Email Address', $body);
+    }
+
+    private function isHttps(array $server): bool {
+        return (!empty($server['HTTPS']) && $server['HTTPS'] !== 'off')
+            || (isset($server['HTTP_X_FORWARDED_PROTO']) && $server['HTTP_X_FORWARDED_PROTO'] === 'https');
     }
 
     /** @return array{status: int, headers: array<string, string>, body: string} */

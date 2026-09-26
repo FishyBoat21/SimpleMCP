@@ -15,6 +15,7 @@ final class AccountController {
         private readonly UserStore $users,
         private readonly ?PasskeyStore $passkeys = null,
         private readonly ?string $issuer = null,
+        private readonly ?TwoFactorService $twoFactor = null,
     ) {}
 
     /**
@@ -25,7 +26,12 @@ final class AccountController {
     public function handle(string $method, string $path, array $get, array $post): array {
         return match ($path) {
             '/account/login' => $method === 'POST' ? $this->login($post) : $this->redirect('/account'),
-            '/account/onboard' => $method === 'GET' ? $this->onboardPage('', '', '') : $this->onboard($post),
+            '/account/2fa/verify' => $method === 'POST' ? $this->twoFactorVerify($post) : $this->twoFactorVerifyPage(),
+            '/account/2fa/resend' => $method === 'POST' ? $this->twoFactorResend($post) : $this->redirect('/account/2fa/verify'),
+            '/account/2fa/set-email' => $method === 'POST' ? $this->twoFactorSetEmail($post) : $this->twoFactorSetEmailPage(),
+            '/account/update-email' => $method === 'POST' ? $this->updateEmail($post) : $this->redirect('/account'),
+            '/account/device/revoke' => $method === 'POST' ? $this->deviceRevoke($post) : $this->redirect('/account'),
+            '/account/onboard' => $method === 'GET' ? $this->onboardPage('', '', '', '') : $this->onboard($post),
             '/account/change-password' => $method === 'POST' ? $this->changePassword($post) : $this->redirect('/account'),
             '/account/logout' => $method === 'POST' ? $this->logout($post) : $this->redirect('/account'),
             '/account/passkey/register/options' => $method === 'POST' ? $this->passkeyRegisterOptions() : $this->methodNotAllowed(),
@@ -55,7 +61,7 @@ final class AccountController {
                 return $this->usernamePage('No account found for this username.');
             }
             if (($row['password_hash'] ?? null) === null) {
-                return $this->onboardPage('Set up your account to finish logging in.', (string) $row['username'], (string) $row['username']);
+                return $this->onboardPage('Set up your account to finish logging in.', (string) $row['username'], (string) $row['username'], (string) ($row['email'] ?? ''));
             }
             return $this->passwordPage(null, $identifier);
         }
@@ -66,8 +72,27 @@ final class AccountController {
             return $this->passwordPage('Incorrect password.', $identifier);
         }
 
-        $_SESSION['username'] = (string) $user['username'];
-        session_regenerate_id(true);
+        $username = (string) $user['username'];
+        $email = (string) ($user['email'] ?? '');
+
+        // Every user must have an email set for 2FA
+        if ($email === '') {
+            $_SESSION['2fa_pending'] = ['username' => $username, 'reason' => 'missing_email'];
+            return $this->redirect('/account/2fa/set-email');
+        }
+
+        // Check if device is trusted or new
+        $rawCookie = $_COOKIE[TwoFactorService::DEVICE_COOKIE_NAME] ?? null;
+        if ($this->twoFactor !== null && !$this->twoFactor->isTrustedDevice($username, $rawCookie)) {
+            $ua = $_SERVER['HTTP_USER_AGENT'] ?? '';
+            $ip = $_SERVER['REMOTE_ADDR'] ?? '';
+            $this->twoFactor->sendOtp($username, $email, $ua, $ip);
+            $_SESSION['2fa_pending'] = ['username' => $username, 'email' => $email, 'type' => 'account_login'];
+            return $this->redirect('/account/2fa/verify');
+        }
+
+        $_SESSION['username'] = $username;
+        $this->regenerateSession();
         return $this->redirect('/account');
     }
 
@@ -78,23 +103,30 @@ final class AccountController {
 
         $existingUsername = (string) ($post['existing_username'] ?? '');
         $username = trim((string) ($post['new_username'] ?? ''));
+        $email = trim((string) ($post['email'] ?? ''));
         $password = (string) ($post['new_password'] ?? '');
         $confirm = (string) ($post['confirm_password'] ?? '');
         $error = '';
 
-        if ($password === '' || $confirm === '' || $password !== $confirm) {
+        if ($email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            $error = 'A valid email address is required for two-factor security.';
+        } elseif ($password === '' || $confirm === '' || $password !== $confirm) {
             $error = 'Passwords do not match.';
         } elseif (strlen($password) < 8) {
             $error = 'Password must be at least 8 characters.';
         } elseif ($existingUsername === '' && $username === '') {
             $error = 'Username is required.';
         } else {
-            $user = $this->users->onboardUser($existingUsername !== '' ? $existingUsername : null, $username, $password);
+            $user = $this->users->onboardUser($existingUsername !== '' ? $existingUsername : null, $username, $password, '', $email);
             if ($user === null) {
                 $error = $existingUsername !== '' ? 'Account is not pending.' : 'Username is already taken.';
             } else {
+                if ($this->twoFactor !== null) {
+                    $token = $this->twoFactor->trustDevice($user->username, $_SERVER['HTTP_USER_AGENT'] ?? '', $_SERVER['REMOTE_ADDR'] ?? '');
+                    $this->twoFactor->setDeviceCookie($token, $this->isHttps());
+                }
                 $_SESSION['username'] = $user->username;
-                session_regenerate_id(true);
+                $this->regenerateSession();
                 return $this->redirect('/account');
             }
         }
@@ -104,7 +136,7 @@ final class AccountController {
             $row = $this->users->getByUsername($existingUsername);
             $displayUsername = $row !== null ? (string) $row['username'] : $username;
         }
-        return $this->onboardPage($error, $existingUsername, $displayUsername);
+        return $this->onboardPage($error, $existingUsername, $displayUsername, $email);
     }
 
     private function changePassword(array $post): array {
@@ -299,8 +331,25 @@ final class AccountController {
             return $this->json(400, ['error' => 'User account not found.']);
         }
 
-        $_SESSION['username'] = (string) $user['username'];
-        session_regenerate_id(true);
+        $username = (string) $user['username'];
+        $email = (string) ($user['email'] ?? '');
+
+        if ($email === '') {
+            $_SESSION['2fa_pending'] = ['username' => $username, 'reason' => 'missing_email'];
+            return $this->json(200, ['success' => true, 'redirect_url' => '/account/2fa/set-email']);
+        }
+
+        $rawCookie = $_COOKIE[TwoFactorService::DEVICE_COOKIE_NAME] ?? null;
+        if ($this->twoFactor !== null && !$this->twoFactor->isTrustedDevice($username, $rawCookie)) {
+            $ua = $_SERVER['HTTP_USER_AGENT'] ?? '';
+            $ip = $_SERVER['REMOTE_ADDR'] ?? '';
+            $this->twoFactor->sendOtp($username, $email, $ua, $ip);
+            $_SESSION['2fa_pending'] = ['username' => $username, 'email' => $email, 'type' => 'account_login'];
+            return $this->json(200, ['success' => true, 'requires_2fa' => true, 'redirect_url' => '/account/2fa/verify']);
+        }
+
+        $_SESSION['username'] = $username;
+        $this->regenerateSession();
 
         return $this->json(200, ['success' => true, 'redirect_url' => '/account']);
     }
@@ -461,14 +510,58 @@ final class AccountController {
         })();
         </script>';
 
+        $emailSection = '
+        <h2>Email Address</h2>
+        <p class="hint">Two-factor authentication codes and account security alerts are sent to this address.</p>
+        <form method="post" action="/account/update-email">
+            <input type="hidden" name="csrf" value="' . $this->csrf() . '">
+            <label>Email address <input type="email" name="email" value="' . htmlspecialchars((string) ($row['email'] ?? ''), ENT_QUOTES) . '" required autocomplete="email" placeholder="you@example.com"></label>
+            <button type="submit" style="background:#0f766e;">Update Email</button>
+        </form>';
+
+        $trustedDevices = $this->twoFactor !== null ? $this->twoFactor->getTrustedDevices($user->username) : [];
+        $devicesHtml = '';
+        if ($trustedDevices === []) {
+            $devicesHtml = '<p class="hint">No trusted devices registered. Unrecognized devices will prompt for email 2FA verification.</p>';
+        } else {
+            $devicesHtml = '<table class="passkeys"><thead><tr><th>Device</th><th>Last Active</th><th>IP</th><th></th></tr></thead><tbody>';
+            foreach ($trustedDevices as $dev) {
+                $lastUsed = $dev['last_used_at'] ? date('Y-m-d H:i', (int) $dev['last_used_at']) : 'Never';
+                $ip = htmlspecialchars((string) ($dev['ip_address'] ?? ''));
+                $devicesHtml .= '<tr>
+                    <td>
+                        <strong>' . htmlspecialchars((string) $dev['name']) . '</strong>
+                        <div style="font-size:0.75rem;color:#64748b;">' . htmlspecialchars(substr((string) ($dev['user_agent'] ?? ''), 0, 45)) . '</div>
+                    </td>
+                    <td>' . htmlspecialchars($lastUsed) . '</td>
+                    <td>' . $ip . '</td>
+                    <td>
+                        <form method="post" action="/account/device/revoke" style="margin:0;">
+                            <input type="hidden" name="csrf" value="' . $this->csrf() . '">
+                            <input type="hidden" name="id" value="' . htmlspecialchars((string) $dev['id'], ENT_QUOTES) . '">
+                            <button type="submit" class="danger" onclick="return confirm(\'Revoke this trusted device?\');">Revoke</button>
+                        </form>
+                    </td>
+                </tr>';
+            }
+            $devicesHtml .= '</tbody></table>';
+        }
+        $deviceSection = '
+        <h2>Trusted Devices (2FA)</h2>
+        <p class="hint">Devices listed here bypass email 2FA when logging in.</p>
+        ' . $devicesHtml;
+
         $body = $msgHtml . '
         <h2>Your account</h2>
         <dl class="user">
             <dt>Username</dt><dd>' . htmlspecialchars($user->username) . '</dd>
             <dt>Name</dt><dd>' . htmlspecialchars($user->name) . '</dd>
+            <dt>Email</dt><dd>' . htmlspecialchars((string) ($row['email'] ?? 'Not set')) . '</dd>
             <dt>Roles</dt><dd>' . htmlspecialchars(implode(', ', $user->roles)) . '</dd>
             <dt>Permissions</dt><dd>' . htmlspecialchars(implode(', ', $user->permissions)) . '</dd>
         </dl>
+        ' . $emailSection . '
+        ' . $deviceSection . '
         ' . $passkeySection . '
         <h2>Change password</h2>
         <form method="post" action="/account/change-password">
@@ -642,7 +735,7 @@ final class AccountController {
         return $this->page(200, 'Log in', $body);
     }
 
-    private function onboardPage(string $error, string $existingUsername, string $username): array {
+    private function onboardPage(string $error, string $existingUsername, string $username, string $email = ''): array {
         $usernameField = $existingUsername !== ''
             ? '<p class="hint">Username <strong>' . htmlspecialchars($existingUsername, ENT_QUOTES) . '</strong> — cannot be changed.</p>'
             : '<label>Username <input type="text" name="new_username" value="' . htmlspecialchars($username, ENT_QUOTES) . '" required autofocus autocomplete="username"></label>';
@@ -651,6 +744,8 @@ final class AccountController {
             <input type="hidden" name="csrf" value="' . $this->csrf() . '">
             <input type="hidden" name="existing_username" value="' . htmlspecialchars($existingUsername, ENT_QUOTES) . '">
             ' . $usernameField . '
+            <label>Email address <input type="email" name="email" value="' . htmlspecialchars($email, ENT_QUOTES) . '" required autocomplete="email" placeholder="you@example.com"></label>
+            <p class="hint" style="margin-top:-0.5rem;margin-bottom:0.8rem;">Required for two-factor verification on new devices.</p>
             <label>Password <input type="password" name="new_password" minlength="8" required autocomplete="new-password"></label>
             <label>Confirm password <input type="password" name="confirm_password" minlength="8" required autocomplete="new-password"></label>
             <button type="submit">Set up my account</button>
@@ -659,15 +754,216 @@ final class AccountController {
         return $this->page(200, 'Set up your account', $body);
     }
 
+    // ---- Two-Factor Authentication (2FA) Handlers ---------------------------
+
+    private function twoFactorVerifyPage(?string $error = null): array {
+        $pending = $_SESSION['2fa_pending'] ?? null;
+        if (!is_array($pending) || empty($pending['username'])) {
+            return $this->redirect('/account');
+        }
+
+        $username = (string) $pending['username'];
+        $user = $this->users->getByUsername($username);
+        $email = (string) ($user['email'] ?? $pending['email'] ?? '');
+        $maskedEmail = $this->twoFactor !== null ? $this->twoFactor->maskEmail($email) : $email;
+
+        $msg = (string) ($_GET['msg'] ?? '');
+        $msgHtml = $msg !== '' ? '<div class="ok">' . htmlspecialchars($msg) . '</div>' : '';
+
+        $body = $msgHtml . $this->errorHtml($error) . '
+        <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:1rem;margin-bottom:1.2rem;">
+            <p style="margin:0 0 0.5rem;font-weight:600;color:#1e40af;">🛡️ New Device Detected</p>
+            <p style="margin:0;font-size:0.9rem;color:#1e3a8a;">A 6-digit verification code has been sent to <strong>' . htmlspecialchars($maskedEmail) . '</strong>.</p>
+        </div>
+        <form method="post" action="/account/2fa/verify">
+            <input type="hidden" name="csrf" value="' . $this->csrf() . '">
+            <label>6-Digit Verification Code
+                <input type="text" name="otp" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autofocus required placeholder="000000" style="letter-spacing:6px;font-size:1.5rem;text-align:center;font-weight:bold;">
+            </label>
+            <label style="display:flex;align-items:center;gap:8px;font-weight:normal;margin:1rem 0;font-size:0.9rem;cursor:pointer;">
+                <input type="checkbox" name="trust_device" value="1" checked style="width:auto;margin:0;"> Trust this device for 90 days (skip 2FA next time)
+            </label>
+            <button type="submit">Verify & Sign In</button>
+        </form>
+        <div style="margin-top:1.2rem;display:flex;justify-content:space-between;align-items:center;">
+            <form method="post" action="/account/2fa/resend" style="margin:0;">
+                <input type="hidden" name="csrf" value="' . $this->csrf() . '">
+                <button type="submit" class="secondary" style="width:auto;padding:0.4rem 0.8rem;font-size:0.85rem;background:#475569;">Resend Code</button>
+            </form>
+            <a href="/account" style="font-size:0.9rem;">Cancel / Different User</a>
+        </div>';
+
+        return $this->page(200, 'Two-Factor Verification', $body);
+    }
+
+    private function twoFactorVerify(array $post): array {
+        if (!$this->csrfOk($post)) {
+            return $this->page(400, 'Bad request', '<p class="error">Invalid form submission.</p>');
+        }
+
+        $pending = $_SESSION['2fa_pending'] ?? null;
+        if (!is_array($pending) || empty($pending['username'])) {
+            return $this->redirect('/account');
+        }
+
+        $username = (string) $pending['username'];
+        $otp = trim((string) ($post['otp'] ?? ''));
+
+        if ($this->twoFactor === null) {
+            $_SESSION['username'] = $username;
+            unset($_SESSION['2fa_pending']);
+            return $this->redirect('/account');
+        }
+
+        $res = $this->twoFactor->verifyOtp($username, $otp);
+        if (!$res['success']) {
+            return $this->twoFactorVerifyPage($res['error']);
+        }
+
+        // Trust device if requested
+        $trustDevice = !empty($post['trust_device']);
+        if ($trustDevice) {
+            $ua = $_SERVER['HTTP_USER_AGENT'] ?? '';
+            $ip = $_SERVER['REMOTE_ADDR'] ?? '';
+            $deviceToken = $this->twoFactor->trustDevice($username, $ua, $ip);
+            $this->twoFactor->setDeviceCookie($deviceToken, $this->isHttps());
+        }
+
+        $_SESSION['username'] = $username;
+        unset($_SESSION['2fa_pending']);
+        $this->regenerateSession();
+
+        return $this->redirect('/account?msg=' . rawurlencode('Verified successfully!'));
+    }
+
+    private function twoFactorResend(array $post): array {
+        if (!$this->csrfOk($post)) {
+            return $this->page(400, 'Bad request', '<p class="error">Invalid form submission.</p>');
+        }
+
+        $pending = $_SESSION['2fa_pending'] ?? null;
+        if (!is_array($pending) || empty($pending['username'])) {
+            return $this->redirect('/account');
+        }
+
+        $username = (string) $pending['username'];
+        $user = $this->users->getByUsername($username);
+        $email = (string) ($user['email'] ?? $pending['email'] ?? '');
+
+        if ($this->twoFactor !== null && $email !== '') {
+            $ua = $_SERVER['HTTP_USER_AGENT'] ?? '';
+            $ip = $_SERVER['REMOTE_ADDR'] ?? '';
+            $this->twoFactor->sendOtp($username, $email, $ua, $ip);
+        }
+
+        return $this->redirect('/account/2fa/verify?msg=' . rawurlencode('A new verification code has been sent.'));
+    }
+
+    private function twoFactorSetEmailPage(?string $error = null): array {
+        $pending = $_SESSION['2fa_pending'] ?? null;
+        if (!is_array($pending) || empty($pending['username'])) {
+            return $this->redirect('/account');
+        }
+
+        $username = (string) $pending['username'];
+        $body = $this->errorHtml($error) . '
+        <div style="background:#fef3c7;border:1px solid #fde68a;border-radius:8px;padding:1rem;margin-bottom:1.2rem;">
+            <p style="margin:0 0 0.4rem;font-weight:600;color:#92400e;">✉️ Email Address Required</p>
+            <p style="margin:0;font-size:0.9rem;color:#78350f;">Every SimpleMCP user must have an email set for two-factor authentication on new devices. Please enter your email address to continue.</p>
+        </div>
+        <form method="post" action="/account/2fa/set-email">
+            <input type="hidden" name="csrf" value="' . $this->csrf() . '">
+            <label>Email address
+                <input type="email" name="email" required autofocus autocomplete="email" placeholder="you@example.com">
+            </label>
+            <button type="submit">Save Email & Send Code</button>
+        </form>
+        <p class="hint" style="margin-top:1.2rem;"><a href="/account">Cancel login</a></p>';
+
+        return $this->page(200, 'Set Email Address', $body);
+    }
+
+    private function twoFactorSetEmail(array $post): array {
+        if (!$this->csrfOk($post)) {
+            return $this->page(400, 'Bad request', '<p class="error">Invalid form submission.</p>');
+        }
+
+        $pending = $_SESSION['2fa_pending'] ?? null;
+        if (!is_array($pending) || empty($pending['username'])) {
+            return $this->redirect('/account');
+        }
+
+        $username = (string) $pending['username'];
+        $email = trim((string) ($post['email'] ?? ''));
+
+        if ($email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            return $this->twoFactorSetEmailPage('Please enter a valid email address.');
+        }
+
+        $ok = $this->users->updateEmail($username, $email);
+        if (!$ok) {
+            return $this->twoFactorSetEmailPage('Failed to update email address. Please try again.');
+        }
+
+        if ($this->twoFactor !== null) {
+            $ua = $_SERVER['HTTP_USER_AGENT'] ?? '';
+            $ip = $_SERVER['REMOTE_ADDR'] ?? '';
+            $this->twoFactor->sendOtp($username, $email, $ua, $ip);
+        }
+
+        $_SESSION['2fa_pending'] = ['username' => $username, 'email' => $email, 'type' => 'account_login'];
+        return $this->redirect('/account/2fa/verify');
+    }
+
+    private function updateEmail(array $post): array {
+        $username = $_SESSION['username'] ?? null;
+        if ($username === null) {
+            return $this->redirect('/account');
+        }
+        if (!$this->csrfOk($post)) {
+            return $this->page(400, 'Bad request', '<p class="error">Invalid form submission.</p>');
+        }
+
+        $email = trim((string) ($post['email'] ?? ''));
+        if ($email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            return $this->redirect('/account?msg=' . rawurlencode('Please enter a valid email address.'));
+        }
+
+        $ok = $this->users->updateEmail((string) $username, $email);
+        return $this->redirect($ok ? '/account?msg=Email+address+updated.' : '/account?msg=' . rawurlencode('Failed to update email address.'));
+    }
+
+    private function deviceRevoke(array $post): array {
+        $username = $_SESSION['username'] ?? null;
+        if ($username === null || $this->twoFactor === null || !$this->csrfOk($post)) {
+            return $this->redirect('/account');
+        }
+
+        $id = (string) ($post['id'] ?? '');
+        if ($id !== '') {
+            $this->twoFactor->revokeDevice($id, (string) $username);
+        }
+        return $this->redirect('/account?msg=' . rawurlencode('Device revoked. It will require 2FA on the next login.'));
+    }
+
     // ---- helpers ------------------------------------------------------------
+
+    private function isHttps(): bool {
+        return (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+            || (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https');
+    }
+
+    private function regenerateSession(): void {
+        if (!headers_sent() && session_status() === PHP_SESSION_ACTIVE) {
+            session_regenerate_id(true);
+        }
+    }
 
     private function origin(): string {
         if (is_string($this->issuer) && $this->issuer !== '') {
             return rtrim($this->issuer, '/');
         }
-        $https = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
-            || (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https');
-        $scheme = $https ? 'https' : 'http';
+        $scheme = $this->isHttps() ? 'https' : 'http';
         $host = $_SERVER['HTTP_X_FORWARDED_HOST'] ?? $_SERVER['HTTP_HOST'] ?? 'localhost';
         return $scheme . '://' . $host;
     }

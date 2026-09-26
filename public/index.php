@@ -15,9 +15,11 @@ use McpServer\Auth\AccountController;
 use McpServer\Auth\ClientStore;
 use McpServer\Auth\Database;
 use McpServer\Auth\DebugLog;
+use McpServer\Auth\EmailService;
 use McpServer\Auth\OAuthServer;
 use McpServer\Auth\PasskeyStore;
 use McpServer\Auth\TokenStore;
+use McpServer\Auth\TwoFactorService;
 use McpServer\Auth\UserStore;
 use McpServer\McpServer;
 use McpServer\UserContext;
@@ -44,15 +46,21 @@ if ($hostName === '127.0.0.1' || $hostName === '::1' || str_starts_with($rawHost
 
 // OAuth + user-management pages share the same SQLite-backed stores.
 $oauthConfig = require dirname(__DIR__) . '/config/oauth.php';
+$mailConfigFile = dirname(__DIR__) . '/config/mail.php';
+$mailConfig = file_exists($mailConfigFile)
+    ? require $mailConfigFile
+    : (file_exists(dirname(__DIR__) . '/config/mail.example.php') ? require dirname(__DIR__) . '/config/mail.example.php' : []);
 $db = new Database(dirname(__DIR__) . '/data/app.sqlite');
 $userStore = new UserStore($db);
 $tokenStore = new TokenStore($db);
 $clientStore = new ClientStore($db, $oauthConfig['clients'] ?? []);
 $passkeyStore = new PasskeyStore($db);
+$emailService = new EmailService($mailConfig);
+$twoFactor = new TwoFactorService($db, $userStore, $emailService);
 $canonicalIssuer = $oauthConfig['issuer'] ?? null;
 
-$oauth = new OAuthServer($userStore, $tokenStore, $clientStore, $oauthConfig, $passkeyStore);
-$account = new AccountController($userStore, $passkeyStore, is_string($canonicalIssuer) ? $canonicalIssuer : null);
+$oauth = new OAuthServer($userStore, $tokenStore, $clientStore, $oauthConfig, $passkeyStore, $twoFactor);
+$account = new AccountController($userStore, $passkeyStore, is_string($canonicalIssuer) ? $canonicalIssuer : null, $twoFactor);
 $db->seedUsersIfEmpty(require dirname(__DIR__) . '/config/users.php');
 
 $isOAuthPath = str_starts_with($path, '/oauth') || in_array($path, [

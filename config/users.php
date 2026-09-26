@@ -18,6 +18,7 @@ return [
     [
         'username' => 'admin',
         'name' => 'Administrator',
+        'email' => 'admin@example.com',
         'password' => '$2y$12$SykCZauQsdZmUCNyuXFzleOa5fsmOKW.94nFh40lnHnCiWzeaNw02', // admin123
         'roles' => ['admin'],
         'permissions' => ['*'],
@@ -26,6 +27,7 @@ return [
     [
         'username' => 'alice',
         'name' => 'Alice',
+        'email' => 'alice@example.com',
         'password' => '$2y$12$Ct7lHRUlKhh5aWnVWcdqnO6VoVHYMEBplHwrX3VKODnXvjkDZe35O', // secret
         'roles' => ['user'],
         'permissions' => [],
@@ -34,6 +36,7 @@ return [
     [
         'username' => 'bob',
         'name' => 'Bob',
+        'email' => 'bob@example.com',
         'password' => null, // not set -> pending onboarding
         'roles' => ['user'],
         'permissions' => [],
