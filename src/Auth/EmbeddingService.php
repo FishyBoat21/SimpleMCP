@@ -54,11 +54,19 @@ class EmbeddingService {
     }
 
     /**
-     * Whether OpenAI embedding is configured and active with an API key.
+     * Whether OpenAI embedding is configured and active.
+     * When using custom/local endpoints (e.g. LM Studio, Ollama), an API key is optional.
      */
     public function isConfigured(): bool {
+        if ($this->getModel() === '') {
+            return false;
+        }
         $key = $this->getApiKey();
-        return $key !== '' && $this->getModel() !== '';
+        if ($key !== '') {
+            return true;
+        }
+        $baseUrl = $this->getBaseUrl();
+        return $baseUrl !== '' && !str_starts_with($baseUrl, 'https://api.openai.com');
     }
 
     public function getApiKey(): string {
@@ -95,14 +103,19 @@ class EmbeddingService {
         if ($url === '') {
             $envUrl = getenv('OPENAI_BASE_URL');
             if (is_string($envUrl) && $envUrl !== '') {
-                return rtrim($envUrl, '/');
+                $url = $envUrl;
+            } elseif (isset($_ENV['OPENAI_BASE_URL']) && is_string($_ENV['OPENAI_BASE_URL'])) {
+                $url = $_ENV['OPENAI_BASE_URL'];
+            } else {
+                return self::DEFAULT_BASE_URL;
             }
-            if (isset($_ENV['OPENAI_BASE_URL']) && is_string($_ENV['OPENAI_BASE_URL'])) {
-                return rtrim($_ENV['OPENAI_BASE_URL'], '/');
-            }
-            return self::DEFAULT_BASE_URL;
         }
-        return rtrim($url, '/');
+        $url = rtrim($url, '/');
+        // Normalize /api/v1 to /v1 (common when configuring LM Studio / local server)
+        if (preg_match('#/api/v1$#i', $url)) {
+            $url = preg_replace('#/api/v1$#i', '/v1', $url);
+        }
+        return $url;
     }
 
     public function getDimensions(): ?int {
@@ -197,16 +210,18 @@ class EmbeddingService {
         $apiKey = $this->getApiKey();
         $timeout = $this->getTimeout();
 
+        $headers = ['Content-Type: application/json'];
+        if ($apiKey !== '') {
+            $headers[] = 'Authorization: Bearer ' . $apiKey;
+        }
+
         if (function_exists('curl_init')) {
             $ch = curl_init($url);
             curl_setopt_array($ch, [
                 CURLOPT_POST => true,
                 CURLOPT_POSTFIELDS => $jsonPayload,
                 CURLOPT_RETURNTRANSFER => true,
-                CURLOPT_HTTPHEADER => [
-                    'Content-Type: application/json',
-                    'Authorization: Bearer ' . $apiKey,
-                ],
+                CURLOPT_HTTPHEADER => $headers,
                 CURLOPT_TIMEOUT => $timeout,
                 CURLOPT_SSL_VERIFYPEER => true,
             ]);
@@ -223,11 +238,11 @@ class EmbeddingService {
             $body = (string) $response;
         } else {
             // Stream context fallback
+            $headerLines = implode("\r\n", $headers) . "\r\n";
             $context = stream_context_create([
                 'http' => [
                     'method' => 'POST',
-                    'header' => "Content-Type: application/json\r\n" .
-                                "Authorization: Bearer $apiKey\r\n",
+                    'header' => $headerLines,
                     'content' => $jsonPayload,
                     'timeout' => $timeout,
                     'ignore_errors' => true,

@@ -2313,9 +2313,13 @@ final class MemoryStore {
             $stmt->execute([':username' => $username, ':id' => $id]);
             $toEntity = $stmt->fetchColumn();
             if (is_string($toEntity) && $toEntity !== '') {
-                $target = $this->findEntity($username, $toEntity);
-                if ($target !== null && ($target['entity_type'] === 'file' || str_contains($target['name'], '/'))) {
-                    return $target['name'];
+                $target = $this->findEntityFull($username, $toEntity);
+                if ($target !== null) {
+                    $tgtType = (string) ($target['entity_type'] ?? '');
+                    $tgtName = (string) ($target['name'] ?? '');
+                    if ($tgtType === 'file' || str_contains($tgtName, '/')) {
+                        return $tgtName;
+                    }
                 }
             }
 
@@ -2329,9 +2333,13 @@ final class MemoryStore {
             $stmtRev->execute([':username' => $username, ':id' => $id]);
             $fromEntity = $stmtRev->fetchColumn();
             if (is_string($fromEntity) && $fromEntity !== '') {
-                $target = $this->findEntity($username, $fromEntity);
-                if ($target !== null && ($target['entity_type'] === 'file' || str_contains($target['name'], '/'))) {
-                    return $target['name'];
+                $target = $this->findEntityFull($username, $fromEntity);
+                if ($target !== null) {
+                    $tgtType = (string) ($target['entity_type'] ?? '');
+                    $tgtName = (string) ($target['name'] ?? '');
+                    if ($tgtType === 'file' || str_contains($tgtName, '/')) {
+                        return $tgtName;
+                    }
                 }
             }
         }
@@ -2468,6 +2476,7 @@ final class MemoryStore {
 
     /**
      * Automatically backfill vector embeddings for any entities with observations missing embeddings.
+     * Uses fast batched embedding generation.
      *
      * @return int Number of entities whose observation embeddings were synced
      */
@@ -2476,19 +2485,173 @@ final class MemoryStore {
             return 0;
         }
 
-        $stmt = $this->pdo->prepare(
-            "SELECT id, name, entity_type, observations FROM memory_entities
-             WHERE username = :username AND observations != '[]' AND observations != ''
-               AND (embedding_pointers = '[]' OR embedding_pointers IS NULL)"
-        );
+        $result = $this->syncAllObservationEmbeddings($username, false);
+        return $result['entities_processed'];
+    }
+
+    /**
+     * Batch sync vector embeddings for all entities with observations.
+     * Batches multiple observations across entities into single requests for high performance.
+     *
+     * @param string $username Owner of the memory entities
+     * @param bool $force Re-generate embeddings even if already present
+     * @param (callable(int $completed, int $total): void)|null $onProgress Optional progress callback
+     * @param int $batchSize Number of texts per embedding request (default: 50)
+     * @return array{entities_processed: int, observations_embedded: int, total_observations: int}
+     */
+    public function syncAllObservationEmbeddings(
+        string $username,
+        bool $force = false,
+        ?callable $onProgress = null,
+        int $batchSize = 50
+    ): array {
+        if (!$this->embeddingService->isConfigured()) {
+            return ['entities_processed' => 0, 'observations_embedded' => 0, 'total_observations' => 0];
+        }
+
+        $sql = "SELECT id, name, entity_type, observations, embedding_pointers FROM memory_entities
+                WHERE username = :username AND observations != '[]' AND observations != ''";
+        if (!$force) {
+            $sql .= " AND (embedding_pointers = '[]' OR embedding_pointers IS NULL)";
+        }
+        $stmt = $this->pdo->prepare($sql);
         $stmt->execute([':username' => $username]);
         $rows = $stmt->fetchAll();
-        $count = 0;
-        foreach ($rows as $row) {
-            $this->syncObservationEmbeddingsForEntity($username, (string) $row['id']);
-            $count++;
+        if ($rows === []) {
+            return ['entities_processed' => 0, 'observations_embedded' => 0, 'total_observations' => 0];
         }
-        return $count;
+
+        // Fetch existing observation embeddings for this user
+        $existingStmt = $this->pdo->prepare(
+            'SELECT target_id, observation_index, content_hash FROM memory_embeddings
+             WHERE username = :username AND target_type = "observation"'
+        );
+        $existingStmt->execute([':username' => $username]);
+        $existing = [];
+        foreach ($existingStmt->fetchAll() as $embRow) {
+            $existing[$embRow['target_id']][(int) $embRow['observation_index']] = $embRow['content_hash'];
+        }
+
+        $queue = [];
+        $entityObsMap = [];
+        $totalObsCount = 0;
+
+        foreach ($rows as $row) {
+            $id = (string) $row['id'];
+            $obsList = $this->decodeObservations((string) $row['observations']);
+            if ($obsList === []) {
+                continue;
+            }
+            $sourceFile = $this->resolveSourceFileForEntity($username, $row);
+            $entityObsMap[$id] = [
+                'pointers' => [],
+            ];
+            foreach ($obsList as $idx => $text) {
+                $totalObsCount++;
+                $hash = hash('sha256', (string) $text);
+                $embId = 'obs:' . $id . '#' . $idx;
+                $entityObsMap[$id]['pointers'][] = $embId;
+
+                if ($force || !isset($existing[$id][$idx]) || $existing[$id][$idx] !== $hash) {
+                    $queue[] = [
+                        'id' => $embId,
+                        'entity_id' => $id,
+                        'obs_idx' => $idx,
+                        'source_file' => $sourceFile,
+                        'hash' => $hash,
+                        'text' => (string) $text,
+                    ];
+                }
+            }
+        }
+
+        $embeddedCount = 0;
+        $totalToEmbed = count($queue);
+        $now = time();
+        $model = $this->embeddingService->getModel();
+
+        if ($totalToEmbed > 0) {
+            $embStmt = $this->pdo->prepare(
+                'INSERT INTO memory_embeddings (id, username, target_type, target_id, observation_index, document_id, source_file, content_hash, text_content, embedding, model, dimensions, created_at, updated_at)
+                 VALUES (:id, :username, :target_type, :target_id, :obs_idx, :doc_id, :source_file, :hash, :text, :embedding, :model, :dims, :created_at, :updated_at)
+                 ON CONFLICT(id) DO UPDATE SET
+                     source_file       = excluded.source_file,
+                     content_hash      = excluded.content_hash,
+                     text_content      = excluded.text_content,
+                     embedding         = excluded.embedding,
+                     model             = excluded.model,
+                     dimensions        = excluded.dimensions,
+                     observation_index = excluded.observation_index,
+                     updated_at        = excluded.updated_at'
+            );
+
+            $chunks = array_chunk($queue, max(1, min(100, $batchSize)));
+            foreach ($chunks as $chunk) {
+                $texts = array_column($chunk, 'text');
+                $vectors = $this->embeddingService->embed($texts);
+
+                $this->pdo->beginTransaction();
+                try {
+                    foreach ($chunk as $i => $item) {
+                        if (!isset($vectors[$i]) || !is_array($vectors[$i]) || $vectors[$i] === []) {
+                            continue;
+                        }
+                        $blob = EmbeddingService::packVector($vectors[$i]);
+                        $embStmt->execute([
+                            ':id' => $item['id'],
+                            ':username' => $username,
+                            ':target_type' => 'observation',
+                            ':target_id' => $item['entity_id'],
+                            ':obs_idx' => $item['obs_idx'],
+                            ':doc_id' => null,
+                            ':source_file' => $item['source_file'],
+                            ':hash' => $item['hash'],
+                            ':text' => $item['text'],
+                            ':embedding' => $blob,
+                            ':model' => $model,
+                            ':dims' => count($vectors[$i]),
+                            ':created_at' => $now,
+                            ':updated_at' => $now,
+                        ]);
+                        $embeddedCount++;
+                    }
+                    $this->pdo->commit();
+                } catch (\Throwable $e) {
+                    $this->pdo->rollBack();
+                    throw $e;
+                }
+
+                if ($onProgress !== null) {
+                    $onProgress($embeddedCount, $totalToEmbed);
+                }
+            }
+        }
+
+        // Update embedding_pointers on memory_entities
+        $updEntity = $this->pdo->prepare(
+            'UPDATE memory_entities SET embedding_pointers = :pointers, updated_at = :updated_at WHERE username = :username AND id = :id'
+        );
+        $this->pdo->beginTransaction();
+        try {
+            foreach ($entityObsMap as $entityId => $info) {
+                $updEntity->execute([
+                    ':pointers' => json_encode($info['pointers'], JSON_UNESCAPED_SLASHES),
+                    ':updated_at' => $now,
+                    ':username' => $username,
+                    ':id' => $entityId,
+                ]);
+            }
+            $this->pdo->commit();
+        } catch (\Throwable $e) {
+            $this->pdo->rollBack();
+            throw $e;
+        }
+
+        return [
+            'entities_processed' => count($rows),
+            'observations_embedded' => $embeddedCount,
+            'total_observations' => $totalObsCount,
+        ];
     }
 
     /** Refresh the FTS mirror for one entity, keeping it in lockstep with the source row. */

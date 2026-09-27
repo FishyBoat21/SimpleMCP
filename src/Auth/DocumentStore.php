@@ -698,23 +698,49 @@ final class DocumentStore {
             return 0;
         }
 
-        $stmt = $this->pdo->prepare(
-            'SELECT c.id, c.content, c.document_id, d.filename, d.source
-             FROM memory_chunks c
-             LEFT JOIN memory_documents d ON c.username = d.username AND c.document_id = d.id
-             LEFT JOIN memory_embeddings e ON c.username = e.username AND e.target_type = "chunk" AND e.target_id = c.id
-             WHERE c.username = :username AND e.id IS NULL'
-        );
+        $res = $this->syncAllChunkEmbeddings($username, false);
+        return $res['chunks_embedded'];
+    }
+
+    /**
+     * Batch sync vector embeddings for document chunks.
+     *
+     * @param string $username Owner of documents
+     * @param bool $force Re-generate embeddings even if already present
+     * @param (callable(int $completed, int $total): void)|null $onProgress Optional progress callback
+     * @param int $batchSize Number of texts per embedding request (default: 50)
+     * @return array{chunks_processed: int, chunks_embedded: int, total_chunks: int}
+     */
+    public function syncAllChunkEmbeddings(
+        string $username,
+        bool $force = false,
+        ?callable $onProgress = null,
+        int $batchSize = 50
+    ): array {
+        if (!$this->embeddingService->isConfigured()) {
+            return ['chunks_processed' => 0, 'chunks_embedded' => 0, 'total_chunks' => 0];
+        }
+
+        $sql = 'SELECT c.id, c.content, c.document_id, c.embedding_id, d.filename, d.source
+                FROM memory_chunks c
+                LEFT JOIN memory_documents d ON c.username = d.username AND c.document_id = d.id
+                LEFT JOIN memory_embeddings e ON c.username = e.username AND e.target_type = "chunk" AND e.target_id = c.id
+                WHERE c.username = :username';
+        if (!$force) {
+            $sql .= ' AND e.id IS NULL';
+        }
+        $stmt = $this->pdo->prepare($sql);
         $stmt->execute([':username' => $username]);
         $rows = $stmt->fetchAll();
         if ($rows === []) {
-            return 0;
+            return ['chunks_processed' => 0, 'chunks_embedded' => 0, 'total_chunks' => 0];
         }
 
-        $count = 0;
         $now = time();
         $model = $this->embeddingService->getModel();
-        $batches = array_chunk($rows, 50);
+        $batches = array_chunk($rows, max(1, min(100, $batchSize)));
+        $embedded = 0;
+        $total = count($rows);
 
         $embStmt = $this->pdo->prepare(
             'INSERT INTO memory_embeddings (id, username, target_type, target_id, observation_index, document_id, source_file, content_hash, text_content, embedding, model, dimensions, created_at, updated_at)
@@ -733,36 +759,53 @@ final class DocumentStore {
         foreach ($batches as $batch) {
             $texts = array_column($batch, 'content');
             $vectors = $this->embeddingService->embed($texts);
-            foreach ($batch as $i => $row) {
-                if (!isset($vectors[$i]) || !is_array($vectors[$i])) {
-                    continue;
-                }
-                $chunkId = (string) $row['id'];
-                $embId = 'chunk:' . $chunkId;
-                $embBlob = EmbeddingService::packVector($vectors[$i]);
-                $sourceFile = (string) ($row['source'] ?? '') !== '' ? (string) $row['source'] : (string) ($row['filename'] ?? '');
 
-                $embStmt->execute([
-                    ':id' => $embId,
-                    ':username' => $username,
-                    ':target_type' => 'chunk',
-                    ':target_id' => $chunkId,
-                    ':obs_idx' => null,
-                    ':doc_id' => $row['document_id'],
-                    ':source_file' => $sourceFile,
-                    ':hash' => hash('sha256', (string) $row['content']),
-                    ':text' => (string) $row['content'],
-                    ':embedding' => $embBlob,
-                    ':model' => $model,
-                    ':dims' => count($vectors[$i]),
-                    ':created_at' => $now,
-                    ':updated_at' => $now,
-                ]);
-                $updChunk->execute([':emb_id' => $embId, ':username' => $username, ':id' => $chunkId]);
-                $count++;
+            $this->pdo->beginTransaction();
+            try {
+                foreach ($batch as $i => $row) {
+                    if (!isset($vectors[$i]) || !is_array($vectors[$i]) || $vectors[$i] === []) {
+                        continue;
+                    }
+                    $chunkId = (string) $row['id'];
+                    $embId = 'chunk:' . $chunkId;
+                    $embBlob = EmbeddingService::packVector($vectors[$i]);
+                    $sourceFile = (string) ($row['source'] ?? '') !== '' ? (string) $row['source'] : (string) ($row['filename'] ?? '');
+
+                    $embStmt->execute([
+                        ':id' => $embId,
+                        ':username' => $username,
+                        ':target_type' => 'chunk',
+                        ':target_id' => $chunkId,
+                        ':obs_idx' => null,
+                        ':doc_id' => $row['document_id'],
+                        ':source_file' => $sourceFile,
+                        ':hash' => hash('sha256', (string) $row['content']),
+                        ':text' => (string) $row['content'],
+                        ':embedding' => $embBlob,
+                        ':model' => $model,
+                        ':dims' => count($vectors[$i]),
+                        ':created_at' => $now,
+                        ':updated_at' => $now,
+                    ]);
+                    $updChunk->execute([':emb_id' => $embId, ':username' => $username, ':id' => $chunkId]);
+                    $embedded++;
+                }
+                $this->pdo->commit();
+            } catch (\Throwable $e) {
+                $this->pdo->rollBack();
+                throw $e;
+            }
+
+            if ($onProgress !== null) {
+                $onProgress($embedded, $total);
             }
         }
-        return $count;
+
+        return [
+            'chunks_processed' => $total,
+            'chunks_embedded' => $embedded,
+            'total_chunks' => $total,
+        ];
     }
 
     /**
