@@ -1322,8 +1322,14 @@ final class MemoryStore {
         }
         $t = $this->toTimestamp($asOf) ?? time();
 
-        $keywordIds = $this->keywordSearch($username, $query, $t, $entityType);
-        $semanticIds = $this->semanticSearch($username, $query, $t, $entityType);
+        $keywordIds = [];
+        $semanticIds = [];
+        if ($searchType === 'keyword' || $searchType === 'hybrid') {
+            $keywordIds = $this->keywordSearch($username, $query, $t, $entityType);
+        }
+        if ($searchType === 'semantic' || $searchType === 'hybrid') {
+            $semanticIds = $this->semanticSearch($username, $query, $t, $entityType);
+        }
 
         $lists = [];
         if ($searchType === 'keyword' || $searchType === 'hybrid') {
@@ -1333,10 +1339,21 @@ final class MemoryStore {
             $lists['semantic'] = $semanticIds;
         }
         if ($hops > 0) {
-            $seeds = array_values(array_unique(array_merge($keywordIds, $semanticIds)));
-            $graphIds = $this->bfsExpand($username, $seeds, $hops, $t, $direction);
-            if ($graphIds !== []) {
-                $lists['graph'] = $graphIds;
+            $seedLimit = min($topK, 5);
+            $seedCandidates = match ($searchType) {
+                'keyword'  => array_slice($keywordIds, 0, $seedLimit),
+                'semantic' => array_slice($semanticIds, 0, $seedLimit),
+                'hybrid'   => array_slice(array_values(array_unique(array_merge(
+                    array_slice($keywordIds, 0, $seedLimit),
+                    array_slice($semanticIds, 0, $seedLimit)
+                ))), 0, $seedLimit),
+            };
+
+            if ($seedCandidates !== []) {
+                $graphIds = $this->bfsExpand($username, $seedCandidates, $hops, $t, $direction);
+                if ($graphIds !== []) {
+                    $lists['graph'] = $graphIds;
+                }
             }
         }
 
@@ -1803,10 +1820,22 @@ final class MemoryStore {
             }
         }
 
+        if ($entityScores === []) {
+            return [];
+        }
+
+        arsort($entityScores);
+        $topScore = reset($entityScores);
+
+        // Require minimum baseline of 0.40 and within 65% of the best match
+        $minThreshold = max(0.40, $topScore * 0.65);
         $scored = [];
         foreach ($entityScores as $id => $score) {
-            if ($score >= 0.20) {
+            if ($score >= $minThreshold) {
                 $scored[] = ['id' => $id, 'score' => $score];
+            }
+            if (count($scored) >= 50) {
+                break;
             }
         }
 
@@ -1894,8 +1923,24 @@ final class MemoryStore {
         }
 
         $distance = $this->subgraphDistances($username, $seeds, $hops, $asOf, false, $direction);
-        uksort($distance, function (string $a, string $b) use ($distance): int {
-            return $distance[$a] <=> $distance[$b] ?: strcmp($a, $b);
+        $seedRank = array_flip(array_values($seeds));
+
+        uksort($distance, function (string $a, string $b) use ($distance, $seedRank): int {
+            if ($distance[$a] !== $distance[$b]) {
+                return $distance[$a] <=> $distance[$b];
+            }
+            $aSeed = $seedRank[$a] ?? null;
+            $bSeed = $seedRank[$b] ?? null;
+            if ($aSeed !== null && $bSeed !== null) {
+                return $aSeed <=> $bSeed;
+            }
+            if ($aSeed !== null) {
+                return -1;
+            }
+            if ($bSeed !== null) {
+                return 1;
+            }
+            return strcmp($a, $b);
         });
         return array_keys($distance);
     }
@@ -2399,11 +2444,13 @@ final class MemoryStore {
 
         $toEmbedIndices = [];
         $toEmbedTexts = [];
+        $prefix = "[{$entity['entity_type']}] {$entity['name']}: ";
         foreach ($obsList as $idx => $text) {
-            $hash = hash('sha256', (string) $text);
+            $embedText = str_starts_with((string) $text, $prefix) ? (string) $text : $prefix . (string) $text;
+            $hash = hash('sha256', $embedText);
             if (!isset($existingRows[$idx]) || $existingRows[$idx]['content_hash'] !== $hash) {
                 $toEmbedIndices[] = $idx;
-                $toEmbedTexts[] = (string) $text;
+                $toEmbedTexts[] = $embedText;
             }
         }
 
@@ -2431,27 +2478,27 @@ final class MemoryStore {
         foreach ($obsList as $idx => $text) {
             $embId = 'obs:' . $id . '#' . $idx;
             $pointers[] = $embId;
-            $hash = hash('sha256', (string) $text);
+            $embedText = str_starts_with((string) $text, $prefix) ? (string) $text : $prefix . (string) $text;
+            $hash = hash('sha256', $embedText);
 
             if (in_array($idx, $toEmbedIndices, true)) {
                 if (isset($newVectors[$vectorIdx]) && is_array($newVectors[$vectorIdx])) {
                     $blob = EmbeddingService::packVector($newVectors[$vectorIdx]);
-                    $embStmt->execute([
-                        ':id' => $embId,
-                        ':username' => $username,
-                        ':target_type' => 'observation',
-                        ':target_id' => $id,
-                        ':obs_idx' => $idx,
-                        ':doc_id' => null,
-                        ':source_file' => $sourceFile,
-                        ':hash' => $hash,
-                        ':text' => (string) $text,
-                        ':embedding' => $blob,
-                        ':model' => $model,
-                        ':dims' => count($newVectors[$vectorIdx]),
-                        ':created_at' => $now,
-                        ':updated_at' => $now,
-                    ]);
+                    $embStmt->bindValue(':id', $embId);
+                    $embStmt->bindValue(':username', $username);
+                    $embStmt->bindValue(':target_type', 'observation');
+                    $embStmt->bindValue(':target_id', $id);
+                    $embStmt->bindValue(':obs_idx', $idx, PDO::PARAM_INT);
+                    $embStmt->bindValue(':doc_id', null, PDO::PARAM_NULL);
+                    $embStmt->bindValue(':source_file', $sourceFile);
+                    $embStmt->bindValue(':hash', $hash);
+                    $embStmt->bindValue(':text', (string) $text);
+                    $embStmt->bindValue(':embedding', $blob, PDO::PARAM_LOB);
+                    $embStmt->bindValue(':model', $model);
+                    $embStmt->bindValue(':dims', count($newVectors[$vectorIdx]), PDO::PARAM_INT);
+                    $embStmt->bindValue(':created_at', $now, PDO::PARAM_INT);
+                    $embStmt->bindValue(':updated_at', $now, PDO::PARAM_INT);
+                    $embStmt->execute();
                 }
                 $vectorIdx++;
             }
@@ -2546,9 +2593,11 @@ final class MemoryStore {
             $entityObsMap[$id] = [
                 'pointers' => [],
             ];
+            $prefix = "[{$row['entity_type']}] {$row['name']}: ";
             foreach ($obsList as $idx => $text) {
                 $totalObsCount++;
-                $hash = hash('sha256', (string) $text);
+                $embedText = str_starts_with((string) $text, $prefix) ? (string) $text : $prefix . (string) $text;
+                $hash = hash('sha256', $embedText);
                 $embId = 'obs:' . $id . '#' . $idx;
                 $entityObsMap[$id]['pointers'][] = $embId;
 
@@ -2560,6 +2609,7 @@ final class MemoryStore {
                         'source_file' => $sourceFile,
                         'hash' => $hash,
                         'text' => (string) $text,
+                        'embed_text' => $embedText,
                     ];
                 }
             }
@@ -2587,7 +2637,7 @@ final class MemoryStore {
 
             $chunks = array_chunk($queue, max(1, min(100, $batchSize)));
             foreach ($chunks as $chunk) {
-                $texts = array_column($chunk, 'text');
+                $texts = array_column($chunk, 'embed_text');
                 $vectors = $this->embeddingService->embed($texts);
 
                 $this->pdo->beginTransaction();
@@ -2597,22 +2647,21 @@ final class MemoryStore {
                             continue;
                         }
                         $blob = EmbeddingService::packVector($vectors[$i]);
-                        $embStmt->execute([
-                            ':id' => $item['id'],
-                            ':username' => $username,
-                            ':target_type' => 'observation',
-                            ':target_id' => $item['entity_id'],
-                            ':obs_idx' => $item['obs_idx'],
-                            ':doc_id' => null,
-                            ':source_file' => $item['source_file'],
-                            ':hash' => $item['hash'],
-                            ':text' => $item['text'],
-                            ':embedding' => $blob,
-                            ':model' => $model,
-                            ':dims' => count($vectors[$i]),
-                            ':created_at' => $now,
-                            ':updated_at' => $now,
-                        ]);
+                        $embStmt->bindValue(':id', $item['id']);
+                        $embStmt->bindValue(':username', $username);
+                        $embStmt->bindValue(':target_type', 'observation');
+                        $embStmt->bindValue(':target_id', $item['entity_id']);
+                        $embStmt->bindValue(':obs_idx', $item['obs_idx'], PDO::PARAM_INT);
+                        $embStmt->bindValue(':doc_id', null, PDO::PARAM_NULL);
+                        $embStmt->bindValue(':source_file', $item['source_file']);
+                        $embStmt->bindValue(':hash', $item['hash']);
+                        $embStmt->bindValue(':text', $item['text']);
+                        $embStmt->bindValue(':embedding', $blob, PDO::PARAM_LOB);
+                        $embStmt->bindValue(':model', $model);
+                        $embStmt->bindValue(':dims', count($vectors[$i]), PDO::PARAM_INT);
+                        $embStmt->bindValue(':created_at', $now, PDO::PARAM_INT);
+                        $embStmt->bindValue(':updated_at', $now, PDO::PARAM_INT);
+                        $embStmt->execute();
                         $embeddedCount++;
                     }
                     $this->pdo->commit();

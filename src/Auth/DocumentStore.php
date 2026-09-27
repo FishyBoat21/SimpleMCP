@@ -323,22 +323,21 @@ final class DocumentStore {
             if (isset($embeddings[$idx]) && is_array($embeddings[$idx]) && $embeddings[$idx] !== []) {
                 $embId = 'chunk:' . $chunkId;
                 $embBlob = EmbeddingService::packVector($embeddings[$idx]);
-                $embStmt->execute([
-                    ':id' => $embId,
-                    ':username' => $username,
-                    ':target_type' => 'chunk',
-                    ':target_id' => $chunkId,
-                    ':obs_idx' => null,
-                    ':doc_id' => $id,
-                    ':source_file' => $sourceFile,
-                    ':hash' => hash('sha256', $text),
-                    ':text' => $text,
-                    ':embedding' => $embBlob,
-                    ':model' => $model,
-                    ':dims' => count($embeddings[$idx]),
-                    ':created_at' => $now,
-                    ':updated_at' => $now,
-                ]);
+                $embStmt->bindValue(':id', $embId);
+                $embStmt->bindValue(':username', $username);
+                $embStmt->bindValue(':target_type', 'chunk');
+                $embStmt->bindValue(':target_id', $chunkId);
+                $embStmt->bindValue(':obs_idx', null, PDO::PARAM_NULL);
+                $embStmt->bindValue(':doc_id', $id);
+                $embStmt->bindValue(':source_file', $sourceFile);
+                $embStmt->bindValue(':hash', hash('sha256', $text));
+                $embStmt->bindValue(':text', $text);
+                $embStmt->bindValue(':embedding', $embBlob, PDO::PARAM_LOB);
+                $embStmt->bindValue(':model', $model);
+                $embStmt->bindValue(':dims', count($embeddings[$idx]), PDO::PARAM_INT);
+                $embStmt->bindValue(':created_at', $now, PDO::PARAM_INT);
+                $embStmt->bindValue(':updated_at', $now, PDO::PARAM_INT);
+                $embStmt->execute();
             }
 
             $stmt->execute([
@@ -617,7 +616,7 @@ final class DocumentStore {
         $stmt = $this->pdo->prepare($sql);
         $stmt->execute($params);
 
-        $scored = [];
+        $rawScores = [];
         while ($row = $stmt->fetch()) {
             $blob = $row['embedding'];
             if (!is_string($blob) || $blob === '') {
@@ -625,8 +624,24 @@ final class DocumentStore {
             }
             $chunkVector = EmbeddingService::unpackVector($blob);
             $score = EmbeddingService::cosineSimilarity($queryVector, $chunkVector);
-            if ($score >= 0.20) {
-                $scored[] = ['id' => (string) $row['target_id'], 'score' => round($score, 4)];
+            $rawScores[(string) $row['target_id']] = $score;
+        }
+
+        if ($rawScores === []) {
+            return [];
+        }
+
+        arsort($rawScores);
+        $topScore = reset($rawScores);
+        $minThreshold = max(0.35, $topScore * 0.65);
+
+        $scored = [];
+        foreach ($rawScores as $id => $score) {
+            if ($score >= $minThreshold) {
+                $scored[] = ['id' => $id, 'score' => round($score, 4)];
+            }
+            if (count($scored) >= 50) {
+                break;
             }
         }
 
@@ -771,22 +786,21 @@ final class DocumentStore {
                     $embBlob = EmbeddingService::packVector($vectors[$i]);
                     $sourceFile = (string) ($row['source'] ?? '') !== '' ? (string) $row['source'] : (string) ($row['filename'] ?? '');
 
-                    $embStmt->execute([
-                        ':id' => $embId,
-                        ':username' => $username,
-                        ':target_type' => 'chunk',
-                        ':target_id' => $chunkId,
-                        ':obs_idx' => null,
-                        ':doc_id' => $row['document_id'],
-                        ':source_file' => $sourceFile,
-                        ':hash' => hash('sha256', (string) $row['content']),
-                        ':text' => (string) $row['content'],
-                        ':embedding' => $embBlob,
-                        ':model' => $model,
-                        ':dims' => count($vectors[$i]),
-                        ':created_at' => $now,
-                        ':updated_at' => $now,
-                    ]);
+                    $embStmt->bindValue(':id', $embId);
+                    $embStmt->bindValue(':username', $username);
+                    $embStmt->bindValue(':target_type', 'chunk');
+                    $embStmt->bindValue(':target_id', $chunkId);
+                    $embStmt->bindValue(':obs_idx', null, PDO::PARAM_NULL);
+                    $embStmt->bindValue(':doc_id', $row['document_id']);
+                    $embStmt->bindValue(':source_file', $sourceFile);
+                    $embStmt->bindValue(':hash', hash('sha256', (string) $row['content']));
+                    $embStmt->bindValue(':text', (string) $row['content']);
+                    $embStmt->bindValue(':embedding', $embBlob, PDO::PARAM_LOB);
+                    $embStmt->bindValue(':model', $model);
+                    $embStmt->bindValue(':dims', count($vectors[$i]), PDO::PARAM_INT);
+                    $embStmt->bindValue(':created_at', $now, PDO::PARAM_INT);
+                    $embStmt->bindValue(':updated_at', $now, PDO::PARAM_INT);
+                    $embStmt->execute();
                     $updChunk->execute([':emb_id' => $embId, ':username' => $username, ':id' => $chunkId]);
                     $embedded++;
                 }
