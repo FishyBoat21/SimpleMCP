@@ -3,30 +3,23 @@
 declare(strict_types=1);
 
 /**
- * SimpleMCP Web Document Root (Public HTTP Entry Point).
+ * SimpleMCP Front Controller / Router.
  *
- * Dedicated HTTP front controller for public and local deployment.
- * Keeps data/, config/, src/, and vendor/ outside the web document root.
+ * Dispatches clean HTTP URLs to standalone page files (PRG pattern)
+ * and standalone API endpoints.
  */
 
-require_once dirname(__DIR__) . '/vendor/autoload.php';
+require_once __DIR__ . '/bootstrap.php';
 
-use McpServer\Auth\AccountController;
-use McpServer\Auth\ClientStore;
-use McpServer\Auth\Database;
-use McpServer\Auth\DebugLog;
-use McpServer\Auth\EmailService;
 use McpServer\Auth\MountPath;
-use McpServer\Auth\OAuthServer;
-use McpServer\Auth\PasskeyStore;
-use McpServer\Auth\TokenStore;
-use McpServer\Auth\TwoFactorService;
-use McpServer\Auth\UserStore;
-use McpServer\McpServer;
-use McpServer\UserContext;
 
-$server = new McpServer();
-$server->registerToolsFromDirectory(dirname(__DIR__) . '/src/Tools', 'McpServer\\Tools\\');
+// In PHP built-in web server (php -S), return false for existing static/script files
+if (php_sapi_name() === 'cli-server') {
+    $reqFile = __DIR__ . (parse_url($_SERVER['REQUEST_URI'] ?? '', PHP_URL_PATH) ?? '');
+    if (is_file($reqFile) && !str_ends_with($reqFile, 'index.php')) {
+        return false;
+    }
+}
 
 $path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?? '/';
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
@@ -34,175 +27,64 @@ $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
 $mount = MountPath::from($_SERVER);
 $path = MountPath::strip($path, $mount);
 
-// WebAuthn / Passkeys strictly prohibit raw IP addresses (e.g. 127.0.0.1) as Relying Party IDs.
-// Automatically redirect browser visits on loopback IP to 'localhost' so passkeys function seamlessly.
-$rawHost = $_SERVER['HTTP_X_FORWARDED_HOST'] ?? $_SERVER['HTTP_HOST'] ?? '';
-$hostName = parse_url('http://' . $rawHost, PHP_URL_HOST);
-if ($hostName === '127.0.0.1' || $hostName === '::1' || str_starts_with($rawHost, '127.0.0.1') || str_starts_with($rawHost, '[::1]')) {
-    if (str_starts_with($path, '/account') || str_starts_with($path, '/oauth/authorize')) {
-        $port = parse_url('http://' . $rawHost, PHP_URL_PORT);
-        $portStr = $port !== null ? ':' . $port : '';
-        $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
-        header('Location: ' . $scheme . '://localhost' . $portStr . ($_SERVER['REQUEST_URI'] ?? '/'), true, 307);
+// Route map mapping clean URLs to standalone files
+$routes = [
+    '/account' => __DIR__ . '/account/index.php',
+    '/account/' => __DIR__ . '/account/index.php',
+    '/account/login' => __DIR__ . '/account/login.php',
+    '/account/logout' => __DIR__ . '/account/logout.php',
+    '/account/onboard' => __DIR__ . '/account/onboard.php',
+    '/account/change-password' => __DIR__ . '/account/change-password.php',
+    '/account/update-email' => __DIR__ . '/account/update-email.php',
+    '/account/device/revoke' => __DIR__ . '/account/device/revoke.php',
+    '/account/2fa/verify' => __DIR__ . '/account/2fa/verify.php',
+    '/account/2fa/resend' => __DIR__ . '/account/2fa/resend.php',
+    '/account/2fa/set-email' => __DIR__ . '/account/2fa/set-email.php',
+    '/account/passkey/register/options' => __DIR__ . '/account/passkey/register/options.php',
+    '/account/passkey/register/verify' => __DIR__ . '/account/passkey/register/verify.php',
+    '/account/passkey/login/options' => __DIR__ . '/account/passkey/login/options.php',
+    '/account/passkey/login/verify' => __DIR__ . '/account/passkey/login/verify.php',
+    '/account/passkey/delete' => __DIR__ . '/account/passkey/delete.php',
+    '/oauth/authorize' => __DIR__ . '/oauth/authorize.php',
+    '/oauth/token' => __DIR__ . '/oauth/token.php',
+    '/oauth/register' => __DIR__ . '/oauth/register.php',
+    '/oauth/passkey/options' => __DIR__ . '/oauth/passkey/options.php',
+    '/oauth/passkey/verify' => __DIR__ . '/oauth/passkey/verify.php',
+    '/.well-known/oauth-authorization-server' => __DIR__ . '/.well-known/oauth-authorization-server.php',
+    '/.well-known/oauth-protected-resource' => __DIR__ . '/.well-known/oauth-protected-resource.php',
+    '/sse' => __DIR__ . '/sse.php',
+    '/message' => __DIR__ . '/message.php',
+    '/mcp' => __DIR__ . '/mcp.php',
+];
+
+// Root endpoint dispatch
+if ($path === '/' || $path === '') {
+    if ($method === 'POST') {
+        require __DIR__ . '/mcp.php';
         exit;
     }
+    // Browser visiting root via GET redirects to account dashboard
+    redirect('/account/index.php');
 }
 
-// OAuth + user-management pages share the same SQLite-backed stores.
-$oauthConfig = require dirname(__DIR__) . '/config/oauth.php';
-$mailConfigFile = dirname(__DIR__) . '/config/mail.php';
-$mailConfig = file_exists($mailConfigFile)
-    ? require $mailConfigFile
-    : (file_exists(dirname(__DIR__) . '/config/mail.example.php') ? require dirname(__DIR__) . '/config/mail.example.php' : []);
-$db = new Database(dirname(__DIR__) . '/data/app.sqlite');
-$userStore = new UserStore($db);
-$tokenStore = new TokenStore($db);
-$clientStore = new ClientStore($db, $oauthConfig['clients'] ?? []);
-$passkeyStore = new PasskeyStore($db);
-$emailService = new EmailService($mailConfig);
-$twoFactor = new TwoFactorService($db, $userStore, $emailService);
-$canonicalIssuer = $oauthConfig['issuer'] ?? null;
-
-$oauth = new OAuthServer($userStore, $tokenStore, $clientStore, $oauthConfig, $passkeyStore, $twoFactor);
-$account = new AccountController($userStore, $passkeyStore, is_string($canonicalIssuer) ? $canonicalIssuer : null, $twoFactor, $mount);
-$db->seedUsersIfEmpty(require dirname(__DIR__) . '/config/users.php');
-
-$isOAuthPath = str_starts_with($path, '/oauth') || in_array($path, [
-    '/.well-known/oauth-authorization-server',
-    '/.well-known/oauth-protected-resource',
-], true);
-$isAccountPath = str_starts_with($path, '/account');
-
-// Secure Session Cookie Configuration
-$isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
-    || (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https');
-
-$sessionDir = dirname(__DIR__) . '/data/sessions';
-if (!is_dir($sessionDir)) {
-    mkdir($sessionDir, 0777, true);
-}
-session_save_path($sessionDir);
-
-session_set_cookie_params([
-    'lifetime' => 0,
-    'path' => '/',
-    'domain' => '',
-    'secure' => $isHttps,
-    'httponly' => true,
-    'samesite' => 'Lax',
-]);
-
-if ($isAccountPath || str_starts_with($path, '/oauth/authorize') || str_starts_with($path, '/oauth/passkey')) {
-    if (session_status() === PHP_SESSION_NONE) {
-        session_start();
-    }
-}
-
-if ($isOAuthPath) {
-    $rawBody = file_get_contents('php://input');
-    sendResponse($oauth->handle($method, $path, $_SERVER, $_GET, $rawBody), $isHttps);
+// Check exact clean route
+if (isset($routes[$path])) {
+    require $routes[$path];
     exit;
 }
 
-if ($isAccountPath) {
-    $post = [];
-    $rawBody = file_get_contents('php://input');
-    $contentType = $_SERVER['CONTENT_TYPE'] ?? '';
-    if (str_contains($contentType, 'application/json')) {
-        $post = json_decode($rawBody, true) ?: [];
-    } else {
-        parse_str($rawBody, $post);
-    }
-    sendResponse($account->handle($method, $path, $_GET, $post), $isHttps);
+// Check if a direct .php file exists for the path
+$candidate = __DIR__ . $path . '.php';
+if (file_exists($candidate) && is_file($candidate)) {
+    require $candidate;
     exit;
 }
 
-// Everything else is the MCP JSON-RPC endpoint (streamable HTTP transport).
-// Authentication is optional: a missing token means an anonymous user who can
-// only see/call tools without role/permission requirements; a present but
-// invalid/expired token is rejected with 401 + WWW-Authenticate.
-$auth = $_SERVER['HTTP_AUTHORIZATION'] ?? $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? '';
-$token = preg_match('/^Bearer\s+(.+)$/i', $auth, $m) ? trim($m[1]) : null;
-
-if ($token === null) {
-    $user = UserContext::anonymous();
+// 404 Not Found
+http_response_code(404);
+if (str_starts_with($path, '/oauth') || str_starts_with($path, '/.well-known') || str_starts_with($path, '/api')) {
+    json_response(404, ['error' => 'not_found', 'error_description' => 'The requested endpoint does not exist.']);
 } else {
-    $user = $oauth->resolveUser($token);
-    if ($user === null) {
-        DebugLog::write("MCP {$method} {$path} token=present => 401 INVALID_TOKEN");
-        $origin = is_string($canonicalIssuer) && $canonicalIssuer !== ''
-            ? rtrim($canonicalIssuer, '/')
-            : ($isHttps ? 'https' : 'http') . '://' . ($_SERVER['HTTP_X_FORWARDED_HOST'] ?? $_SERVER['HTTP_HOST'] ?? 'localhost');
-
-        http_response_code(401);
-        header('WWW-Authenticate: Bearer resource_metadata="' . $origin . '/.well-known/oauth-protected-resource", error="invalid_token"');
-        header('Content-Type: application/json; charset=utf-8');
-        header('Cache-Control: no-store');
-        header('X-Frame-Options: DENY');
-        header('X-Content-Type-Options: nosniff');
-        echo json_encode(['error' => 'invalid_token', 'error_description' => 'The access token is invalid or expired. Re-authenticate via OAuth.']);
-        exit;
-    }
-}
-
-if ($method !== 'POST') {
-    DebugLog::write("MCP {$method} {$path} => 405");
-    http_response_code(405);
-    header('Content-Type: application/json; charset=utf-8');
-    header('X-Frame-Options: DENY');
-    header('X-Content-Type-Options: nosniff');
-    echo json_encode(['error' => 'Method Not Allowed. Use POST.']);
-    exit;
-}
-
-$rawBody = file_get_contents('php://input');
-$decoded = json_decode($rawBody, true);
-$rpcMethod = is_array($decoded) ? (string) ($decoded['method'] ?? '?') : 'invalid-json';
-DebugLog::write("MCP {$method} {$path} rpc={$rpcMethod} token=" . ($token !== null ? 'present' : 'none') . ' user=' . $user->username);
-
-$sessionId = $_SERVER['HTTP_MCP_SESSION_ID'] ?? '';
-if ($sessionId === '' && $rpcMethod === 'initialize') {
-    $sessionId = bin2hex(random_bytes(16));
-}
-
-$response = $server->handleRequest($rawBody, $user);
-header('Content-Type: application/json; charset=utf-8');
-header('X-Frame-Options: DENY');
-header('X-Content-Type-Options: nosniff');
-header('Referrer-Policy: strict-origin-when-cross-origin');
-if ($isHttps) {
-    header('Strict-Transport-Security: max-age=31536000; includeSubDomains');
-}
-if ($sessionId !== '') {
-    header('Mcp-Session-Id: ' . $sessionId);
-}
-if ($response !== null) {
-    $rpc = json_decode($response, true);
-    $outcome = $rpc['error']['code'] ?? 'ok';
-    DebugLog::write("MCP result rpc={$rpcMethod} code={$outcome}");
-    echo $response;
-}
-
-/**
- * Emit a `{status, headers, body}` response produced by the controllers with security headers.
- *
- * @param array{status: int, headers: array<string, string>, body: string} $response
- */
-function sendResponse(array $response, bool $isHttps = false): void {
-    http_response_code($response['status']);
-
-    $headers = $response['headers'];
-    $headers['X-Frame-Options'] ??= 'DENY';
-    $headers['X-Content-Type-Options'] ??= 'nosniff';
-    $headers['Referrer-Policy'] ??= 'strict-origin-when-cross-origin';
-    if ($isHttps) {
-        $headers['Strict-Transport-Security'] ??= 'max-age=31536000; includeSubDomains';
-    }
-
-    foreach ($headers as $name => $value) {
-        header($name . ': ' . $value);
-    }
-    if ($response['body'] !== '') {
-        echo $response['body'];
-    }
+    require_once __DIR__ . '/layout.php';
+    render_html('404 Not Found', '<div class="alert alert-error">Page not found: <code>' . htmlspecialchars($path) . '</code></div><p><a href="/account">Return to Dashboard</a></p>');
 }

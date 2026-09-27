@@ -14,9 +14,12 @@ printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n{"jsonrpc":"
 
 - **MCP protocol** — `initialize`, `tools/list`, `tools/call`, `notifications/initialized`
   (protocol version `2024-11-05`).
-- **Two transports** from a single entry point:
+- **Three transports** from a single entry point:
   - **stdio** — line-delimited JSON-RPC over stdin/stdout, how MCP clients launch the server.
-  - **HTTP** — Streamable HTTP transport with optional `Mcp-Session-Id` handling.
+  - **Streamable HTTP** — direct JSON-RPC POST (`/` or `/mcp`) with optional `Mcp-Session-Id` handling.
+  - **SSE MCP (Server-Sent Events)** — standard MCP SSE stream (`GET /sse`) with message receiver (`POST /message?sessionId=...`).
+- **File-per-Page (PRG pattern)** — each web page is a dedicated file that strictly follows the Post/Redirect/Get pattern with flash messages to prevent form re-submissions.
+- **Standalone File-per-API** — every API endpoint (OAuth token, client registration, passkey options/verify, discovery metadata, MCP JSON-RPC, and SSE) lives in its own standalone script.
 - **Attribute-based tools** — drop a class in [src/Tools/](src/Tools/) with `#[McpFunction]`
   methods and it is auto-discovered; no manual registration.
 - **Per-tool access control** — tools declare required `roles` / `permissions`; unauthorized
@@ -362,7 +365,43 @@ php cli/cleanup_clients.php --prune --days=7 --dry-run
 ```
 stdio.php                     dedicated stdio JSON-RPC loop for MCP clients
 public/
-  index.php                   isolated HTTP document root (OAuth, Account, Passkey, MCP JSON-RPC)
+  index.php                   front controller / clean URL router
+  bootstrap.php               shared bootstrap entry point
+  layout.php                  shared modern UI layout with flash message support
+  mcp.php                     standalone Streamable HTTP MCP JSON-RPC API
+  sse.php                     standalone Server-Sent Events (SSE) MCP stream
+  message.php                 standalone MCP SSE message receiver API
+  .well-known/
+    oauth-authorization-server.php  RFC 8414 discovery metadata API
+    oauth-protected-resource.php    RFC 9728 discovery metadata API
+  oauth/
+    authorize.php             OAuth 2.1 authorization consent & login page (PRG)
+    token.php                 OAuth 2.1 token endpoint API
+    register.php              RFC 7591 dynamic client registration API
+    passkey/
+      options.php             OAuth passkey login options API
+      verify.php              OAuth passkey login verify API
+  account/
+    index.php                 account dashboard page (PRG)
+    login.php                 account login page (PRG)
+    logout.php                account logout action (PRG)
+    onboard.php               account onboarding page (PRG)
+    change-password.php       change password action (PRG)
+    update-email.php          update email action (PRG)
+    2fa/
+      verify.php              2FA verification code page (PRG)
+      resend.php              2FA code resend action (PRG)
+      set-email.php           2FA email setup page (PRG)
+    device/
+      revoke.php              revoke trusted device action (PRG)
+    passkey/
+      delete.php              delete passkey action (PRG)
+      register/
+        options.php           passkey registration options API
+        verify.php            passkey registration verify API
+      login/
+        options.php           passkey login options API
+        verify.php            passkey login verify API
 cli/
   cleanup_clients.php         housekeeping CLI for dynamic clients and expired tokens
 index.php                     root delegator (CLI -> stdio.php, HTTP -> public/index.php)
@@ -370,6 +409,7 @@ config/
   users.php                   seed users
   oauth.php                   OAuth clients, TTLs, issuer, registration token
 src/
+  bootstrap.php               core bootstrap, container, and security/session helpers
   McpServer.php               MCP core: tool registry, routing, access control, UserContext injection
   UserContext.php             immutable user value object (local() / anonymous() factories, * wildcard)
   Attributes/McpFunction.php  the #[McpFunction(name, description, schema, roles, permissions)] attribute
@@ -384,11 +424,9 @@ src/
     ClientStore.php           OAuth client registry: static config + RFC 7591 dynamic clients
     PasskeyStore.php          WebAuthn passkey credential persistence & counter tracking
     WebAuthn.php              pure-PHP WebAuthn engine (ES256, RS256, CBOR decoding)
-    EmailService.php          zero-dependency SMTP / native mail / log driver email sender
-    TwoFactorService.php      email OTP generation, verification, and trusted device manager
-    OAuthServer.php           OAuth 2.1 AS + PKCE + passkey login + discovery + resolveUser()
-    AccountController.php     /account pages (passkey management, 2FA, change password, login)
-    DebugLog.php              append-only diagnostics log to data/requests.log
+    TwoFactorService.php      email 2FA service and trusted device tracking
+    EmailService.php          email delivery engine (SMTP, log driver)
+    DebugLog.php              append-only diagnostics log
 data/                         runtime-only, gitignored (app.sqlite, memory.sqlite,
                               requests.log, sessions/)
 ```
