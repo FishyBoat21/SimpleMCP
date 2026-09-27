@@ -3,5 +3,6 @@
 CLAUDE.md
 /data/*
 /config/mail.php
+/config/embedding.php
 /config/*.local.php
 /.agents/

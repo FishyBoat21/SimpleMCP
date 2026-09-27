@@ -31,6 +31,11 @@ printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n{"jsonrpc":"
   `read_graph`) plus search, temporal invalidation, entity merging, and graph summaries.
 - **Documents & RAG** — ingest text documents into a per-user chunked store and retrieve them
   with keyword (BM25), semantic, or hybrid (RRF) strategies, optionally fused with graph search.
+- **OpenAI Vector Embeddings** — dense vector embeddings for document chunks and graph observations
+  via standard OpenAI models (`text-embedding-3-small`, `text-embedding-3-large`, `text-embedding-ada-002`).
+  When configured in [config/embedding.php](config/embedding.php), embeddings are automatically generated
+  into `memory_embeddings` with pointers to the original source text file, and semantic search runs
+  fast cosine similarity instead of the character-trigram weighted loop.
 - **Markdown & Image ↔ PDF** — convert Markdown or images to PDF and PDFs back to Markdown or
   images via a Stirling-PDF server; the endpoint and optional API key are set per account on the
   `/account` page (HTTP mode) or globally in [config/config.php](config/config.php) (stdio mode).
@@ -166,8 +171,9 @@ run as the trusted `local` user).
   within that many relation hops (optionally `include_observations`, and `projection` /
   `direction` to shape the result).
 - **Search** — `search_graph(query, search_type, top_k, hops, ...)`: keyword = BM25 over the
-  FTS5 index, semantic = character-trigram similarity with corpus-level IDF weighting
-  (resilient to typos and CJK text that FTS5's tokenizer can't split), hybrid = both fused with
+  FTS5 index, semantic = dense vector embeddings (OpenAI API standard model: `text-embedding-3-small`,
+  `text-embedding-3-large`, `text-embedding-ada-002`) with fast cosine similarity when configured,
+  or zero-dependency character-trigram IDF similarity fallback, hybrid = both fused with
   Reciprocal Rank Fusion. `hops > 0` adds breadth-first graph traversal through up to `hops`
   relation hops from the matches, directed by `direction`.
 - **Graph hygiene** — `merge_entities` collapses duplicates atomically (observations merged,

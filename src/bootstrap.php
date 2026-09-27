@@ -15,6 +15,7 @@ use McpServer\Auth\ClientStore;
 use McpServer\Auth\Database;
 use McpServer\Auth\DebugLog;
 use McpServer\Auth\EmailService;
+use McpServer\Auth\EmbeddingService;
 use McpServer\Auth\PasskeyStore;
 use McpServer\Auth\TokenStore;
 use McpServer\Auth\TwoFactorService;
@@ -50,6 +51,8 @@ class App {
     private static ?McpServer $mcpServer = null;
     private static ?array $oauthConfig = null;
     private static ?array $mailConfig = null;
+    private static ?array $embeddingConfig = null;
+    private static ?EmbeddingService $embeddingService = null;
 
     public static function rootDir(): string {
         return dirname(__DIR__);
@@ -132,6 +135,23 @@ class App {
             self::$mcpServer->registerToolsFromDirectory(self::rootDir() . '/src/Tools', 'McpServer\\Tools\\');
         }
         return self::$mcpServer;
+    }
+
+    public static function embeddingConfig(): array {
+        if (self::$embeddingConfig === null) {
+            $embedFile = self::rootDir() . '/config/embedding.php';
+            self::$embeddingConfig = file_exists($embedFile)
+                ? require $embedFile
+                : (file_exists(self::rootDir() . '/config/embedding.example.php') ? require self::rootDir() . '/config/embedding.example.php' : []);
+        }
+        return self::$embeddingConfig;
+    }
+
+    public static function embeddingService(): EmbeddingService {
+        if (self::$embeddingService === null) {
+            self::$embeddingService = new EmbeddingService(self::embeddingConfig());
+        }
+        return self::$embeddingService;
     }
 }
 

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace McpServer\Auth;
 
+use App;
 use PDO;
 
 /**
@@ -15,20 +16,22 @@ use PDO;
  * memory_chunks, with an FTS5 mirror (memory_chunks_fts) powering BM25 keyword
  * retrieval. Everything is created idempotently on first use.
  *
+ * When OpenAI embedding API is configured (standard embedding model:
+ * text-embedding-3-small, text-embedding-3-large, or text-embedding-ada-002),
+ * dense vector embeddings are automatically generated and stored in
+ * memory_embeddings with pointer references from chunks and to the original
+ * source text file. Semantic retrieval then uses cosine vector similarity
+ * instead of the character-trigram weighted loop.
+ *
  * Every row is scoped to a username, so each user gets an isolated document
  * library, exactly like the per-user graph in MemoryStore. In stdio mode the
  * injected user is the trusted `local` user.
- *
- * Retrieval mirrors the graph's zero-dependency search: keyword = FTS5 BM25,
- * semantic = IDF-weighted character n-gram similarity, hybrid = Reciprocal Rank
- * Fusion of both. Documents carry created/updated metadata but no validity
- * window — document content is not a temporal fact, so there is no as_of /
- * invalidate plumbing here.
  */
 final class DocumentStore {
     private PDO $pdo;
+    private EmbeddingService $embeddingService;
 
-    public function __construct(?string $dbPath = null) {
+    public function __construct(?string $dbPath = null, ?EmbeddingService $embeddingService = null) {
         $dbPath ??= dirname(__DIR__, 2) . '/data/memory.sqlite';
         $dir = dirname($dbPath);
         if (!is_dir($dir)) {
@@ -39,6 +42,8 @@ final class DocumentStore {
         $this->pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
         $this->pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
         $this->pdo->exec('PRAGMA journal_mode = WAL');
+
+        $this->embeddingService = $embeddingService ?? (class_exists(App::class) ? App::embeddingService() : new EmbeddingService());
 
         $this->createSchema();
     }
@@ -61,17 +66,40 @@ final class DocumentStore {
             CREATE INDEX IF NOT EXISTS idx_memory_documents_username ON memory_documents(username);
 
             CREATE TABLE IF NOT EXISTS memory_chunks (
-                id          TEXT NOT NULL,
-                username    TEXT NOT NULL,
-                document_id TEXT NOT NULL,
-                idx         INTEGER NOT NULL,
-                content     TEXT NOT NULL,
-                created_at  INTEGER NOT NULL,
-                updated_at  INTEGER NOT NULL,
+                id           TEXT NOT NULL,
+                username     TEXT NOT NULL,
+                document_id  TEXT NOT NULL,
+                idx          INTEGER NOT NULL,
+                content      TEXT NOT NULL,
+                created_at   INTEGER NOT NULL,
+                updated_at   INTEGER NOT NULL,
+                embedding_id TEXT,
                 PRIMARY KEY (username, id)
             );
 
             CREATE INDEX IF NOT EXISTS idx_memory_chunks_document ON memory_chunks(username, document_id);
+
+            CREATE TABLE IF NOT EXISTS memory_embeddings (
+                id                TEXT PRIMARY KEY,
+                username          TEXT NOT NULL,
+                target_type       TEXT NOT NULL,
+                target_id         TEXT NOT NULL,
+                observation_index INTEGER,
+                document_id       TEXT,
+                source_file       TEXT NOT NULL DEFAULT '',
+                content_hash      TEXT NOT NULL,
+                text_content      TEXT NOT NULL,
+                embedding         BLOB NOT NULL,
+                model             TEXT NOT NULL,
+                dimensions        INTEGER NOT NULL,
+                created_at        INTEGER NOT NULL,
+                updated_at        INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_memory_embeddings_user_type ON memory_embeddings(username, target_type);
+            CREATE INDEX IF NOT EXISTS idx_memory_embeddings_target ON memory_embeddings(username, target_type, target_id);
+            CREATE INDEX IF NOT EXISTS idx_memory_embeddings_doc ON memory_embeddings(username, document_id);
+            CREATE INDEX IF NOT EXISTS idx_memory_embeddings_source ON memory_embeddings(username, source_file);
 
             CREATE VIRTUAL TABLE IF NOT EXISTS memory_chunks_fts USING fts5(
                 username    UNINDEXED,
@@ -80,6 +108,11 @@ final class DocumentStore {
                 content
             );
             SQL);
+
+        $chunkCols = array_column($this->pdo->query('PRAGMA table_info(memory_chunks)')->fetchAll(), 'name');
+        if (!in_array('embedding_id', $chunkCols, true)) {
+            $this->pdo->exec('ALTER TABLE memory_chunks ADD COLUMN embedding_id TEXT');
+        }
 
         // A database created before the FTS index existed has chunks but no
         // index entries: rebuild once so keyword search covers pre-existing data.
@@ -249,16 +282,65 @@ final class DocumentStore {
             ':updated_at' => $now,
         ]);
 
-        // Replace the old chunk set (and its FTS mirror) with the new one.
+        // Replace the old chunk set (and its FTS mirror + vector embeddings) with the new one.
         $this->deleteChunks($username, $id);
 
         $chunkIds = [];
+        $chunkTexts = [];
+        foreach ($chunks as $idx => $text) {
+            $chunkIds[] = $id . '#' . $idx;
+            $chunkTexts[] = $text;
+        }
+
+        // Automatic dense vector embedding generation when OpenAI embedding API is configured
+        $embeddings = [];
+        if ($this->embeddingService->isConfigured()) {
+            $embeddings = $this->embeddingService->embed($chunkTexts);
+        }
+
+        $sourceFile = (string) ($params['source'] ?? '') !== '' ? (string) $params['source'] : $filename;
+        $model = $this->embeddingService->getModel();
+        $embStmt = $this->pdo->prepare(
+            'INSERT INTO memory_embeddings (id, username, target_type, target_id, observation_index, document_id, source_file, content_hash, text_content, embedding, model, dimensions, created_at, updated_at)
+             VALUES (:id, :username, :target_type, :target_id, :obs_idx, :doc_id, :source_file, :hash, :text, :embedding, :model, :dims, :created_at, :updated_at)
+             ON CONFLICT(id) DO UPDATE SET
+                 source_file  = excluded.source_file,
+                 content_hash = excluded.content_hash,
+                 text_content = excluded.text_content,
+                 embedding    = excluded.embedding,
+                 model        = excluded.model,
+                 dimensions   = excluded.dimensions,
+                 updated_at   = excluded.updated_at'
+        );
+
         $stmt = $this->pdo->prepare(
-            'INSERT INTO memory_chunks (id, username, document_id, idx, content, created_at, updated_at)
-             VALUES (:id, :username, :document_id, :idx, :content, :created_at, :updated_at)'
+            'INSERT INTO memory_chunks (id, username, document_id, idx, content, created_at, updated_at, embedding_id)
+             VALUES (:id, :username, :document_id, :idx, :content, :created_at, :updated_at, :embedding_id)'
         );
         foreach ($chunks as $idx => $text) {
-            $chunkId = $id . '#' . $idx;
+            $chunkId = $chunkIds[$idx];
+            $embId = null;
+            if (isset($embeddings[$idx]) && is_array($embeddings[$idx]) && $embeddings[$idx] !== []) {
+                $embId = 'chunk:' . $chunkId;
+                $embBlob = EmbeddingService::packVector($embeddings[$idx]);
+                $embStmt->execute([
+                    ':id' => $embId,
+                    ':username' => $username,
+                    ':target_type' => 'chunk',
+                    ':target_id' => $chunkId,
+                    ':obs_idx' => null,
+                    ':doc_id' => $id,
+                    ':source_file' => $sourceFile,
+                    ':hash' => hash('sha256', $text),
+                    ':text' => $text,
+                    ':embedding' => $embBlob,
+                    ':model' => $model,
+                    ':dims' => count($embeddings[$idx]),
+                    ':created_at' => $now,
+                    ':updated_at' => $now,
+                ]);
+            }
+
             $stmt->execute([
                 ':id' => $chunkId,
                 ':username' => $username,
@@ -267,9 +349,9 @@ final class DocumentStore {
                 ':content' => $text,
                 ':created_at' => $now,
                 ':updated_at' => $now,
+                ':embedding_id' => $embId,
             ]);
             $this->syncFtsRow($username, $chunkId);
-            $chunkIds[] = $chunkId;
         }
 
         return [
@@ -493,11 +575,71 @@ final class DocumentStore {
 
     /**
      * @return array<int, array{id: string, score: float}> chunks by semantic
-     *         similarity, best first. Same zero-dependency character-trigram
-     *         approach as MemoryStore::semanticSearch, applied over chunk
-     *         content with corpus-level IDF weighting.
+     *         similarity, best first. When OpenAI embedding API is configured,
+     *         dense vector embeddings and cosine similarity are used (no trigram loop).
+     *         Falls back to zero-dependency character-trigram similarity with
+     *         corpus-level IDF weighting.
      */
     private function semanticSearch(string $username, string $query, ?string $documentId): array {
+        if ($this->embeddingService->isConfigured()) {
+            $vectorResults = $this->vectorSemanticSearch($username, $query, $documentId);
+            if ($vectorResults !== null) {
+                return $vectorResults;
+            }
+        }
+
+        return $this->trigramSemanticSearch($username, $query, $documentId);
+    }
+
+    /**
+     * Dense vector semantic search using OpenAI embeddings and cosine similarity.
+     * Replaces the character-trigram loop with vector similarity when configured.
+     *
+     * @return array<int, array{id: string, score: float}>|null
+     */
+    private function vectorSemanticSearch(string $username, string $query, ?string $documentId): ?array {
+        $qVectors = $this->embeddingService->embed($query);
+        if ($qVectors === [] || !isset($qVectors[0]) || !is_array($qVectors[0])) {
+            return null;
+        }
+        $queryVector = $qVectors[0];
+
+        // Ensure missing embeddings are backfilled if any exist
+        $this->syncMissingChunkEmbeddings($username);
+
+        $sql = 'SELECT target_id, embedding FROM memory_embeddings WHERE username = :username AND target_type = :target_type';
+        $params = [':username' => $username, ':target_type' => 'chunk'];
+        if ($documentId !== null) {
+            $sql .= ' AND document_id = :document_id';
+            $params[':document_id'] = $documentId;
+        }
+
+        $stmt = $this->pdo->prepare($sql);
+        $stmt->execute($params);
+
+        $scored = [];
+        while ($row = $stmt->fetch()) {
+            $blob = $row['embedding'];
+            if (!is_string($blob) || $blob === '') {
+                continue;
+            }
+            $chunkVector = EmbeddingService::unpackVector($blob);
+            $score = EmbeddingService::cosineSimilarity($queryVector, $chunkVector);
+            if ($score >= 0.20) {
+                $scored[] = ['id' => (string) $row['target_id'], 'score' => round($score, 4)];
+            }
+        }
+
+        usort($scored, static fn(array $a, array $b): int => $b['score'] <=> $a['score'] ?: strcmp($a['id'], $b['id']));
+        return $scored;
+    }
+
+    /**
+     * Fallback trigram semantic search ("triweigh loop") when embeddings are not configured.
+     *
+     * @return array<int, array{id: string, score: float}>
+     */
+    private function trigramSemanticSearch(string $username, string $query, ?string $documentId): array {
         $qGrams = $this->nGramSet($query);
         if ($qGrams === []) {
             return [];
@@ -544,6 +686,83 @@ final class DocumentStore {
         }
         usort($scored, static fn(array $a, array $b): int => $b['score'] <=> $a['score'] ?: strcmp($a['id'], $b['id']));
         return $scored;
+    }
+
+    /**
+     * Automatically backfill vector embeddings for any chunks missing an embedding.
+     *
+     * @return int Number of chunks embedded
+     */
+    public function syncMissingChunkEmbeddings(string $username): int {
+        if (!$this->embeddingService->isConfigured()) {
+            return 0;
+        }
+
+        $stmt = $this->pdo->prepare(
+            'SELECT c.id, c.content, c.document_id, d.filename, d.source
+             FROM memory_chunks c
+             LEFT JOIN memory_documents d ON c.username = d.username AND c.document_id = d.id
+             LEFT JOIN memory_embeddings e ON c.username = e.username AND e.target_type = "chunk" AND e.target_id = c.id
+             WHERE c.username = :username AND e.id IS NULL'
+        );
+        $stmt->execute([':username' => $username]);
+        $rows = $stmt->fetchAll();
+        if ($rows === []) {
+            return 0;
+        }
+
+        $count = 0;
+        $now = time();
+        $model = $this->embeddingService->getModel();
+        $batches = array_chunk($rows, 50);
+
+        $embStmt = $this->pdo->prepare(
+            'INSERT INTO memory_embeddings (id, username, target_type, target_id, observation_index, document_id, source_file, content_hash, text_content, embedding, model, dimensions, created_at, updated_at)
+             VALUES (:id, :username, :target_type, :target_id, :obs_idx, :doc_id, :source_file, :hash, :text, :embedding, :model, :dims, :created_at, :updated_at)
+             ON CONFLICT(id) DO UPDATE SET
+                 source_file  = excluded.source_file,
+                 content_hash = excluded.content_hash,
+                 text_content = excluded.text_content,
+                 embedding    = excluded.embedding,
+                 model        = excluded.model,
+                 dimensions   = excluded.dimensions,
+                 updated_at   = excluded.updated_at'
+        );
+        $updChunk = $this->pdo->prepare('UPDATE memory_chunks SET embedding_id = :emb_id WHERE username = :username AND id = :id');
+
+        foreach ($batches as $batch) {
+            $texts = array_column($batch, 'content');
+            $vectors = $this->embeddingService->embed($texts);
+            foreach ($batch as $i => $row) {
+                if (!isset($vectors[$i]) || !is_array($vectors[$i])) {
+                    continue;
+                }
+                $chunkId = (string) $row['id'];
+                $embId = 'chunk:' . $chunkId;
+                $embBlob = EmbeddingService::packVector($vectors[$i]);
+                $sourceFile = (string) ($row['source'] ?? '') !== '' ? (string) $row['source'] : (string) ($row['filename'] ?? '');
+
+                $embStmt->execute([
+                    ':id' => $embId,
+                    ':username' => $username,
+                    ':target_type' => 'chunk',
+                    ':target_id' => $chunkId,
+                    ':obs_idx' => null,
+                    ':doc_id' => $row['document_id'],
+                    ':source_file' => $sourceFile,
+                    ':hash' => hash('sha256', (string) $row['content']),
+                    ':text' => (string) $row['content'],
+                    ':embedding' => $embBlob,
+                    ':model' => $model,
+                    ':dims' => count($vectors[$i]),
+                    ':created_at' => $now,
+                    ':updated_at' => $now,
+                ]);
+                $updChunk->execute([':emb_id' => $embId, ':username' => $username, ':id' => $chunkId]);
+                $count++;
+            }
+        }
+        return $count;
     }
 
     /**
@@ -640,11 +859,13 @@ final class DocumentStore {
         return $row !== false ? $row : null;
     }
 
-    /** Delete every chunk (and its FTS mirror) belonging to a document. */
+    /** Delete every chunk (and its FTS mirror + vector embeddings) belonging to a document. */
     private function deleteChunks(string $username, string $documentId): void {
         $this->pdo->prepare('DELETE FROM memory_chunks_fts WHERE username = :username AND document_id = :document_id')
             ->execute([':username' => $username, ':document_id' => $documentId]);
         $this->pdo->prepare('DELETE FROM memory_chunks WHERE username = :username AND document_id = :document_id')
+            ->execute([':username' => $username, ':document_id' => $documentId]);
+        $this->pdo->prepare('DELETE FROM memory_embeddings WHERE username = :username AND target_type = "chunk" AND document_id = :document_id')
             ->execute([':username' => $username, ':document_id' => $documentId]);
     }
 
