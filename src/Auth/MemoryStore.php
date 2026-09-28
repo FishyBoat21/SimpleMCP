@@ -71,6 +71,7 @@ final class MemoryStore {
         $this->embeddingService = $embeddingService ?? (class_exists(App::class) ? App::embeddingService() : new EmbeddingService());
 
         $this->createSchema();
+        EmbeddingIdentity::migrate($this->pdo);
     }
 
     private function createSchema(): void {
@@ -2476,7 +2477,7 @@ final class MemoryStore {
         $vectorIdx = 0;
         $pointers = [];
         foreach ($obsList as $idx => $text) {
-            $embId = 'obs:' . $id . '#' . $idx;
+            $embId = EmbeddingIdentity::observation($username, $id, $idx);
             $pointers[] = $embId;
             $embedText = str_starts_with((string) $text, $prefix) ? (string) $text : $prefix . (string) $text;
             $hash = hash('sha256', $embedText);
@@ -2598,7 +2599,7 @@ final class MemoryStore {
                 $totalObsCount++;
                 $embedText = str_starts_with((string) $text, $prefix) ? (string) $text : $prefix . (string) $text;
                 $hash = hash('sha256', $embedText);
-                $embId = 'obs:' . $id . '#' . $idx;
+                $embId = EmbeddingIdentity::observation($username, $id, $idx);
                 $entityObsMap[$id]['pointers'][] = $embId;
 
                 if ($force || !isset($existing[$id][$idx]) || $existing[$id][$idx] !== $hash) {

@@ -46,6 +46,7 @@ final class DocumentStore {
         $this->embeddingService = $embeddingService ?? (class_exists(App::class) ? App::embeddingService() : new EmbeddingService());
 
         $this->createSchema();
+        EmbeddingIdentity::migrate($this->pdo);
     }
 
     private function createSchema(): void {
@@ -260,31 +261,6 @@ final class DocumentStore {
         $existing = $this->findDocument($username, $id);
         $now = time();
 
-        $this->pdo->prepare(
-            'INSERT INTO memory_documents (id, username, filename, title, source, format, chunk_count, created_at, updated_at)
-             VALUES (:id, :username, :filename, :title, :source, :format, :chunk_count, :created_at, :updated_at)
-             ON CONFLICT (username, id) DO UPDATE SET
-                 filename  = excluded.filename,
-                 title     = excluded.title,
-                 source    = excluded.source,
-                 format    = excluded.format,
-                 chunk_count = excluded.chunk_count,
-                 updated_at = excluded.updated_at'
-        )->execute([
-            ':id' => $id,
-            ':username' => $username,
-            ':filename' => $filename,
-            ':title' => (string) ($params['title'] ?? ''),
-            ':source' => (string) ($params['source'] ?? ''),
-            ':format' => $format,
-            ':chunk_count' => count($chunks),
-            ':created_at' => $now,
-            ':updated_at' => $now,
-        ]);
-
-        // Replace the old chunk set (and its FTS mirror + vector embeddings) with the new one.
-        $this->deleteChunks($username, $id);
-
         $chunkIds = [];
         $chunkTexts = [];
         foreach ($chunks as $idx => $text) {
@@ -292,65 +268,97 @@ final class DocumentStore {
             $chunkTexts[] = $text;
         }
 
-        // Automatic dense vector embedding generation when OpenAI embedding API is configured
+        // External embedding calls finish before any document rows are changed.
         $embeddings = [];
         if ($this->embeddingService->isConfigured()) {
             $embeddings = $this->embeddingService->embed($chunkTexts);
         }
 
-        $sourceFile = (string) ($params['source'] ?? '') !== '' ? (string) $params['source'] : $filename;
-        $model = $this->embeddingService->getModel();
-        $embStmt = $this->pdo->prepare(
-            'INSERT INTO memory_embeddings (id, username, target_type, target_id, observation_index, document_id, source_file, content_hash, text_content, embedding, model, dimensions, created_at, updated_at)
-             VALUES (:id, :username, :target_type, :target_id, :obs_idx, :doc_id, :source_file, :hash, :text, :embedding, :model, :dims, :created_at, :updated_at)
-             ON CONFLICT(id) DO UPDATE SET
-                 source_file  = excluded.source_file,
-                 content_hash = excluded.content_hash,
-                 text_content = excluded.text_content,
-                 embedding    = excluded.embedding,
-                 model        = excluded.model,
-                 dimensions   = excluded.dimensions,
-                 updated_at   = excluded.updated_at'
-        );
-
-        $stmt = $this->pdo->prepare(
-            'INSERT INTO memory_chunks (id, username, document_id, idx, content, created_at, updated_at, embedding_id)
-             VALUES (:id, :username, :document_id, :idx, :content, :created_at, :updated_at, :embedding_id)'
-        );
-        foreach ($chunks as $idx => $text) {
-            $chunkId = $chunkIds[$idx];
-            $embId = null;
-            if (isset($embeddings[$idx]) && is_array($embeddings[$idx]) && $embeddings[$idx] !== []) {
-                $embId = 'chunk:' . $chunkId;
-                $embBlob = EmbeddingService::packVector($embeddings[$idx]);
-                $embStmt->bindValue(':id', $embId);
-                $embStmt->bindValue(':username', $username);
-                $embStmt->bindValue(':target_type', 'chunk');
-                $embStmt->bindValue(':target_id', $chunkId);
-                $embStmt->bindValue(':obs_idx', null, PDO::PARAM_NULL);
-                $embStmt->bindValue(':doc_id', $id);
-                $embStmt->bindValue(':source_file', $sourceFile);
-                $embStmt->bindValue(':hash', hash('sha256', $text));
-                $embStmt->bindValue(':text', $text);
-                $embStmt->bindValue(':embedding', $embBlob, PDO::PARAM_LOB);
-                $embStmt->bindValue(':model', $model);
-                $embStmt->bindValue(':dims', count($embeddings[$idx]), PDO::PARAM_INT);
-                $embStmt->bindValue(':created_at', $now, PDO::PARAM_INT);
-                $embStmt->bindValue(':updated_at', $now, PDO::PARAM_INT);
-                $embStmt->execute();
-            }
-
-            $stmt->execute([
-                ':id' => $chunkId,
+        $this->pdo->beginTransaction();
+        try {
+            $this->pdo->prepare(
+                'INSERT INTO memory_documents (id, username, filename, title, source, format, chunk_count, created_at, updated_at)
+                 VALUES (:id, :username, :filename, :title, :source, :format, :chunk_count, :created_at, :updated_at)
+                 ON CONFLICT (username, id) DO UPDATE SET
+                     filename  = excluded.filename,
+                     title     = excluded.title,
+                     source    = excluded.source,
+                     format    = excluded.format,
+                     chunk_count = excluded.chunk_count,
+                     updated_at = excluded.updated_at'
+            )->execute([
+                ':id' => $id,
                 ':username' => $username,
-                ':document_id' => $id,
-                ':idx' => $idx,
-                ':content' => $text,
+                ':filename' => $filename,
+                ':title' => (string) ($params['title'] ?? ''),
+                ':source' => (string) ($params['source'] ?? ''),
+                ':format' => $format,
+                ':chunk_count' => count($chunks),
                 ':created_at' => $now,
                 ':updated_at' => $now,
-                ':embedding_id' => $embId,
             ]);
-            $this->syncFtsRow($username, $chunkId);
+
+            // Replace the old chunk set (and its FTS mirror + vector embeddings) with the new one.
+            $this->deleteChunks($username, $id);
+
+            $sourceFile = (string) ($params['source'] ?? '') !== '' ? (string) $params['source'] : $filename;
+            $model = $this->embeddingService->getModel();
+            $embStmt = $this->pdo->prepare(
+                'INSERT INTO memory_embeddings (id, username, target_type, target_id, observation_index, document_id, source_file, content_hash, text_content, embedding, model, dimensions, created_at, updated_at)
+                 VALUES (:id, :username, :target_type, :target_id, :obs_idx, :doc_id, :source_file, :hash, :text, :embedding, :model, :dims, :created_at, :updated_at)
+                 ON CONFLICT(id) DO UPDATE SET
+                     source_file  = excluded.source_file,
+                     content_hash = excluded.content_hash,
+                     text_content = excluded.text_content,
+                     embedding    = excluded.embedding,
+                     model        = excluded.model,
+                     dimensions   = excluded.dimensions,
+                     updated_at   = excluded.updated_at'
+            );
+
+            $stmt = $this->pdo->prepare(
+                'INSERT INTO memory_chunks (id, username, document_id, idx, content, created_at, updated_at, embedding_id)
+                 VALUES (:id, :username, :document_id, :idx, :content, :created_at, :updated_at, :embedding_id)'
+            );
+            foreach ($chunks as $idx => $text) {
+                $chunkId = $chunkIds[$idx];
+                $embId = null;
+                if (isset($embeddings[$idx]) && is_array($embeddings[$idx]) && $embeddings[$idx] !== []) {
+                    $embId = EmbeddingIdentity::chunk($username, $chunkId);
+                    $embBlob = EmbeddingService::packVector($embeddings[$idx]);
+                    $embStmt->bindValue(':id', $embId);
+                    $embStmt->bindValue(':username', $username);
+                    $embStmt->bindValue(':target_type', 'chunk');
+                    $embStmt->bindValue(':target_id', $chunkId);
+                    $embStmt->bindValue(':obs_idx', null, PDO::PARAM_NULL);
+                    $embStmt->bindValue(':doc_id', $id);
+                    $embStmt->bindValue(':source_file', $sourceFile);
+                    $embStmt->bindValue(':hash', hash('sha256', $text));
+                    $embStmt->bindValue(':text', $text);
+                    $embStmt->bindValue(':embedding', $embBlob, PDO::PARAM_LOB);
+                    $embStmt->bindValue(':model', $model);
+                    $embStmt->bindValue(':dims', count($embeddings[$idx]), PDO::PARAM_INT);
+                    $embStmt->bindValue(':created_at', $now, PDO::PARAM_INT);
+                    $embStmt->bindValue(':updated_at', $now, PDO::PARAM_INT);
+                    $embStmt->execute();
+                }
+
+                $stmt->execute([
+                    ':id' => $chunkId,
+                    ':username' => $username,
+                    ':document_id' => $id,
+                    ':idx' => $idx,
+                    ':content' => $text,
+                    ':created_at' => $now,
+                    ':updated_at' => $now,
+                    ':embedding_id' => $embId,
+                ]);
+                $this->syncFtsRow($username, $chunkId);
+            }
+            $this->pdo->commit();
+        } catch (\Throwable $e) {
+            $this->pdo->rollBack();
+            throw $e;
         }
 
         return [
@@ -782,7 +790,7 @@ final class DocumentStore {
                         continue;
                     }
                     $chunkId = (string) $row['id'];
-                    $embId = 'chunk:' . $chunkId;
+                    $embId = EmbeddingIdentity::chunk($username, $chunkId);
                     $embBlob = EmbeddingService::packVector($vectors[$i]);
                     $sourceFile = (string) ($row['source'] ?? '') !== '' ? (string) $row['source'] : (string) ($row['filename'] ?? '');
 
