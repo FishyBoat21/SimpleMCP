@@ -14,9 +14,12 @@ printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n{"jsonrpc":"
 
 - **MCP protocol** — `initialize`, `tools/list`, `tools/call`, `notifications/initialized`
   (protocol version `2024-11-05`).
-- **Two transports** from a single entry point:
+- **Three transports** from a single entry point:
   - **stdio** — line-delimited JSON-RPC over stdin/stdout, how MCP clients launch the server.
-  - **HTTP** — Streamable HTTP transport with optional `Mcp-Session-Id` handling.
+  - **Streamable HTTP** — direct JSON-RPC POST (`/` or `/mcp`) with optional `Mcp-Session-Id` handling.
+  - **SSE MCP (Server-Sent Events)** — standard MCP SSE stream (`GET /sse`) with message receiver (`POST /message?sessionId=...`).
+- **File-per-Page (PRG pattern)** — each web page is a dedicated file that strictly follows the Post/Redirect/Get pattern with flash messages to prevent form re-submissions.
+- **Standalone File-per-API** — every API endpoint (OAuth token, client registration, passkey options/verify, discovery metadata, MCP JSON-RPC, and SSE) lives in its own standalone script.
 - **Attribute-based tools** — drop a class in [src/Tools/](src/Tools/) with `#[McpFunction]`
   methods and it is auto-discovered; no manual registration.
 - **Per-tool access control** — tools declare required `roles` / `permissions`; unauthorized
@@ -28,13 +31,20 @@ printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n{"jsonrpc":"
   `read_graph`) plus search, temporal invalidation, entity merging, and graph summaries.
 - **Documents & RAG** — ingest text documents into a per-user chunked store and retrieve them
   with keyword (BM25), semantic, or hybrid (RRF) strategies, optionally fused with graph search.
+- **OpenAI Vector Embeddings** — dense vector embeddings for document chunks and graph observations
+  via standard OpenAI models (`text-embedding-3-small`, `text-embedding-3-large`, `text-embedding-ada-002`).
+  When configured in [config/embedding.php](config/embedding.php), embeddings are automatically generated
+  into `memory_embeddings` with pointers to the original source text file, and semantic search runs
+  fast cosine similarity instead of the character-trigram weighted loop.
 - **Markdown & Image ↔ PDF** — convert Markdown or images to PDF and PDFs back to Markdown or
   images via a Stirling-PDF server; the endpoint and optional API key are set per account on the
   `/account` page (HTTP mode) or globally in [config/config.php](config/config.php) (stdio mode).
 - **Self-hosted OAuth 2.1** — interactive login page, token endpoint, RFC 7591 dynamic
   client registration, RFC 8414 / RFC 9728 discovery. Tokens are sha256-hashed at rest.
-- **User management page** (`/account`) — login, public onboarding, change password, logout.
-- **SQLite storage** — users, OAuth clients, and tokens in `data/app.sqlite` (gitignored),
+- **WebAuthn Passkeys** — passwordless biometric and hardware security key logins (FIDO2 / WebAuthn).
+- **Email Two-Factor Authentication (2FA)** — 6-digit OTP verification for new devices, with trusted device cookies (90-day persistence) and zero external dependencies. Copy [config/mail.example.php](config/mail.example.php) to `config/mail.php` to configure SMTP or log driver.
+- **User management page** (`/account`) — login, public onboarding, change password, passkey registration, email management, trusted devices, and logout.
+- **SQLite storage** — users, OAuth clients, passkeys, trusted devices, and tokens in `data/app.sqlite` (gitignored),
   seeded from [config/users.php](config/users.php) on first run; the knowledge graph and
   document store live in their own `data/memory.sqlite`.
 - **No dependencies** — `composer.json` declares only `php >= 8.4`.
@@ -47,14 +57,14 @@ printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n{"jsonrpc":"
 
 ### stdio mode (MCP clients)
 
-MCP clients launch the server directly. A typical client config:
+MCP clients launch the dedicated stdio script directly:
 
 ```json
 {
   "mcpServers": {
     "simplemcp": {
       "command": "php",
-      "args": ["D:\\Project\\SimpleMCP\\index.php"]
+      "args": ["D:\\Project\\SimpleMCP\\stdio.php"]
     }
   }
 }
@@ -63,18 +73,23 @@ MCP clients launch the server directly. A typical client config:
 Smoke test:
 
 ```sh
-printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n' | php index.php
+printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n' | php stdio.php
 ```
 
-### HTTP mode (OAuth + browser login)
+### HTTP mode (Isolated Document Root & Public Deployment)
+
+For local development:
 
 ```sh
-php -S localhost:8000 index.php
+php -S localhost:8000 -t public/
 ```
 
-`index.php` must be the router script so `data/` is never served statically. The server then
-exposes the OAuth endpoints, the `/account` page, and the MCP JSON-RPC endpoint (everything
-else).
+For production/public web servers (Nginx/Apache/Caddy):
+- Point your web server document root to the `public/` directory.
+- This isolates `data/` (SQLite databases, logs, sessions) and `config/` completely outside the web root.
+- All HTTP responses carry security headers (`X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`).
+- Cookies are hardened (`HttpOnly`, `SameSite=Lax`, and `Secure` on HTTPS).
+- Configure a canonical `issuer` in `config/oauth.php` to prevent Host-header poisoning.
 
 ## Included tools
 
@@ -156,8 +171,9 @@ run as the trusted `local` user).
   within that many relation hops (optionally `include_observations`, and `projection` /
   `direction` to shape the result).
 - **Search** — `search_graph(query, search_type, top_k, hops, ...)`: keyword = BM25 over the
-  FTS5 index, semantic = character-trigram similarity with corpus-level IDF weighting
-  (resilient to typos and CJK text that FTS5's tokenizer can't split), hybrid = both fused with
+  FTS5 index, semantic = dense vector embeddings (OpenAI API standard model: `text-embedding-3-small`,
+  `text-embedding-3-large`, `text-embedding-ada-002`) with fast cosine similarity when configured,
+  or zero-dependency character-trigram IDF similarity fallback, hybrid = both fused with
   Reciprocal Rank Fusion. `hops > 0` adds breadth-first graph traversal through up to `hops`
   relation hops from the matches, directed by `direction`.
 - **Graph hygiene** — `merge_entities` collapses duplicates atomically (observations merged,
@@ -324,37 +340,100 @@ OAuth handshake when `client_secret_basic` is offered, so DCR-registered clients
   client/redirect/PKCE) and exchange the resulting code normally; the client connects but
   only sees/calls public tools.
 
+### Passkey (WebAuthn / FIDO2) Authentication
+
+Users can log in passwordlessly with biometrics (Touch ID, Face ID, Windows Hello) or physical security keys (YubiKey):
+- **Registration**: Log into `/account` and click **"Add Passkey"**. The browser triggers `navigator.credentials.create()` and saves the public key in SQLite.
+- **Login**: Both `/account/login` and `/oauth/authorize` support **"Sign in with Passkey"** and browser WebAuthn Conditional UI (autofill).
+- **OAuth 2.1 Compatibility**: When an MCP client triggers the OAuth flow, the user authenticates with their passkey in the browser, and the server automatically issues the authorization code back to the MCP client.
+
+### Client & Token Housekeeping CLI
+
+SimpleMCP supports Dynamic Client Registration (RFC 7591) while keeping the database clean via a CLI housekeeping tool:
+
+```sh
+# View dynamically registered clients and expired token stats
+php cli/cleanup_clients.php
+
+# Prune expired tokens and inactive dynamic clients (older than 30 days)
+php cli/cleanup_clients.php --prune
+
+# Custom threshold (e.g. 7 days) or dry run
+php cli/cleanup_clients.php --prune --days=7 --dry-run
+```
+
 ## Configuration
 
-- **[config/users.php](config/users.php)** — seed users. `password` is a bcrypt hash (generate
-  with `php -r 'echo password_hash("pw", PASSWORD_BCRYPT);'`); a plaintext value is accepted
-  as a dev fallback. `status: 'pending'` (or a missing password) marks a user for onboarding.
-- **[config/oauth.php](config/oauth.php)** — OAuth clients, token/code TTLs, whether plain
-  PKCE is allowed, and an optional `registration_access_token` protecting `/oauth/register`.
+- **[config/users.php](config/users.php)** — seed users. `password` is a bcrypt hash; `status: 'pending'` marks a user for onboarding.
+- **[config/oauth.php](config/oauth.php)** — OAuth clients, token/code TTLs, `registration_access_token`, and canonical `issuer` for public deployment.
 
 ## Project structure
 
 ```
-index.php                     entry point — stdio loop, or HTTP router + auth bootstrap
+stdio.php                     dedicated stdio JSON-RPC loop for MCP clients
+public/
+  index.php                   front controller / clean URL router
+  bootstrap.php               shared bootstrap entry point
+  layout.php                  shared modern UI layout with flash message support
+  mcp.php                     standalone Streamable HTTP MCP JSON-RPC API
+  sse.php                     standalone Server-Sent Events (SSE) MCP stream
+  message.php                 standalone MCP SSE message receiver API
+  .well-known/
+    oauth-authorization-server.php  RFC 8414 discovery metadata API
+    oauth-protected-resource.php    RFC 9728 discovery metadata API
+  oauth/
+    authorize.php             OAuth 2.1 authorization consent & login page (PRG)
+    token.php                 OAuth 2.1 token endpoint API
+    register.php              RFC 7591 dynamic client registration API
+    passkey/
+      options.php             OAuth passkey login options API
+      verify.php              OAuth passkey login verify API
+  account/
+    index.php                 account dashboard page (PRG)
+    login.php                 account login page (PRG)
+    logout.php                account logout action (PRG)
+    onboard.php               account onboarding page (PRG)
+    change-password.php       change password action (PRG)
+    update-email.php          update email action (PRG)
+    2fa/
+      verify.php              2FA verification code page (PRG)
+      resend.php              2FA code resend action (PRG)
+      set-email.php           2FA email setup page (PRG)
+    device/
+      revoke.php              revoke trusted device action (PRG)
+    passkey/
+      delete.php              delete passkey action (PRG)
+      register/
+        options.php           passkey registration options API
+        verify.php            passkey registration verify API
+      login/
+        options.php           passkey login options API
+        verify.php            passkey login verify API
+cli/
+  cleanup_clients.php         housekeeping CLI for dynamic clients and expired tokens
+index.php                     root delegator (CLI -> stdio.php, HTTP -> public/index.php)
 config/
   users.php                   seed users
-  oauth.php                   OAuth clients, TTLs, registration token
+  oauth.php                   OAuth clients, TTLs, issuer, registration token
 src/
+  bootstrap.php               core bootstrap, container, and security/session helpers
   McpServer.php               MCP core: tool registry, routing, access control, UserContext injection
   UserContext.php             immutable user value object (local() / anonymous() factories, * wildcard)
   Attributes/McpFunction.php  the #[McpFunction(name, description, schema, roles, permissions)] attribute
   Tools/                      auto-discovered tool classes (CalculatorTool, AdminTool,
                               MemoryTool, KnowledgeBaseTool, ...)
   Auth/
-    Database.php              SQLite bootstrap + idempotent schema + user seeding
-    UserStore.php             DB-backed accounts: auth, onboarding, change password
+    Database.php              SQLite bootstrap + schema (users, clients, tokens, passkeys, 2FA)
+    UserStore.php             DB-backed accounts: auth, onboarding, change password, email
     MemoryStore.php           per-user knowledge graph + FTS5 search (data/memory.sqlite)
     DocumentStore.php         per-user chunked document store + RAG retrieval
     TokenStore.php            OAuth codes/access/refresh tokens (sha256-hashed, single-use, rotating)
     ClientStore.php           OAuth client registry: static config + RFC 7591 dynamic clients
-    OAuthServer.php           authorize/token/register/discovery + resolveUser()
-    AccountController.php     /account user-management pages (native sessions + CSRF)
-    DebugLog.php              append-only diagnostics log to data/requests.log
+    PasskeyStore.php          WebAuthn passkey credential persistence & counter tracking
+    WebAuthn.php              pure-PHP WebAuthn engine (ES256, RS256, CBOR decoding)
+    TwoFactorService.php      email 2FA service and trusted device tracking
+    EmailService.php          email delivery engine (SMTP, log driver)
+    DebugLog.php              append-only diagnostics log
 data/                         runtime-only, gitignored (app.sqlite, memory.sqlite,
                               requests.log, sessions/)
 ```
@@ -383,4 +462,4 @@ data/                         runtime-only, gitignored (app.sqlite, memory.sqlit
 
 ## License
 
-Not specified.
+This project is licensed under the [MIT License](LICENSE).

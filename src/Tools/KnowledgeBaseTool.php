@@ -70,7 +70,7 @@ readonly class KnowledgeBaseTool {
     #[McpFunction(
         name: 'retrieve',
         roles: self::REQUIRED_ROLES,
-        description: 'Retrieve the most relevant document chunks for a query (RAG retrieval). keyword = BM25 via the SQLite FTS5 index; semantic = fuzzy character n-gram similarity (resilient to typos and CJK text); hybrid = both fused with Reciprocal Rank Fusion (default). Pass document_id to scope retrieval to one document, and include_graph to also fuse matching knowledge-graph entities into the result under an "entities" key.',
+        description: 'Retrieve the most relevant document chunks for a query (RAG retrieval). keyword = BM25 via the SQLite FTS5 index; semantic = dense vector embeddings (OpenAI) when configured, or fuzzy character n-gram similarity fallback; hybrid = both fused with Reciprocal Rank Fusion (default). Pass document_id to scope retrieval to one document, and include_graph to also fuse matching knowledge-graph entities into the result under an "entities" key.',
         schema: [
             'type' => 'object',
             'properties' => [

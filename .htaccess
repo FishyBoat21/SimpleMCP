@@ -1,0 +1,14 @@
+# SimpleMCP Root .htaccess
+# Redirect and rewrite all incoming web requests to the public/ directory.
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+
+    # Block direct access to internal directories and hidden files
+    RewriteRule ^(\.git|\.agents|config|data|cli|src|vendor)(\/|$) - [F,L,NC]
+    RewriteRule \.(sqlite|log|json|lock|md|example)$ - [F,L,NC]
+
+    # Rewrite all traffic to the public/ directory
+    RewriteCond %{REQUEST_URI} !^/public/
+    RewriteRule ^(.*)$ public/$1 [L]
+</IfModule>

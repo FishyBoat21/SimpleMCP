@@ -402,7 +402,7 @@ readonly class MemoryTool {
     #[McpFunction(
         name: 'search_graph',
         roles: self::REQUIRED_ROLES,
-        description: 'Search the knowledge graph. keyword = BM25 via a built-in SQLite FTS5 index; semantic = fuzzy character n-gram similarity (a zero-dependency stand-in for embeddings, resilient to typos and CJK text); hybrid = both fused with Reciprocal Rank Fusion. When hops > 0, results are expanded by breadth-first traversal through up to `hops` relation hops from the matched entities. Only facts valid at `as_of` are searched.',
+        description: 'Search the knowledge graph. keyword = BM25 via a built-in SQLite FTS5 index; semantic = dense vector embeddings (OpenAI) over observations when configured, or fuzzy character n-gram similarity fallback; hybrid = both fused with Reciprocal Rank Fusion. When hops > 0, results are expanded by breadth-first traversal through up to `hops` relation hops from the matched entities. Only facts valid at `as_of` are searched.',
         schema: [
             'type' => 'object',
             'properties' => [

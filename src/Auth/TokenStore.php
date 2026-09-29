@@ -158,6 +158,34 @@ final class TokenStore {
         }
     }
 
+    /**
+     * Delete expired authorization codes, access tokens, and refresh tokens.
+     *
+     * @return array{codes: int, access_tokens: int, refresh_tokens: int}
+     */
+    public function pruneExpired(): array {
+        $now = time();
+        $pdo = $this->db->pdo();
+
+        $c1 = $pdo->prepare('DELETE FROM auth_codes WHERE expires_at < :now');
+        $c1->execute([':now' => $now]);
+        $codes = $c1->rowCount();
+
+        $c2 = $pdo->prepare('DELETE FROM access_tokens WHERE expires_at < :now');
+        $c2->execute([':now' => $now]);
+        $access = $c2->rowCount();
+
+        $c3 = $pdo->prepare('DELETE FROM refresh_tokens WHERE expires_at < :now');
+        $c3->execute([':now' => $now]);
+        $refresh = $c3->rowCount();
+
+        return [
+            'codes' => $codes,
+            'access_tokens' => $access,
+            'refresh_tokens' => $refresh,
+        ];
+    }
+
     private function generateToken(): string {
         return bin2hex(random_bytes(32));
     }

@@ -1,0 +1,14 @@
+# SimpleMCP Public .htaccess
+# Directs clean URLs to index.php front controller while allowing direct file access.
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+
+    # If physical file or directory exists, serve directly
+    RewriteCond %{REQUEST_FILENAME} -f [OR]
+    RewriteCond %{REQUEST_FILENAME} -d
+    RewriteRule ^ - [L]
+
+    # Clean URL support: rewrite to index.php
+    RewriteRule ^ index.php [QSA,L]
+</IfModule>
