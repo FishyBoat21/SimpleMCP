@@ -111,8 +111,13 @@ class EmbeddingService {
             }
         }
         $url = rtrim($url, '/');
-        // Normalize /api/v1 to /v1 (common when configuring LM Studio / local server)
-        if (preg_match('#/api/v1$#i', $url)) {
+        // Normalize /api/v1 to /v1 for local model servers (LM Studio, Ollama, vLLM)
+        // where /api/v1 is a common paste mistake; remote hosts such as openrouter.ai
+        // legitimately serve the API under /api/v1 and must keep the configured path.
+        $host = parse_url($url, PHP_URL_HOST);
+        $isLocal = is_string($host)
+            && ($host === 'localhost' || filter_var($host, FILTER_VALIDATE_IP) !== false);
+        if ($isLocal && preg_match('#/api/v1$#i', $url)) {
             $url = preg_replace('#/api/v1$#i', '/v1', $url);
         }
         return $url;

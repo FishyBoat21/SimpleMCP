@@ -12,6 +12,13 @@ namespace McpServer\Auth;
  * to, and the outcome code. Never logs tokens, secrets or passwords.
  */
 final class DebugLog {
+    /**
+     * Append a channel-tagged entry, e.g. append('openai_embedding', 'HTTP 500 ...').
+     */
+    public static function append(string $channel, string $message): void {
+        self::write("[$channel] $message");
+    }
+
     public static function write(string $message): void {
         $file = dirname(__DIR__, 2) . '/data/requests.log';
         $dir = dirname($file);
