@@ -92,6 +92,7 @@ final class DocumentStore {
                 text_content      TEXT NOT NULL,
                 embedding         BLOB NOT NULL,
                 model             TEXT NOT NULL,
+                profile           TEXT NOT NULL DEFAULT '',
                 dimensions        INTEGER NOT NULL,
                 created_at        INTEGER NOT NULL,
                 updated_at        INTEGER NOT NULL
@@ -221,51 +222,49 @@ final class DocumentStore {
         return $chunks;
     }
 
-    /**
-     * Ingest a document: chunk its content and store it, replacing any previous
-     * version with the same id. The id defaults to a slug of the filename, so
-     * re-ingesting the same filename replaces that document idempotently.
-     *
-     * @param string $username owner of the document
-     * @param array<string, mixed> $params content, filename, optional id/format/title/source/chunk_size/chunk_overlap
-     * @return array<string, mixed> {id, filename, format, title, source, chunkCount, replaced, chunks} or {error}
-     */
-    public function ingestDocument(string $username, array $params): array {
+    /** Read a local file for the stdio-only path ingestion tool. */
+    public function ingestDocumentFromPath(string $username, array $params): array {
         $path = trim((string) ($params['path'] ?? $params['file_path'] ?? ''));
-        if ($path !== '') {
-            $resolvedPath = $path;
-            if (!is_file($resolvedPath)) {
-                // If not found relative to current working directory or absolute, try relative to project root
-                $repoRelative = dirname(__DIR__, 2) . DIRECTORY_SEPARATOR . ltrim($path, '/\\');
-                if (is_file($repoRelative)) {
-                    $resolvedPath = $repoRelative;
-                }
+        if ($path === '') {
+            return ['error' => 'path must be a non-empty string.'];
+        }
+        $resolvedPath = $path;
+        if (!is_file($resolvedPath)) {
+            $repoRelative = dirname(__DIR__, 2) . DIRECTORY_SEPARATOR . ltrim($path, '/\\');
+            if (is_file($repoRelative)) {
+                $resolvedPath = $repoRelative;
             }
+        }
+        if (!is_file($resolvedPath) || !is_readable($resolvedPath)) {
+            return ['error' => "No readable file at '{$path}'."];
+        }
+        if (filesize($resolvedPath) > 20 * 1024 * 1024) {
+            return ['error' => 'File exceeds the 20 MiB ingestion limit.'];
+        }
+        $fileContent = @file_get_contents($resolvedPath);
+        if (!is_string($fileContent) || trim($fileContent) === '') {
+            return ['error' => "File at '{$path}' is empty or could not be read."];
+        }
+        $params['content'] = $fileContent;
+        $params['filename'] = basename($resolvedPath);
+        $params['source'] = (string) ($params['source'] ?? $path);
 
-            if (!is_file($resolvedPath) || !is_readable($resolvedPath)) {
-                return ['error' => "No readable file at '{$path}'."];
-            }
+        unset($params['path'], $params['file_path']);
+        return $this->ingestDocument($username, $params);
+    }
 
-            $fileContent = @file_get_contents($resolvedPath);
-            if (!is_string($fileContent) || trim($fileContent) === '') {
-                return ['error' => "File at '{$path}' is empty or could not be read."];
-            }
-
-            if (!isset($params['content']) || trim((string) $params['content']) === '') {
-                $params['content'] = $fileContent;
-            }
-            if (!isset($params['filename']) || trim((string) $params['filename']) === '') {
-                $params['filename'] = basename($resolvedPath);
-            }
-            if (!isset($params['source']) || trim((string) $params['source']) === '') {
-                $params['source'] = $path;
-            }
+    public function ingestDocument(string $username, array $params): array {
+        if (array_key_exists('path', $params) || array_key_exists('file_path', $params)) {
+            return ['error' => 'Path ingestion is available only through ingest_document_from_path on stdio.'];
         }
 
         $content = trim((string) ($params['content'] ?? ''));
         $filename = trim((string) ($params['filename'] ?? ''));
         if ($content === '') {
-            return ['error' => "Either 'path' pointing to a readable file, or 'content' and 'filename' must be provided."];
+            return ['error' => 'content and filename must be provided.'];
+        }
+        if (strlen($content) > 20 * 1024 * 1024) {
+            return ['error' => 'Content exceeds the 20 MiB ingestion limit.'];
         }
         if ($filename === '') {
             return ['error' => 'filename must be a non-empty string.'];
@@ -340,14 +339,15 @@ final class DocumentStore {
             $sourceFile = (string) ($params['source'] ?? '') !== '' ? (string) $params['source'] : $filename;
             $model = $this->embeddingService->getModel();
             $embStmt = $this->pdo->prepare(
-                'INSERT INTO memory_embeddings (id, username, target_type, target_id, observation_index, document_id, source_file, content_hash, text_content, embedding, model, dimensions, created_at, updated_at)
-                 VALUES (:id, :username, :target_type, :target_id, :obs_idx, :doc_id, :source_file, :hash, :text, :embedding, :model, :dims, :created_at, :updated_at)
+                'INSERT INTO memory_embeddings (id, username, target_type, target_id, observation_index, document_id, source_file, content_hash, text_content, embedding, model, profile, dimensions, created_at, updated_at)
+                 VALUES (:id, :username, :target_type, :target_id, :obs_idx, :doc_id, :source_file, :hash, :text, :embedding, :model, :profile, :dims, :created_at, :updated_at)
                  ON CONFLICT(id) DO UPDATE SET
                      source_file  = excluded.source_file,
                      content_hash = excluded.content_hash,
                      text_content = excluded.text_content,
                      embedding    = excluded.embedding,
                      model        = excluded.model,
+                     profile      = excluded.profile,
                      dimensions   = excluded.dimensions,
                      updated_at   = excluded.updated_at'
             );
@@ -373,6 +373,7 @@ final class DocumentStore {
                     $embStmt->bindValue(':text', $text);
                     $embStmt->bindValue(':embedding', $embBlob, PDO::PARAM_LOB);
                     $embStmt->bindValue(':model', $model);
+                    $embStmt->bindValue(':profile', $this->embeddingService->getProfile());
                     $embStmt->bindValue(':dims', count($embeddings[$idx]), PDO::PARAM_INT);
                     $embStmt->bindValue(':created_at', $now, PDO::PARAM_INT);
                     $embStmt->bindValue(':updated_at', $now, PDO::PARAM_INT);
@@ -410,10 +411,8 @@ final class DocumentStore {
     }
 
     /**
-     * Retrieve the most relevant chunks for a query. keyword = FTS5 BM25 over
-     * the chunk index; semantic = IDF-weighted character n-gram similarity;
-     * hybrid = Reciprocal Rank Fusion of both. An optional `documentId` scopes
-     * the retrieval to a single document.
+     * Retrieve chunks with FTS5 BM25, current-profile vectors (or trigram
+     * fallback), and optional Reciprocal Rank Fusion. Read paths never backfill.
      *
      * @param string $username owner of the documents
      * @param string $query search text
@@ -440,11 +439,11 @@ final class DocumentStore {
             $searchType = 'hybrid';
         }
 
-        $keywordIds = array_map(
+        $keywordIds = $searchType === 'semantic' ? [] : array_map(
             static fn(array $row): string => $row['id'],
             $this->keywordSearch($username, $query, $documentId),
         );
-        $semanticIds = array_map(
+        $semanticIds = $searchType === 'keyword' ? [] : array_map(
             static fn(array $row): string => $row['id'],
             $this->semanticSearch($username, $query, $documentId),
         );
@@ -647,11 +646,8 @@ final class DocumentStore {
         }
         $queryVector = $qVectors[0];
 
-        // Ensure missing embeddings are backfilled if any exist
-        $this->syncMissingChunkEmbeddings($username);
-
-        $sql = 'SELECT target_id, embedding FROM memory_embeddings WHERE username = :username AND target_type = :target_type';
-        $params = [':username' => $username, ':target_type' => 'chunk'];
+        $sql = 'SELECT target_id, embedding FROM memory_embeddings WHERE username = :username AND target_type = :target_type AND profile = :profile AND dimensions = :dimensions';
+        $params = [':username' => $username, ':target_type' => 'chunk', ':profile' => $this->embeddingService->getProfile(), ':dimensions' => count($queryVector)];
         if ($documentId !== null) {
             $sql .= ' AND document_id = :document_id';
             $params[':document_id'] = $documentId;
@@ -672,7 +668,7 @@ final class DocumentStore {
         }
 
         if ($rawScores === []) {
-            return [];
+            return null;
         }
 
         arsort($rawScores);
@@ -748,7 +744,7 @@ final class DocumentStore {
     }
 
     /**
-     * Automatically backfill vector embeddings for any chunks missing an embedding.
+     * Explicitly backfill missing or stale chunk embeddings.
      *
      * @return int Number of chunks embedded
      */
@@ -783,13 +779,13 @@ final class DocumentStore {
         $sql = 'SELECT c.id, c.content, c.document_id, c.embedding_id, d.filename, d.source
                 FROM memory_chunks c
                 LEFT JOIN memory_documents d ON c.username = d.username AND c.document_id = d.id
-                LEFT JOIN memory_embeddings e ON c.username = e.username AND e.target_type = "chunk" AND e.target_id = c.id
+                LEFT JOIN memory_embeddings e ON c.username = e.username AND e.target_type = "chunk" AND e.target_id = c.id AND e.profile = :profile
                 WHERE c.username = :username';
         if (!$force) {
             $sql .= ' AND e.id IS NULL';
         }
         $stmt = $this->pdo->prepare($sql);
-        $stmt->execute([':username' => $username]);
+        $stmt->execute([':username' => $username, ':profile' => $this->embeddingService->getProfile()]);
         $rows = $stmt->fetchAll();
         if ($rows === []) {
             return ['chunks_processed' => 0, 'chunks_embedded' => 0, 'total_chunks' => 0];
@@ -802,14 +798,15 @@ final class DocumentStore {
         $total = count($rows);
 
         $embStmt = $this->pdo->prepare(
-            'INSERT INTO memory_embeddings (id, username, target_type, target_id, observation_index, document_id, source_file, content_hash, text_content, embedding, model, dimensions, created_at, updated_at)
-             VALUES (:id, :username, :target_type, :target_id, :obs_idx, :doc_id, :source_file, :hash, :text, :embedding, :model, :dims, :created_at, :updated_at)
+            'INSERT INTO memory_embeddings (id, username, target_type, target_id, observation_index, document_id, source_file, content_hash, text_content, embedding, model, profile, dimensions, created_at, updated_at)
+             VALUES (:id, :username, :target_type, :target_id, :obs_idx, :doc_id, :source_file, :hash, :text, :embedding, :model, :profile, :dims, :created_at, :updated_at)
              ON CONFLICT(id) DO UPDATE SET
                  source_file  = excluded.source_file,
                  content_hash = excluded.content_hash,
                  text_content = excluded.text_content,
                  embedding    = excluded.embedding,
                  model        = excluded.model,
+                 profile      = excluded.profile,
                  dimensions   = excluded.dimensions,
                  updated_at   = excluded.updated_at'
         );
@@ -841,6 +838,7 @@ final class DocumentStore {
                     $embStmt->bindValue(':text', (string) $row['content']);
                     $embStmt->bindValue(':embedding', $embBlob, PDO::PARAM_LOB);
                     $embStmt->bindValue(':model', $model);
+                    $embStmt->bindValue(':profile', $this->embeddingService->getProfile());
                     $embStmt->bindValue(':dims', count($vectors[$i]), PDO::PARAM_INT);
                     $embStmt->bindValue(':created_at', $now, PDO::PARAM_INT);
                     $embStmt->bindValue(':updated_at', $now, PDO::PARAM_INT);

@@ -29,6 +29,7 @@ use SplQueue;
 final class MemoryStore {
     private PDO $pdo;
     private EmbeddingService $embeddingService;
+    private bool $snapshotActive = false;
 
     /**
      * Relation-type vocabulary (B7). Not exhaustive and not enforced — unknown
@@ -121,6 +122,7 @@ final class MemoryStore {
                 text_content      TEXT NOT NULL,
                 embedding         BLOB NOT NULL,
                 model             TEXT NOT NULL,
+                profile           TEXT NOT NULL DEFAULT '',
                 dimensions        INTEGER NOT NULL,
                 created_at        INTEGER NOT NULL,
                 updated_at        INTEGER NOT NULL
@@ -134,6 +136,112 @@ final class MemoryStore {
 
         $this->migrateColumns();
         $this->createFtsTable();
+        $this->createHistory();
+    }
+
+    /** Retain prior graph values so as_of reads can reconstruct earlier snapshots. */
+    private function createHistory(): void {
+        $this->pdo->exec(<<<'SQL'
+            CREATE TABLE IF NOT EXISTS memory_entities_history (
+                version_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id TEXT NOT NULL, username TEXT NOT NULL, name TEXT NOT NULL,
+                entity_type TEXT NOT NULL, observations TEXT NOT NULL,
+                embedding_pointers TEXT NOT NULL, created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL, valid_from INTEGER, valid_to INTEGER,
+                recorded_to INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_entities_history_snapshot
+                ON memory_entities_history(username, updated_at, recorded_to);
+            CREATE TABLE IF NOT EXISTS memory_relations_history (
+                version_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL, from_entity TEXT NOT NULL,
+                to_entity TEXT NOT NULL, relation_type TEXT NOT NULL,
+                created_at INTEGER NOT NULL, updated_at INTEGER,
+                valid_from INTEGER, valid_to INTEGER, recorded_to INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_relations_history_snapshot
+                ON memory_relations_history(username, updated_at, recorded_to);
+            CREATE TRIGGER IF NOT EXISTS memory_entities_history_update
+            BEFORE UPDATE OF name, entity_type, observations, valid_from, valid_to ON memory_entities
+            WHEN OLD.name IS NOT NEW.name OR OLD.entity_type IS NOT NEW.entity_type
+              OR OLD.observations IS NOT NEW.observations OR OLD.valid_from IS NOT NEW.valid_from
+              OR OLD.valid_to IS NOT NEW.valid_to
+            BEGIN
+                INSERT INTO memory_entities_history
+                (id, username, name, entity_type, observations, embedding_pointers,
+                 created_at, updated_at, valid_from, valid_to, recorded_to)
+                VALUES (OLD.id, OLD.username, OLD.name, OLD.entity_type, OLD.observations,
+                        OLD.embedding_pointers, OLD.created_at, OLD.updated_at,
+                        OLD.valid_from, OLD.valid_to, NEW.updated_at);
+            END;
+            CREATE TRIGGER IF NOT EXISTS memory_entities_history_delete
+            BEFORE DELETE ON memory_entities
+            BEGIN
+                INSERT INTO memory_entities_history
+                (id, username, name, entity_type, observations, embedding_pointers,
+                 created_at, updated_at, valid_from, valid_to, recorded_to)
+                VALUES (OLD.id, OLD.username, OLD.name, OLD.entity_type, OLD.observations,
+                        OLD.embedding_pointers, OLD.created_at, OLD.updated_at,
+                        OLD.valid_from, OLD.valid_to, CAST(strftime('%s','now') AS INTEGER));
+            END;
+            CREATE TRIGGER IF NOT EXISTS memory_relations_history_update
+            BEFORE UPDATE OF valid_from, valid_to ON memory_relations
+            WHEN OLD.valid_from IS NOT NEW.valid_from OR OLD.valid_to IS NOT NEW.valid_to
+            BEGIN
+                INSERT INTO memory_relations_history
+                (username, from_entity, to_entity, relation_type, created_at,
+                 updated_at, valid_from, valid_to, recorded_to)
+                VALUES (OLD.username, OLD.from_entity, OLD.to_entity, OLD.relation_type,
+                        OLD.created_at, OLD.updated_at, OLD.valid_from, OLD.valid_to, NEW.updated_at);
+            END;
+            CREATE TRIGGER IF NOT EXISTS memory_relations_history_delete
+            BEFORE DELETE ON memory_relations
+            BEGIN
+                INSERT INTO memory_relations_history
+                (username, from_entity, to_entity, relation_type, created_at,
+                 updated_at, valid_from, valid_to, recorded_to)
+                VALUES (OLD.username, OLD.from_entity, OLD.to_entity, OLD.relation_type,
+                        OLD.created_at, OLD.updated_at, OLD.valid_from, OLD.valid_to,
+                        CAST(strftime('%s','now') AS INTEGER));
+            END;
+            SQL);
+    }
+
+    /** Shadow current tables for one historical read; never alter persistent rows. */
+    private function withHistoricalSnapshot(int $asOf, callable $read, bool $withFts = false): mixed {
+        $t = (int) $asOf;
+        try {
+            $this->pdo->exec("CREATE TEMP VIEW memory_entities AS
+            SELECT id, username, name, entity_type, observations, embedding_pointers,
+                   created_at, updated_at, valid_from, valid_to
+            FROM main.memory_entities WHERE updated_at <= $t
+            UNION ALL
+            SELECT id, username, name, entity_type, observations, embedding_pointers,
+                   created_at, updated_at, valid_from, valid_to
+            FROM main.memory_entities_history WHERE updated_at <= $t AND recorded_to > $t");
+            $this->pdo->exec("CREATE TEMP VIEW memory_relations AS
+            SELECT username, from_entity, to_entity, relation_type,
+                   created_at, updated_at, valid_from, valid_to
+            FROM main.memory_relations WHERE updated_at <= $t
+            UNION ALL
+            SELECT username, from_entity, to_entity, relation_type,
+                   created_at, updated_at, valid_from, valid_to
+            FROM main.memory_relations_history WHERE updated_at <= $t AND recorded_to > $t");
+            if ($withFts) {
+                $this->pdo->exec('CREATE VIRTUAL TABLE temp.memory_entities_fts USING fts5(
+                    username UNINDEXED, entity_id UNINDEXED, name, entity_type, observations
+                )');
+                $this->pdo->exec('INSERT INTO temp.memory_entities_fts(username, entity_id, name, entity_type, observations)
+                    SELECT username, id, name, entity_type, observations FROM temp.memory_entities');
+            }
+            $this->snapshotActive = true;
+            return $read();
+        } finally {
+            $this->snapshotActive = false;
+            $this->pdo->exec('DROP TABLE IF EXISTS temp.memory_entities_fts');
+            $this->pdo->exec('DROP VIEW IF EXISTS temp.memory_relations');
+            $this->pdo->exec('DROP VIEW IF EXISTS temp.memory_entities');
+        }
     }
 
     /**
@@ -226,6 +334,9 @@ final class MemoryStore {
                  valid_to = NULL,
                  updated_at = excluded.updated_at'
         );
+        $existingStmt = $this->pdo->prepare(
+            'SELECT name, entity_type, observations, valid_to FROM memory_entities WHERE username = :username AND id = :id'
+        );
 
         $ids = [];
         $this->pdo->beginTransaction();
@@ -237,13 +348,23 @@ final class MemoryStore {
                     continue;
                 }
 
+                $type = (string) ($entity['entityType'] ?? '');
+                $observationJson = json_encode($this->stringList($entity['observations'] ?? []), JSON_UNESCAPED_SLASHES);
+                $existingStmt->execute([':username' => $username, ':id' => $id]);
+                $existing = $existingStmt->fetch();
+                if ($existing !== false && !array_key_exists('validFrom', $entity)
+                    && $existing['valid_to'] === null && $existing['name'] === $name
+                    && $existing['entity_type'] === $type && $existing['observations'] === $observationJson) {
+                    $ids[] = $id;
+                    continue;
+                }
                 $validFrom = $this->toTimestamp($entity['validFrom'] ?? null) ?? $now;
                 $stmt->execute([
                     ':id' => $id,
                     ':username' => $username,
                     ':name' => $name,
-                    ':entity_type' => (string) ($entity['entityType'] ?? ''),
-                    ':observations' => json_encode($this->stringList($entity['observations'] ?? []), JSON_UNESCAPED_SLASHES),
+                    ':entity_type' => $type,
+                    ':observations' => $observationJson,
                     ':created_at' => $now,
                     ':updated_at' => $now,
                     ':valid_from' => $validFrom,
@@ -257,11 +378,9 @@ final class MemoryStore {
             throw $e;
         }
 
-        if ($this->embeddingService->isConfigured()) {
-            $this->syncObservationEmbeddingsForEntities($username, $entities);
-        }
-
-        return ['ids' => $ids, 'duplicates' => $this->potentialDuplicates($username, $entities, $ids)];
+        $duplicates = $this->potentialDuplicates($username, $entities, $ids);
+        $warnings = $this->syncEmbeddingsAfterWrite($username, $ids);
+        return ['ids' => $ids, 'duplicates' => $duplicates, 'warnings' => $warnings];
     }
 
     /**
@@ -446,6 +565,7 @@ final class MemoryStore {
         $updates = [];
         $errors = [];
         $warnings = [];
+        $changedIds = [];
 
         $this->pdo->beginTransaction();
         try {
@@ -472,8 +592,11 @@ final class MemoryStore {
                     $existing = [];
                 }
                 $merged = array_values(array_unique([...$existing, ...$contents]));
-                $this->updateObservations($username, $entity['id'], $merged);
-                $updates[$entityName] = ['added' => count($contents), 'total' => count($merged)];
+                if ($merged !== $existing) {
+                    $this->updateObservations($username, $entity['id'], $merged);
+                    $changedIds[$entity['id']] = true;
+                }
+                $updates[$entityName] = ['added' => count($merged) - count($existing), 'total' => count($merged)];
             }
             $this->pdo->commit();
         } catch (\Throwable $e) {
@@ -481,6 +604,7 @@ final class MemoryStore {
             throw $e;
         }
 
+        $warnings = array_merge($warnings, $this->syncEmbeddingsAfterWrite($username, array_keys($changedIds)));
         return ['updates' => $updates, 'errors' => $errors, 'warnings' => array_values(array_unique($warnings))];
     }
 
@@ -689,6 +813,10 @@ final class MemoryStore {
             throw $e;
         }
 
+        if ($observationsMerged > 0) {
+            $warnings = array_merge($warnings, $this->syncEmbeddingsAfterWrite($username, [$keepId]));
+        }
+
         return [
             'keep' => $keepId,
             'absorbed' => $absorbed,
@@ -827,6 +955,12 @@ final class MemoryStore {
         ?string $entityType = null,
     ): array {
         $t = $this->toTimestamp($asOf) ?? time();
+        if ($asOf !== null && !$this->snapshotActive) {
+            return $this->withHistoricalSnapshot($t, fn(): array => $this->readGraph(
+                $username, $asOf, $includeInvalid, $root, $depth, $entityId,
+                $limit, $offset, $includeObservations, $projection, $direction, $entityType
+            ));
+        }
 
         if ($entityId !== null && $entityId !== '') {
             return $this->readEntity($username, $entityId, $t, $includeInvalid);
@@ -1322,6 +1456,12 @@ final class MemoryStore {
             $direction = 'both';
         }
         $t = $this->toTimestamp($asOf) ?? time();
+        if ($asOf !== null && !$this->snapshotActive) {
+            return $this->withHistoricalSnapshot($t, fn(): array => $this->searchGraph(
+                $username, $query, $searchType, $topK, $hops, $asOf,
+                $includeRelations, $direction, $entityType
+            ), true);
+        }
 
         $keywordIds = [];
         $semanticIds = [];
@@ -1421,6 +1561,11 @@ final class MemoryStore {
             $direction = 'both';
         }
         $t = $this->toTimestamp($asOf) ?? time();
+        if ($asOf !== null && !$this->snapshotActive) {
+            return $this->withHistoricalSnapshot($t, fn(): array => $this->searchRelations(
+                $username, $relationType, $entity, $direction, $limit, $offset, $asOf
+            ));
+        }
 
         $entityId = null;
         if ($entity !== null && $entity !== '') {
@@ -1764,7 +1909,7 @@ final class MemoryStore {
      * corpus-level IDF weighting.
      */
     private function semanticSearch(string $username, string $query, int $asOf, ?string $entityType = null): array {
-        if ($this->embeddingService->isConfigured()) {
+        if (!$this->snapshotActive && $this->embeddingService->isConfigured()) {
             $vectorResults = $this->vectorSemanticSearch($username, $query, $asOf, $entityType);
             if ($vectorResults !== null) {
                 return $vectorResults;
@@ -1787,20 +1932,21 @@ final class MemoryStore {
         }
         $queryVector = $qVectors[0];
 
-        // Ensure missing observation embeddings are backfilled if any exist
-        $this->syncMissingObservationEmbeddings($username);
-
         $typeCond = ($entityType !== null && $entityType !== '') ? ' AND me.entity_type = :entity_type' : '';
         $sql = "SELECT e.target_id, e.embedding
                 FROM memory_embeddings e
                 JOIN memory_entities me ON e.username = me.username AND e.target_id = me.id
                 WHERE e.username = :username
                   AND e.target_type = 'observation'
+                  AND e.profile = :profile
+                  AND e.dimensions = :dimensions
                   AND me.valid_from <= :asof
                   AND (me.valid_to IS NULL OR me.valid_to > :asof)$typeCond";
 
         $stmt = $this->pdo->prepare($sql);
         $stmt->bindValue(':username', $username);
+        $stmt->bindValue(':profile', $this->embeddingService->getProfile());
+        $stmt->bindValue(':dimensions', count($queryVector), PDO::PARAM_INT);
         $stmt->bindValue(':asof', $asOf);
         if ($typeCond !== '') {
             $stmt->bindValue(':entity_type', $entityType);
@@ -1822,7 +1968,7 @@ final class MemoryStore {
         }
 
         if ($entityScores === []) {
-            return [];
+            return null;
         }
 
         arsort($entityScores);
@@ -2309,9 +2455,22 @@ final class MemoryStore {
             ':id' => $id,
         ]);
         $this->syncFtsRow($username, $id);
-        if ($this->embeddingService->isConfigured()) {
-            $this->syncObservationEmbeddingsForEntity($username, $id, $observations);
+    }
+
+    /** External embedding requests run only after the graph transaction commits. */
+    private function syncEmbeddingsAfterWrite(string $username, array $ids): array {
+        if (!$this->embeddingService->isConfigured()) {
+            return [];
         }
+        $warnings = [];
+        foreach (array_unique($ids) as $id) {
+            try {
+                $this->syncObservationEmbeddingsForEntity($username, $id);
+            } catch (\Throwable $e) {
+                $warnings[] = "Embedding for '$id' is pending: " . $e->getMessage();
+            }
+        }
+        return $warnings;
     }
 
     /**
@@ -2434,7 +2593,7 @@ final class MemoryStore {
 
         // Check which observations already have matching embeddings by content hash
         $existingStmt = $this->pdo->prepare(
-            'SELECT id, observation_index, content_hash FROM memory_embeddings
+            'SELECT id, observation_index, content_hash, profile FROM memory_embeddings
              WHERE username = :username AND target_type = "observation" AND target_id = :id'
         );
         $existingStmt->execute([':username' => $username, ':id' => $id]);
@@ -2449,7 +2608,7 @@ final class MemoryStore {
         foreach ($obsList as $idx => $text) {
             $embedText = str_starts_with((string) $text, $prefix) ? (string) $text : $prefix . (string) $text;
             $hash = hash('sha256', $embedText);
-            if (!isset($existingRows[$idx]) || $existingRows[$idx]['content_hash'] !== $hash) {
+            if (!isset($existingRows[$idx]) || $existingRows[$idx]['content_hash'] !== $hash || $existingRows[$idx]['profile'] !== $this->embeddingService->getProfile()) {
                 $toEmbedIndices[] = $idx;
                 $toEmbedTexts[] = $embedText;
             }
@@ -2461,14 +2620,15 @@ final class MemoryStore {
         }
 
         $embStmt = $this->pdo->prepare(
-            'INSERT INTO memory_embeddings (id, username, target_type, target_id, observation_index, document_id, source_file, content_hash, text_content, embedding, model, dimensions, created_at, updated_at)
-             VALUES (:id, :username, :target_type, :target_id, :obs_idx, :doc_id, :source_file, :hash, :text, :embedding, :model, :dims, :created_at, :updated_at)
+            'INSERT INTO memory_embeddings (id, username, target_type, target_id, observation_index, document_id, source_file, content_hash, text_content, embedding, model, profile, dimensions, created_at, updated_at)
+             VALUES (:id, :username, :target_type, :target_id, :obs_idx, :doc_id, :source_file, :hash, :text, :embedding, :model, :profile, :dims, :created_at, :updated_at)
              ON CONFLICT(id) DO UPDATE SET
                  source_file       = excluded.source_file,
                  content_hash      = excluded.content_hash,
                  text_content      = excluded.text_content,
                  embedding         = excluded.embedding,
                  model             = excluded.model,
+                 profile           = excluded.profile,
                  dimensions        = excluded.dimensions,
                  observation_index = excluded.observation_index,
                  updated_at        = excluded.updated_at'
@@ -2496,6 +2656,7 @@ final class MemoryStore {
                     $embStmt->bindValue(':text', (string) $text);
                     $embStmt->bindValue(':embedding', $blob, PDO::PARAM_LOB);
                     $embStmt->bindValue(':model', $model);
+                    $embStmt->bindValue(':profile', $this->embeddingService->getProfile());
                     $embStmt->bindValue(':dims', count($newVectors[$vectorIdx]), PDO::PARAM_INT);
                     $embStmt->bindValue(':created_at', $now, PDO::PARAM_INT);
                     $embStmt->bindValue(':updated_at', $now, PDO::PARAM_INT);
@@ -2513,17 +2674,16 @@ final class MemoryStore {
         )->execute([':username' => $username, ':id' => $id, ':max_idx' => $maxIdx]);
 
         $this->pdo->prepare(
-            'UPDATE memory_entities SET embedding_pointers = :pointers, updated_at = :updated_at WHERE username = :username AND id = :id'
+            'UPDATE memory_entities SET embedding_pointers = :pointers WHERE username = :username AND id = :id'
         )->execute([
             ':pointers' => json_encode($pointers, JSON_UNESCAPED_SLASHES),
-            ':updated_at' => $now,
             ':username' => $username,
             ':id' => $id,
         ]);
     }
 
     /**
-     * Automatically backfill vector embeddings for any entities with observations missing embeddings.
+     * Explicitly backfill missing or stale observation embeddings.
      * Uses fast batched embedding generation.
      *
      * @return int Number of entities whose observation embeddings were synced
@@ -2545,13 +2705,15 @@ final class MemoryStore {
      * @param bool $force Re-generate embeddings even if already present
      * @param (callable(int $completed, int $total): void)|null $onProgress Optional progress callback
      * @param int $batchSize Number of texts per embedding request (default: 50)
+     * @param bool $dryRun Count pending vectors without writing or calling the endpoint
      * @return array{entities_processed: int, observations_embedded: int, total_observations: int}
      */
     public function syncAllObservationEmbeddings(
         string $username,
         bool $force = false,
         ?callable $onProgress = null,
-        int $batchSize = 50
+        int $batchSize = 50,
+        bool $dryRun = false
     ): array {
         if (!$this->embeddingService->isConfigured()) {
             return ['entities_processed' => 0, 'observations_embedded' => 0, 'total_observations' => 0];
@@ -2559,9 +2721,7 @@ final class MemoryStore {
 
         $sql = "SELECT id, name, entity_type, observations, embedding_pointers FROM memory_entities
                 WHERE username = :username AND observations != '[]' AND observations != ''";
-        if (!$force) {
-            $sql .= " AND (embedding_pointers = '[]' OR embedding_pointers IS NULL)";
-        }
+        // Inspect every observation: nonempty pointers may reference a different model.
         $stmt = $this->pdo->prepare($sql);
         $stmt->execute([':username' => $username]);
         $rows = $stmt->fetchAll();
@@ -2571,13 +2731,13 @@ final class MemoryStore {
 
         // Fetch existing observation embeddings for this user
         $existingStmt = $this->pdo->prepare(
-            'SELECT target_id, observation_index, content_hash FROM memory_embeddings
+            'SELECT target_id, observation_index, content_hash, profile FROM memory_embeddings
              WHERE username = :username AND target_type = "observation"'
         );
         $existingStmt->execute([':username' => $username]);
         $existing = [];
         foreach ($existingStmt->fetchAll() as $embRow) {
-            $existing[$embRow['target_id']][(int) $embRow['observation_index']] = $embRow['content_hash'];
+            $existing[$embRow['target_id']][(int) $embRow['observation_index']] = $embRow;
         }
 
         $queue = [];
@@ -2602,7 +2762,7 @@ final class MemoryStore {
                 $embId = EmbeddingIdentity::observation($username, $id, $idx);
                 $entityObsMap[$id]['pointers'][] = $embId;
 
-                if ($force || !isset($existing[$id][$idx]) || $existing[$id][$idx] !== $hash) {
+                if ($force || !isset($existing[$id][$idx]) || $existing[$id][$idx]['content_hash'] !== $hash || $existing[$id][$idx]['profile'] !== $this->embeddingService->getProfile()) {
                     $queue[] = [
                         'id' => $embId,
                         'entity_id' => $id,
@@ -2618,19 +2778,28 @@ final class MemoryStore {
 
         $embeddedCount = 0;
         $totalToEmbed = count($queue);
+        if ($dryRun) {
+            return [
+                'entities_processed' => count($entityObsMap),
+                'observations_embedded' => 0,
+                'total_observations' => $totalObsCount,
+                'pending_observations' => $totalToEmbed,
+            ];
+        }
         $now = time();
         $model = $this->embeddingService->getModel();
 
         if ($totalToEmbed > 0) {
             $embStmt = $this->pdo->prepare(
-                'INSERT INTO memory_embeddings (id, username, target_type, target_id, observation_index, document_id, source_file, content_hash, text_content, embedding, model, dimensions, created_at, updated_at)
-                 VALUES (:id, :username, :target_type, :target_id, :obs_idx, :doc_id, :source_file, :hash, :text, :embedding, :model, :dims, :created_at, :updated_at)
+                'INSERT INTO memory_embeddings (id, username, target_type, target_id, observation_index, document_id, source_file, content_hash, text_content, embedding, model, profile, dimensions, created_at, updated_at)
+                 VALUES (:id, :username, :target_type, :target_id, :obs_idx, :doc_id, :source_file, :hash, :text, :embedding, :model, :profile, :dims, :created_at, :updated_at)
                  ON CONFLICT(id) DO UPDATE SET
                      source_file       = excluded.source_file,
                      content_hash      = excluded.content_hash,
                      text_content      = excluded.text_content,
                      embedding         = excluded.embedding,
                      model             = excluded.model,
+                     profile           = excluded.profile,
                      dimensions        = excluded.dimensions,
                      observation_index = excluded.observation_index,
                      updated_at        = excluded.updated_at'
@@ -2659,6 +2828,7 @@ final class MemoryStore {
                         $embStmt->bindValue(':text', $item['text']);
                         $embStmt->bindValue(':embedding', $blob, PDO::PARAM_LOB);
                         $embStmt->bindValue(':model', $model);
+                        $embStmt->bindValue(':profile', $this->embeddingService->getProfile());
                         $embStmt->bindValue(':dims', count($vectors[$i]), PDO::PARAM_INT);
                         $embStmt->bindValue(':created_at', $now, PDO::PARAM_INT);
                         $embStmt->bindValue(':updated_at', $now, PDO::PARAM_INT);
@@ -2679,14 +2849,13 @@ final class MemoryStore {
 
         // Update embedding_pointers on memory_entities
         $updEntity = $this->pdo->prepare(
-            'UPDATE memory_entities SET embedding_pointers = :pointers, updated_at = :updated_at WHERE username = :username AND id = :id'
+            'UPDATE memory_entities SET embedding_pointers = :pointers WHERE username = :username AND id = :id'
         );
         $this->pdo->beginTransaction();
         try {
             foreach ($entityObsMap as $entityId => $info) {
                 $updEntity->execute([
                     ':pointers' => json_encode($info['pointers'], JSON_UNESCAPED_SLASHES),
-                    ':updated_at' => $now,
                     ':username' => $username,
                     ':id' => $entityId,
                 ]);

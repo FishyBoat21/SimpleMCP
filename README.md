@@ -136,7 +136,8 @@ Document ingestion and retrieval — same login requirement as the graph tools.
 
 | Tool | What it does |
 |------|--------------|
-| `ingest_document` | Chunk and store a text document (txt/markdown/csv/json/html/code), from raw content or directly from a file path; re-ingesting an existing id replaces that document. |
+| `ingest_document` | Chunk and store supplied text (txt/markdown/csv/json/html/code); re-ingesting an existing id replaces that document. |
+| `ingest_document_from_path` | Read a local file and ingest it. Available only through the trusted stdio transport; hidden and rejected over HTTP. |
 | `retrieve` | RAG over chunks: keyword / semantic / hybrid (default); `include_graph` also fuses matching graph entities. |
 | `list_documents` | List ingested documents with metadata. |
 | `get_document` | Fetch one document's full text, chunks in order. |
@@ -164,7 +165,9 @@ run as the trusted `local` user).
   (which cascades to touching relations) and `invalidate_relation` close the window instead of
   deleting, so history survives. `read_graph` / `search_graph` accept `as_of` to look back in
   time and `includeInvalid` to reveal closed windows; re-creating an invalidated relation
-  re-activates it.
+  re-activates it. Prior versions of changed or deleted rows are retained in history tables;
+  explicit `as_of` reads reconstruct the graph as it was recorded at that second. Existing
+  databases start retaining versions after this migration; earlier edits cannot be recovered.
 - **Lazy, paginated reads** — `read_graph` returns a compact index by default (id/name/type/
   relation count, paginated via `limit`/`offset`). Pass `entity_id` for one entity's
   observations and every relation touching it, or `root` + `depth` (0–8) for the subgraph
@@ -175,7 +178,11 @@ run as the trusted `local` user).
   `text-embedding-3-large`, `text-embedding-ada-002`) with fast cosine similarity when configured,
   or zero-dependency character-trigram IDF similarity fallback, hybrid = both fused with
   Reciprocal Rank Fusion. `hops > 0` adds breadth-first graph traversal through up to `hops`
-  relation hops from the matches, directed by `direction`.
+  relation hops from the matches, directed by `direction`. Embeddings are tagged with their
+  model, endpoint, and dimensions profile, so changing configuration requires backfilling
+  vectors with `php cli/generate_embeddings.php`. Search never backfills on the read path.
+  Historical `as_of` searches use the recorded text with FTS5 or trigram similarity; current
+  embeddings are not applied to old observation values.
 - **Graph hygiene** — `merge_entities` collapses duplicates atomically (observations merged,
   relations re-pointed); `search_relations` filters edges directly; `graph_summary` reports
   node/edge counts, a relation-type histogram, duplicate groups, and orphans. `create_entities`
@@ -189,8 +196,9 @@ run as the trusted `local` user).
 (txt/markdown/csv/json/html/code) into a per-user chunked store (`memory_documents` /
 `memory_chunks` + FTS5 mirror `memory_chunks_fts`) in the same `data/memory.sqlite`.
 
-- `ingest_document` accepts raw text `content` or ingests directly from a file `path` / `file_path`
-  (e.g. a Markdown file), chunking the text at paragraph then line boundaries, greedily packing to
+- `ingest_document` accepts raw text `content` and `filename` (up to 20 MiB). For local stdio use,
+  `ingest_document_from_path` accepts a readable `path` (up to 20 MiB). HTTP does not expose or
+  accept the path tool. Both split text at paragraph then line boundaries, greedily packing to
   `chunk_size` (default 1000 chars, clamped 50–8000) with `chunk_overlap` (default 150)
   characters carried across boundaries so context isn't cut off. Re-ingesting an existing id
   replaces that document.
@@ -297,9 +305,8 @@ role, so only logged-in accounts can use them (all three seed accounts hold `use
 A user added with no password (status `pending`) must complete **onboarding**: the first time
 they log in — via `/account` or the OAuth flow a tool call triggers — they are asked to set a
 password. Their provisioned username is kept and is not editable. `/account/onboard` is the
-public path for brand-new users, who choose their own username. New accounts are granted
-no special roles (`[]`); grant `admin` (or other roles) by editing `config/users.php` or the
-`users` table.
+public path for brand-new users, who choose their own username. New accounts receive the
+`user` role; grant `admin` (or other roles) by editing `config/users.php` or the `users` table.
 
 In **stdio mode** there is no HTTP layer: every request runs as the trusted `local` user with
 the `*` wildcard role/permission, so all tools are visible and callable.

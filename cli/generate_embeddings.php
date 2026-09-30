@@ -150,7 +150,6 @@ foreach ($users as $username) {
         $candStmt = $pdo->prepare(
             "SELECT COUNT(*) FROM memory_entities
              WHERE username = :username AND observations != '[]' AND observations != ''"
-             . ($force ? '' : " AND (embedding_pointers = '[]' OR embedding_pointers IS NULL)")
         );
         $candStmt->execute([':username' => $username]);
         $candEntities = (int) $candStmt->fetchColumn();
@@ -158,7 +157,8 @@ foreach ($users as $username) {
         echo "  [Memory] Entities needing inspection: $candEntities\n";
 
         if ($dryRun) {
-            echo "  [Memory] (Dry-run) Skipped actual embedding.\n";
+            $pending = $memoryStore->syncAllObservationEmbeddings($username, $force, null, $batchSize, true);
+            echo "  [Memory] (Dry-run) Observation vectors needing generation: {$pending['pending_observations']}\n";
         } elseif ($candEntities > 0) {
             $memStart = microtime(true);
             $memResult = $memoryStore->syncAllObservationEmbeddings(
@@ -181,10 +181,10 @@ foreach ($users as $username) {
     if ($type === 'all' || $type === 'documents') {
         $chunkStmt = $pdo->prepare(
             'SELECT COUNT(*) FROM memory_chunks c
-             LEFT JOIN memory_embeddings e ON c.username = e.username AND e.target_type = "chunk" AND e.target_id = c.id
+             LEFT JOIN memory_embeddings e ON c.username = e.username AND e.target_type = "chunk" AND e.target_id = c.id AND e.profile = :profile
              WHERE c.username = :username' . ($force ? '' : ' AND e.id IS NULL')
         );
-        $chunkStmt->execute([':username' => $username]);
+        $chunkStmt->execute([':username' => $username, ':profile' => $embeddingService->getProfile()]);
         $candChunks = (int) $chunkStmt->fetchColumn();
 
         echo "  [Documents] Chunks needing embeddings: $candChunks\n";

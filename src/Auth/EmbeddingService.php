@@ -134,6 +134,13 @@ class EmbeddingService {
         return max(3, (int) ($this->config['timeout'] ?? 15));
     }
 
+    /** Identifies the vector space, including OpenAI-compatible endpoint changes. */
+    public function getProfile(): string {
+        return hash('sha256', json_encode([
+            $this->getBaseUrl(), $this->getModel(), $this->getDimensions(),
+        ], JSON_THROW_ON_ERROR));
+    }
+
     /**
      * Generate embeddings for one or more text inputs.
      *
@@ -159,11 +166,12 @@ class EmbeddingService {
 
         // Use custom transport if injected (e.g. for testing)
         if ($this->transport !== null) {
-            return ($this->transport)([
+            $vectors = ($this->transport)([
                 'model' => $this->getModel(),
                 'input' => $cleanTexts,
                 'dimensions' => $this->getDimensions(),
             ]);
+            return self::validVectors($vectors, count($cleanTexts)) ? $vectors : [];
         }
 
         // Batch in groups of 100 to stay within request size limits
@@ -181,7 +189,31 @@ class EmbeddingService {
             }
         }
 
-        return $allEmbeddings;
+        return self::validVectors($allEmbeddings, count($cleanTexts)) ? $allEmbeddings : [];
+    }
+
+    private static function validVectors(array $vectors, int $expected): bool {
+        if (count($vectors) !== $expected || $expected === 0) {
+            return false;
+        }
+        if (!is_array($vectors[0] ?? null)) {
+            return false;
+        }
+        $dimensions = count($vectors[0]);
+        if ($dimensions === 0) {
+            return false;
+        }
+        foreach ($vectors as $vector) {
+            if (!is_array($vector) || count($vector) !== $dimensions) {
+                return false;
+            }
+            foreach ($vector as $value) {
+                if (!is_numeric($value) || !is_finite((float) $value)) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     /**
@@ -305,8 +337,8 @@ class EmbeddingService {
      * @param array<int, float> $b
      */
     public static function cosineSimilarity(array $a, array $b): float {
-        $count = min(count($a), count($b));
-        if ($count === 0) {
+        $count = count($a);
+        if ($count === 0 || $count !== count($b)) {
             return 0.0;
         }
 
@@ -336,7 +368,10 @@ class EmbeddingService {
      * @param array<int, float> $b
      */
     public static function dotProduct(array $a, array $b): float {
-        $count = min(count($a), count($b));
+        $count = count($a);
+        if ($count !== count($b)) {
+            return 0.0;
+        }
         $sum = 0.0;
         for ($i = 0; $i < $count; $i++) {
             $sum += $a[$i] * $b[$i];

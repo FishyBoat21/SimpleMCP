@@ -32,26 +32,54 @@ readonly class KnowledgeBaseTool {
     #[McpFunction(
         name: 'ingest_document',
         roles: self::REQUIRED_ROLES,
-        description: 'Ingest a text-based document (txt, markdown, csv, json, html, code) into the knowledge base, directly from raw content or from a file path (e.g. a Markdown file). The content is split into overlapping chunks for retrieval. Re-ingesting the same id (default: derived from the filename) replaces the previous version. Returns the document id, the chunk ids and the chunk count.',
+        description: 'Ingest supplied text into the knowledge base. The content is split into overlapping chunks for retrieval. Re-ingesting the same id replaces the previous version.',
         schema: [
             'type' => 'object',
             'properties' => [
-                'path' => ['type' => 'string', 'description' => 'Path of a document file (e.g. a Markdown file) to ingest directly from disk. If provided, content, filename, and source are automatically populated if omitted.'],
-                'file_path' => ['type' => 'string', 'description' => 'Alias for path.'],
-                'content' => ['type' => 'string', 'description' => 'The raw text of the document to ingest. Required if path is not specified.'],
-                'filename' => ['type' => 'string', 'description' => 'Name of the file (used for the default id and format inference). Optional if path is specified.'],
+                'content' => ['type' => 'string', 'description' => 'The raw text of the document to ingest.'],
+                'filename' => ['type' => 'string', 'description' => 'Name of the file (used for the default id and format inference).'],
                 'id' => ['type' => 'string', 'description' => 'Optional stable id for the document. Defaults to a slug of the filename; re-using an existing id replaces that document.'],
                 'format' => ['type' => 'string', 'enum' => ['text', 'markdown', 'csv', 'json', 'html', 'code'], 'description' => 'Optional file format. Defaults to a guess from the filename extension.'],
                 'title' => ['type' => 'string', 'description' => 'Optional human-readable title for the document.'],
-                'source' => ['type' => 'string', 'description' => 'Optional provenance note, e.g. a URL or file path. Defaults to path when path is provided.'],
+                'source' => ['type' => 'string', 'description' => 'Optional provenance note, e.g. a URL or source name.'],
                 'chunk_size' => ['type' => 'integer', 'default' => 1000, 'minimum' => 50, 'maximum' => 8000, 'description' => 'Target chunk length in characters.'],
                 'chunk_overlap' => ['type' => 'integer', 'default' => 150, 'minimum' => 0, 'maximum' => 2000, 'description' => 'Characters of overlap carried between consecutive chunks so context spans boundaries.'],
             ],
+            'required' => ['content', 'filename'],
         ]
     )]
     public function ingestDocument(array $arguments, ?UserContext $user = null): array {
         $user ??= UserContext::anonymous();
         $result = (new DocumentStore())->ingestDocument($user->username, $arguments);
+        return self::ingestResult($result);
+    }
+
+    #[McpFunction(
+        name: 'ingest_document_from_path',
+        roles: self::REQUIRED_ROLES,
+        localOnly: true,
+        description: 'Ingest a text file from the local machine running this stdio server. This tool is unavailable over HTTP.',
+        schema: [
+            'type' => 'object',
+            'properties' => [
+                'path' => ['type' => 'string', 'description' => 'Readable local text file path.'],
+                'id' => ['type' => 'string', 'description' => 'Optional stable document id.'],
+                'format' => ['type' => 'string', 'enum' => ['text', 'markdown', 'csv', 'json', 'html', 'code']],
+                'title' => ['type' => 'string'],
+                'source' => ['type' => 'string'],
+                'chunk_size' => ['type' => 'integer', 'minimum' => 50, 'maximum' => 8000],
+                'chunk_overlap' => ['type' => 'integer', 'minimum' => 0, 'maximum' => 2000],
+            ],
+            'required' => ['path'],
+        ]
+    )]
+    public function ingestDocumentFromPath(array $arguments, ?UserContext $user = null): array {
+        $user ??= UserContext::anonymous();
+        $result = (new DocumentStore())->ingestDocumentFromPath($user->username, $arguments);
+        return self::ingestResult($result);
+    }
+
+    private static function ingestResult(array $result): array {
         if (isset($result['error'])) {
             return [['type' => 'text', 'text' => 'Error: ' . $result['error']]];
         }

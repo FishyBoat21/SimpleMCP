@@ -14,6 +14,7 @@ readonly class McpFunction {
      * @param array|object $schema JSON Schema describing the `arguments` parameter.
      * @param string[] $roles Roles required to call this tool (any match grants access).
      * @param string[] $permissions Permissions required to call this tool (any match grants access).
+     * @param bool $localOnly Expose only on the trusted stdio transport.
      */
     public function __construct(
         public string $name,
@@ -21,5 +22,6 @@ readonly class McpFunction {
         public array|object $schema = [],
         public array $roles = [],
         public array $permissions = [],
+        public bool $localOnly = false,
     ) {}
 }

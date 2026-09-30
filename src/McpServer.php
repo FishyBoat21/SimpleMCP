@@ -11,11 +11,12 @@ use Throwable;
 use McpServer\Attributes\McpFunction;
 
 class McpServer {
-    /** @var array<string, array{instance: object, method: string, name: string, description: string, schema: array|object, roles: string[], permissions: string[], userIndex: int|null, enabledCheck: (callable(?UserContext): bool)|null}> */
+    /** @var array<string, array{instance: object, method: string, name: string, description: string, schema: array|object, roles: string[], permissions: string[], localOnly: bool, userIndex: int|null, enabledCheck: (callable(?UserContext): bool)|null}> */
     private array $tools = [];
 
     /** The user for the current request; defaults to the trusted local user. */
     private ?UserContext $user = null;
+    private bool $localTransport = false;
 
     public function registerTool(object $toolContainer): void {
         $reflection = new ReflectionClass($toolContainer);
@@ -36,6 +37,7 @@ class McpServer {
                 'schema' => $mcpFunction->schema,
                 'roles' => $mcpFunction->roles,
                 'permissions' => $mcpFunction->permissions,
+                'localOnly' => $mcpFunction->localOnly,
                 'userIndex' => self::userParameterIndex($method),
                 'enabledCheck' => method_exists($toolContainer, 'isAvailable')
                     ? [$toolContainer, 'isAvailable']
@@ -85,6 +87,7 @@ class McpServer {
     public function handleRequest(string $payload, ?UserContext $user = null): ?string {
         // The per-request user. CLI/stdio mode has no HTTP layer, so it defaults
         // to the trusted local user with full access.
+        $this->localTransport = $user === null;
         $this->user = $user ?? UserContext::local();
 
         // Utilizing PHP 8.3+ built-in json_validate for performance
@@ -190,6 +193,10 @@ class McpServer {
      */
     private function canCall(array $tool, ?UserContext $user = null): bool {
         $user ??= $this->user ?? UserContext::local();
+
+        if (($tool['localOnly'] ?? false) && !$this->localTransport) {
+            return false;
+        }
 
         if (($tool['enabledCheck'] ?? null) !== null && !($tool['enabledCheck'])($user)) {
             return false;

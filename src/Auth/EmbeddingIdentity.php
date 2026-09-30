@@ -29,6 +29,9 @@ final class EmbeddingIdentity {
         $pdo->exec('CREATE TABLE IF NOT EXISTS memory_store_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
         $pdo->beginTransaction();
         try {
+            if (!self::hasColumn($pdo, 'memory_embeddings', 'profile')) {
+                $pdo->exec("ALTER TABLE memory_embeddings ADD COLUMN profile TEXT NOT NULL DEFAULT ''");
+            }
             $done = $pdo->query("SELECT value FROM memory_store_meta WHERE key = 'embedding_identity_v2'")->fetchColumn();
             if ($done === false) {
                 $pdo->exec('DELETE FROM memory_embeddings');

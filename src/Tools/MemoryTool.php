@@ -93,6 +93,9 @@ readonly class MemoryTool {
                 $lines[] = "Note: '$requested' shares name+type with existing '{$match['id']}'$root — if it's the same entity, merge_entities keep='{$match['id']}' absorb=['$requested'].";
             }
         }
+        foreach ($result['warnings'] ?? [] as $warning) {
+            $lines[] = "Warning: $warning";
+        }
         if ($lines === []) {
             $lines[] = 'No entities created.';
         }
