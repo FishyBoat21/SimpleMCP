@@ -1,5 +1,18 @@
 # SimpleMCP
 
+> [!CAUTION]
+> # 🚨🚨🚨 MAXIMUM AI SLOP ALERT 🚨🚨🚨
+> 
+> # **THIS ENTIRE REPOSITORY / PROJECT IS 100% RAW, UNFILTERED AI SLOP.**
+> 
+> ### **PROCEED AT YOUR OWN RISK!**
+> 
+> - **Code Quality:** *Vibe coded by a neural net at 3 AM.*
+> - **Dependencies:** *Hallucinated.*
+> - **Tests:** *None. We die like real prompt engineers.*
+> 
+> **You have been warned.** 🪦
+
 A minimal, zero-dependency **Model Context Protocol (MCP) server** written in PHP ≥ 8.4.
 It speaks JSON-RPC 2.0 and exposes tools to MCP clients such as Claude Desktop, Cherry
 Studio, or Open WebUI. In HTTP mode it also ships a self-hosted **OAuth 2.1
