@@ -32,7 +32,7 @@ readonly class KnowledgeBaseTool {
     #[McpFunction(
         name: 'ingest_document',
         roles: self::REQUIRED_ROLES,
-        description: 'Ingest supplied text into the knowledge base. The content is split into overlapping chunks for retrieval. Re-ingesting the same id replaces the previous version.',
+        description: 'Ingest supplied text into the knowledge base. The content is split into structured or semantic chunks for retrieval. Re-ingesting the same id replaces the previous version.',
         schema: [
             'type' => 'object',
             'properties' => [
@@ -42,8 +42,14 @@ readonly class KnowledgeBaseTool {
                 'format' => ['type' => 'string', 'enum' => ['text', 'markdown', 'csv', 'json', 'html', 'code'], 'description' => 'Optional file format. Defaults to a guess from the filename extension.'],
                 'title' => ['type' => 'string', 'description' => 'Optional human-readable title for the document.'],
                 'source' => ['type' => 'string', 'description' => 'Optional provenance note, e.g. a URL or source name.'],
-                'chunk_size' => ['type' => 'integer', 'default' => 1000, 'minimum' => 50, 'maximum' => 8000, 'description' => 'Target chunk length in characters.'],
-                'chunk_overlap' => ['type' => 'integer', 'default' => 150, 'minimum' => 0, 'maximum' => 2000, 'description' => 'Characters of overlap carried between consecutive chunks so context spans boundaries.'],
+                'chunking' => ['type' => 'string', 'enum' => ['auto', 'semantic', 'fixed'], 'description' => 'Chunking strategy (auto: semantic for markdown/html/text, fixed for code/csv/json). Configured in config/chunking.php.'],
+                'chunk_size' => ['type' => 'integer', 'minimum' => 50, 'maximum' => 8000, 'description' => 'Target chunk length in characters (default 1000 or config/chunking.php).'],
+                'min_chunk_size' => ['type' => 'integer', 'minimum' => 50, 'maximum' => 8000, 'description' => 'Minimum chunk size before merging with neighbor (default 250 or config/chunking.php).'],
+                'chunk_overlap' => ['type' => 'integer', 'minimum' => 0, 'maximum' => 2000, 'description' => 'Characters of overlap carried in fixed strategy (default 150 or config/chunking.php).'],
+                'overlap_units' => ['type' => 'integer', 'minimum' => 0, 'maximum' => 3, 'description' => 'Sentence units carried forward in semantic strategy (default 1 or config/chunking.php).'],
+                'breakpoint_percentile' => ['type' => 'integer', 'minimum' => 50, 'maximum' => 99, 'description' => 'Percentile distance threshold for breakpoint detection (default 90 or config/chunking.php).'],
+                'max_embedded_units' => ['type' => 'integer', 'minimum' => 0, 'description' => 'Maximum units sent for breakpoint embedding (0 = unlimited, default 5000 or config/chunking.php).'],
+                'chunk_vectors' => ['type' => 'string', 'enum' => ['reembed', 'pooled'], 'description' => 'Vector generation method for chunks: reembed (direct contextual chunk vector) or pooled (average of unit vectors).'],
             ],
             'required' => ['content', 'filename'],
         ]
@@ -67,8 +73,14 @@ readonly class KnowledgeBaseTool {
                 'format' => ['type' => 'string', 'enum' => ['text', 'markdown', 'csv', 'json', 'html', 'code']],
                 'title' => ['type' => 'string'],
                 'source' => ['type' => 'string'],
+                'chunking' => ['type' => 'string', 'enum' => ['auto', 'semantic', 'fixed'], 'description' => 'Chunking strategy (auto, semantic, fixed).'],
                 'chunk_size' => ['type' => 'integer', 'minimum' => 50, 'maximum' => 8000],
+                'min_chunk_size' => ['type' => 'integer', 'minimum' => 50, 'maximum' => 8000],
                 'chunk_overlap' => ['type' => 'integer', 'minimum' => 0, 'maximum' => 2000],
+                'overlap_units' => ['type' => 'integer', 'minimum' => 0, 'maximum' => 3],
+                'breakpoint_percentile' => ['type' => 'integer', 'minimum' => 50, 'maximum' => 99],
+                'max_embedded_units' => ['type' => 'integer', 'minimum' => 0],
+                'chunk_vectors' => ['type' => 'string', 'enum' => ['reembed', 'pooled']],
             ],
             'required' => ['path'],
         ]
@@ -85,10 +97,27 @@ readonly class KnowledgeBaseTool {
         }
 
         $chunkLabel = $result['chunkCount'] === 1 ? 'chunk' : 'chunks';
+        $strategy = $result['chunking'] ?? 'fixed';
         $text = 'Ingested "' . $result['filename'] . '" as ' . $result['format']
-            . " document \"{$result['id']}\" with {$result['chunkCount']} $chunkLabel.";
+            . " document \"{$result['id']}\" with {$result['chunkCount']} $chunkLabel using {$strategy} chunking.";
         if ($result['replaced']) {
             $text .= ' Replaced a previous version.';
+        }
+        if (isset($result['stats']) && is_array($result['stats'])) {
+            $s = $result['stats'];
+            $extra = [];
+            if (!empty($s['unitsEmbedded'])) {
+                $extra[] = "Units embedded: {$s['unitsEmbedded']}";
+            }
+            if (!empty($s['fallbackSections'])) {
+                $extra[] = "Fallback sections: {$s['fallbackSections']}";
+            }
+            if (!empty($s['pooledVectors'])) {
+                $extra[] = "Pooled vectors: {$s['pooledVectors']}";
+            }
+            if ($extra !== []) {
+                $text .= ' (' . implode(', ', $extra) . ')';
+            }
         }
         $text .= "\n\nChunks:\n" . implode("\n", $result['chunks']);
 

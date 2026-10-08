@@ -115,6 +115,20 @@ final class DocumentStore {
         if (!in_array('embedding_id', $chunkCols, true)) {
             $this->pdo->exec('ALTER TABLE memory_chunks ADD COLUMN embedding_id TEXT');
         }
+        if (!in_array('heading_path', $chunkCols, true)) {
+            $this->pdo->exec("ALTER TABLE memory_chunks ADD COLUMN heading_path TEXT NOT NULL DEFAULT ''");
+        }
+        if (!in_array('char_start', $chunkCols, true)) {
+            $this->pdo->exec('ALTER TABLE memory_chunks ADD COLUMN char_start INTEGER');
+        }
+        if (!in_array('char_end', $chunkCols, true)) {
+            $this->pdo->exec('ALTER TABLE memory_chunks ADD COLUMN char_end INTEGER');
+        }
+
+        $docCols = array_column($this->pdo->query('PRAGMA table_info(memory_documents)')->fetchAll(), 'name');
+        if (!in_array('chunking', $docCols, true)) {
+            $this->pdo->exec("ALTER TABLE memory_documents ADD COLUMN chunking TEXT NOT NULL DEFAULT 'fixed'");
+        }
 
         // A database created before the FTS index existed has chunks but no
         // index entries: rebuild once so keyword search covers pre-existing data.
@@ -259,6 +273,7 @@ final class DocumentStore {
         }
 
         $content = trim((string) ($params['content'] ?? ''));
+        $content = str_replace(["\r\n", "\r"], "\n", $content);
         $filename = trim((string) ($params['filename'] ?? ''));
         if ($content === '') {
             return ['error' => 'content and filename must be provided.'];
@@ -285,10 +300,13 @@ final class DocumentStore {
             $title = trim($matches[1]);
         }
 
-        $chunkSize = max(50, min(8000, (int) ($params['chunk_size'] ?? 1000)));
-        $overlap = max(0, min(2000, (int) ($params['chunk_overlap'] ?? 150)));
+        $chunkConfig = ChunkingConfig::load()->withArguments($params);
 
-        $chunks = self::chunk($content, $chunkSize, $overlap);
+        $chunker = new SemanticChunker($this->embeddingService);
+        $chunkResult = $chunker->chunk($content, $format, $chunkConfig);
+        $chunks = $chunkResult['chunks'];
+        $stats = $chunkResult['stats'];
+
         if ($chunks === []) {
             return ['error' => 'Document contains no chunkable text.'];
         }
@@ -297,30 +315,60 @@ final class DocumentStore {
         $now = time();
 
         $chunkIds = [];
-        $chunkTexts = [];
-        foreach ($chunks as $idx => $text) {
+        $chunkContextualTexts = [];
+        $chunkHashes = [];
+        foreach ($chunks as $idx => $chunkItem) {
             $chunkIds[] = $id . '#' . $idx;
-            $chunkTexts[] = $text;
+            $ctxText = self::contextualEmbeddingText($title, $chunkItem['heading_path'] ?? '', $chunkItem['content']);
+            $chunkContextualTexts[] = $ctxText;
+            $chunkHashes[] = hash('sha256', $ctxText);
         }
 
-        // External embedding calls finish before any document rows are changed.
+        // External embedding calls and vector resolution finish before any document rows are changed.
         $embeddings = [];
+        $isPooled = [];
         if ($this->embeddingService->isConfigured()) {
-            $embeddings = $this->embeddingService->embed($chunkTexts);
+            $profile = $this->embeddingService->getProfile();
+            $reused = $chunkConfig->reuseVectors ? $this->reusableVectors($username, $chunkHashes, $profile) : [];
+
+            $neededIndices = [];
+            $neededTexts = [];
+            foreach ($chunks as $idx => $chunkItem) {
+                $hash = $chunkHashes[$idx];
+                if (isset($reused[$hash]) && is_array($reused[$hash]) && $reused[$hash] !== []) {
+                    $embeddings[$idx] = $reused[$hash];
+                } elseif ($chunkConfig->chunkVectors === 'pooled' && isset($chunkItem['vector']) && is_array($chunkItem['vector']) && $chunkItem['vector'] !== []) {
+                    $embeddings[$idx] = $chunkItem['vector'];
+                    $isPooled[$idx] = true;
+                } else {
+                    $neededIndices[] = $idx;
+                    $neededTexts[] = $chunkContextualTexts[$idx];
+                }
+            }
+
+            if ($neededTexts !== []) {
+                $newVectors = $this->embeddingService->embed($neededTexts);
+                foreach ($neededIndices as $pos => $idx) {
+                    if (isset($newVectors[$pos]) && is_array($newVectors[$pos])) {
+                        $embeddings[$idx] = $newVectors[$pos];
+                    }
+                }
+            }
         }
 
         $this->pdo->beginTransaction();
         try {
             $this->pdo->prepare(
-                'INSERT INTO memory_documents (id, username, filename, title, source, format, chunk_count, created_at, updated_at)
-                 VALUES (:id, :username, :filename, :title, :source, :format, :chunk_count, :created_at, :updated_at)
+                'INSERT INTO memory_documents (id, username, filename, title, source, format, chunk_count, chunking, created_at, updated_at)
+                 VALUES (:id, :username, :filename, :title, :source, :format, :chunk_count, :chunking, :created_at, :updated_at)
                  ON CONFLICT (username, id) DO UPDATE SET
-                     filename  = excluded.filename,
-                     title     = excluded.title,
-                     source    = excluded.source,
-                     format    = excluded.format,
+                     filename    = excluded.filename,
+                     title       = excluded.title,
+                     source      = excluded.source,
+                     format      = excluded.format,
                      chunk_count = excluded.chunk_count,
-                     updated_at = excluded.updated_at'
+                     chunking    = excluded.chunking,
+                     updated_at  = excluded.updated_at'
             )->execute([
                 ':id' => $id,
                 ':username' => $username,
@@ -329,6 +377,7 @@ final class DocumentStore {
                 ':source' => (string) ($params['source'] ?? ''),
                 ':format' => $format,
                 ':chunk_count' => count($chunks),
+                ':chunking' => (string) ($stats['strategy'] ?? 'fixed'),
                 ':created_at' => $now,
                 ':updated_at' => $now,
             ]);
@@ -353,15 +402,20 @@ final class DocumentStore {
             );
 
             $stmt = $this->pdo->prepare(
-                'INSERT INTO memory_chunks (id, username, document_id, idx, content, created_at, updated_at, embedding_id)
-                 VALUES (:id, :username, :document_id, :idx, :content, :created_at, :updated_at, :embedding_id)'
+                'INSERT INTO memory_chunks (id, username, document_id, idx, content, created_at, updated_at, embedding_id, heading_path, char_start, char_end)
+                 VALUES (:id, :username, :document_id, :idx, :content, :created_at, :updated_at, :embedding_id, :heading_path, :char_start, :char_end)'
             );
-            foreach ($chunks as $idx => $text) {
+            foreach ($chunks as $idx => $chunkItem) {
                 $chunkId = $chunkIds[$idx];
+                $text = $chunkItem['content'];
+                $ctxText = $chunkContextualTexts[$idx];
                 $embId = null;
                 if (isset($embeddings[$idx]) && is_array($embeddings[$idx]) && $embeddings[$idx] !== []) {
                     $embId = EmbeddingIdentity::chunk($username, $chunkId);
                     $embBlob = EmbeddingService::packVector($embeddings[$idx]);
+                    $chunkProfile = !empty($isPooled[$idx])
+                        ? ($this->embeddingService->getProfile() . ':pooled')
+                        : $this->embeddingService->getProfile();
                     $embStmt->bindValue(':id', $embId);
                     $embStmt->bindValue(':username', $username);
                     $embStmt->bindValue(':target_type', 'chunk');
@@ -369,11 +423,11 @@ final class DocumentStore {
                     $embStmt->bindValue(':obs_idx', null, PDO::PARAM_NULL);
                     $embStmt->bindValue(':doc_id', $id);
                     $embStmt->bindValue(':source_file', $sourceFile);
-                    $embStmt->bindValue(':hash', hash('sha256', $text));
+                    $embStmt->bindValue(':hash', $chunkHashes[$idx]);
                     $embStmt->bindValue(':text', $text);
                     $embStmt->bindValue(':embedding', $embBlob, PDO::PARAM_LOB);
                     $embStmt->bindValue(':model', $model);
-                    $embStmt->bindValue(':profile', $this->embeddingService->getProfile());
+                    $embStmt->bindValue(':profile', $chunkProfile);
                     $embStmt->bindValue(':dims', count($embeddings[$idx]), PDO::PARAM_INT);
                     $embStmt->bindValue(':created_at', $now, PDO::PARAM_INT);
                     $embStmt->bindValue(':updated_at', $now, PDO::PARAM_INT);
@@ -389,6 +443,9 @@ final class DocumentStore {
                     ':created_at' => $now,
                     ':updated_at' => $now,
                     ':embedding_id' => $embId,
+                    ':heading_path' => (string) ($chunkItem['heading_path'] ?? ''),
+                    ':char_start' => isset($chunkItem['char_start']) ? (int) $chunkItem['char_start'] : null,
+                    ':char_end' => isset($chunkItem['char_end']) ? (int) $chunkItem['char_end'] : null,
                 ]);
                 $this->syncFtsRow($username, $chunkId);
             }
@@ -407,6 +464,8 @@ final class DocumentStore {
             'chunkCount' => count($chunks),
             'replaced' => $existing !== null,
             'chunks' => $chunkIds,
+            'chunking' => (string) ($stats['strategy'] ?? 'fixed'),
+            'stats' => $stats,
         ];
     }
 
@@ -469,6 +528,9 @@ final class DocumentStore {
                 'chunkId' => $chunkId,
                 'documentId' => $chunk['document_id'],
                 'chunkIndex' => (int) $chunk['idx'],
+                'section' => (string) ($chunk['heading_path'] ?? ''),
+                'charStart' => isset($chunk['char_start']) ? (int) $chunk['char_start'] : null,
+                'charEnd' => isset($chunk['char_end']) ? (int) $chunk['char_end'] : null,
                 'score' => round($ranked[$chunkId], 4),
                 'matchedOn' => $this->matchedOn($chunk['content'], $query),
             ];
@@ -499,7 +561,7 @@ final class DocumentStore {
     /** @return array{documents: array<int, array<string, mixed>>, total: int} */
     public function listDocuments(string $username): array {
         $stmt = $this->pdo->prepare(
-            'SELECT id, filename, title, source, format, chunk_count, created_at, updated_at
+            'SELECT id, filename, title, source, format, chunk_count, chunking, created_at, updated_at
              FROM memory_documents
              WHERE username = :username
              ORDER BY created_at DESC'
@@ -515,6 +577,7 @@ final class DocumentStore {
                 'source' => $row['source'],
                 'format' => $row['format'],
                 'chunkCount' => (int) $row['chunk_count'],
+                'chunking' => (string) ($row['chunking'] ?? 'fixed'),
                 'createdAt' => $this->formatTime($row['created_at']),
                 'updatedAt' => $this->formatTime($row['updated_at']),
             ];
@@ -534,7 +597,7 @@ final class DocumentStore {
         }
 
         $stmt = $this->pdo->prepare(
-            'SELECT id, idx, content FROM memory_chunks
+            'SELECT id, idx, content, heading_path, char_start, char_end FROM memory_chunks
              WHERE username = :username AND document_id = :document_id
              ORDER BY idx'
         );
@@ -546,6 +609,9 @@ final class DocumentStore {
                 'chunkId' => $row['id'],
                 'index' => (int) $row['idx'],
                 'content' => $row['content'],
+                'section' => (string) ($row['heading_path'] ?? ''),
+                'charStart' => isset($row['char_start']) ? (int) $row['char_start'] : null,
+                'charEnd' => isset($row['char_end']) ? (int) $row['char_end'] : null,
             ];
         }
 
@@ -556,6 +622,7 @@ final class DocumentStore {
             'title' => $doc['title'],
             'source' => $doc['source'],
             'chunkCount' => (int) $doc['chunk_count'],
+            'chunking' => (string) ($doc['chunking'] ?? 'fixed'),
             'createdAt' => $this->formatTime($doc['created_at']),
             'updatedAt' => $this->formatTime($doc['updated_at']),
             'chunks' => $chunks,
@@ -776,7 +843,7 @@ final class DocumentStore {
             return ['chunks_processed' => 0, 'chunks_embedded' => 0, 'total_chunks' => 0];
         }
 
-        $sql = 'SELECT c.id, c.content, c.document_id, c.embedding_id, d.filename, d.source
+        $sql = 'SELECT c.id, c.content, c.heading_path, c.document_id, c.embedding_id, d.filename, d.title, d.source
                 FROM memory_chunks c
                 LEFT JOIN memory_documents d ON c.username = d.username AND c.document_id = d.id
                 LEFT JOIN memory_embeddings e ON c.username = e.username AND e.target_type = "chunk" AND e.target_id = c.id AND e.profile = :profile
@@ -813,7 +880,14 @@ final class DocumentStore {
         $updChunk = $this->pdo->prepare('UPDATE memory_chunks SET embedding_id = :emb_id WHERE username = :username AND id = :id');
 
         foreach ($batches as $batch) {
-            $texts = array_column($batch, 'content');
+            $texts = [];
+            foreach ($batch as $row) {
+                $texts[] = self::contextualEmbeddingText(
+                    (string) ($row['title'] ?? ''),
+                    (string) ($row['heading_path'] ?? ''),
+                    (string) $row['content']
+                );
+            }
             $vectors = $this->embeddingService->embed($texts);
 
             $this->pdo->beginTransaction();
@@ -826,6 +900,7 @@ final class DocumentStore {
                     $embId = EmbeddingIdentity::chunk($username, $chunkId);
                     $embBlob = EmbeddingService::packVector($vectors[$i]);
                     $sourceFile = (string) ($row['source'] ?? '') !== '' ? (string) $row['source'] : (string) ($row['filename'] ?? '');
+                    $ctxText = $texts[$i];
 
                     $embStmt->bindValue(':id', $embId);
                     $embStmt->bindValue(':username', $username);
@@ -834,7 +909,7 @@ final class DocumentStore {
                     $embStmt->bindValue(':obs_idx', null, PDO::PARAM_NULL);
                     $embStmt->bindValue(':doc_id', $row['document_id']);
                     $embStmt->bindValue(':source_file', $sourceFile);
-                    $embStmt->bindValue(':hash', hash('sha256', (string) $row['content']));
+                    $embStmt->bindValue(':hash', hash('sha256', $ctxText));
                     $embStmt->bindValue(':text', (string) $row['content']);
                     $embStmt->bindValue(':embedding', $embBlob, PDO::PARAM_LOB);
                     $embStmt->bindValue(':model', $model);
@@ -936,7 +1011,7 @@ final class DocumentStore {
     /** @return array<string, mixed>|null */
     private function findDocument(string $username, string $id): ?array {
         $stmt = $this->pdo->prepare(
-            'SELECT id, filename, title, source, format, chunk_count, created_at, updated_at
+            'SELECT id, filename, title, source, format, chunk_count, chunking, created_at, updated_at
              FROM memory_documents
              WHERE username = :username AND id = :id
              LIMIT 1'
@@ -946,10 +1021,49 @@ final class DocumentStore {
         return $row !== false ? $row : null;
     }
 
-    /** @return array{id: string, document_id: string, idx: int, content: string}|null */
+    /** Look up existing vector embeddings by content hash and profile. @param string[] $hashes @return array<string, array<int, float>> */
+    private function reusableVectors(string $username, array $hashes, string $profile): array {
+        if ($hashes === []) {
+            return [];
+        }
+        $hashes = array_values(array_unique($hashes));
+        $results = [];
+
+        foreach (array_chunk($hashes, 500) as $batch) {
+            $placeholders = implode(',', array_fill(0, count($batch), '?'));
+            $stmt = $this->pdo->prepare(
+                "SELECT content_hash, embedding FROM memory_embeddings
+                 WHERE username = ? AND profile = ? AND content_hash IN ($placeholders)"
+            );
+            $params = array_merge([$username, $profile], $batch);
+            $stmt->execute($params);
+
+            foreach ($stmt->fetchAll() as $row) {
+                $blob = $row['embedding'];
+                if (is_string($blob) && $blob !== '') {
+                    $results[$row['content_hash']] = EmbeddingService::unpackVector($blob);
+                }
+            }
+        }
+        return $results;
+    }
+
+    /** Contextualize chunk text with document title and heading path for embeddings. */
+    public static function contextualEmbeddingText(?string $title, ?string $headingPath, string $content): string {
+        $prefix = '';
+        if ($title !== null && trim($title) !== '') {
+            $prefix .= 'Document: ' . trim($title) . "\n";
+        }
+        if ($headingPath !== null && trim($headingPath) !== '') {
+            $prefix .= 'Section: ' . trim($headingPath) . "\n";
+        }
+        return $prefix !== '' ? $prefix . "\n" . $content : $content;
+    }
+
+    /** @return array{id: string, document_id: string, idx: int, content: string, heading_path: string, char_start: ?int, char_end: ?int}|null */
     private function chunkRow(string $username, string $chunkId): ?array {
         $stmt = $this->pdo->prepare(
-            'SELECT id, document_id, idx, content FROM memory_chunks
+            'SELECT id, document_id, idx, content, heading_path, char_start, char_end FROM memory_chunks
              WHERE username = :username AND id = :id
              LIMIT 1'
         );
@@ -971,13 +1085,16 @@ final class DocumentStore {
     /** Refresh the FTS mirror for one chunk, keeping it in lockstep with the source row. */
     private function syncFtsRow(string $username, string $chunkId): void {
         $stmt = $this->pdo->prepare(
-            'SELECT document_id, content FROM memory_chunks WHERE username = :username AND id = :id'
+            'SELECT document_id, content, heading_path FROM memory_chunks WHERE username = :username AND id = :id'
         );
         $stmt->execute([':username' => $username, ':id' => $chunkId]);
         $row = $stmt->fetch();
         if ($row === false) {
             return;
         }
+
+        $heading = trim((string) ($row['heading_path'] ?? ''));
+        $ftsContent = $heading !== '' ? "[{$heading}] " . $row['content'] : $row['content'];
 
         $this->pdo->prepare('DELETE FROM memory_chunks_fts WHERE username = :username AND chunk_id = :id')
             ->execute([':username' => $username, ':id' => $chunkId]);
@@ -988,7 +1105,7 @@ final class DocumentStore {
             ':username' => $username,
             ':id' => $chunkId,
             ':document_id' => $row['document_id'],
-            ':content' => $row['content'],
+            ':content' => $ftsContent,
         ]);
     }
 

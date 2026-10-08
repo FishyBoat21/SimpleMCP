@@ -4,5 +4,6 @@ CLAUDE.md
 /data/*
 /config/mail.php
 /config/embedding.php
+/config/chunking.php
 /config/*.local.php
 /.agents/

@@ -196,15 +196,23 @@ run as the trusted `local` user).
 (txt/markdown/csv/json/html/code) into a per-user chunked store (`memory_documents` /
 `memory_chunks` + FTS5 mirror `memory_chunks_fts`) in the same `data/memory.sqlite`.
 
+- **Hierarchical semantic chunking** (`chunking`: `auto` default, `semantic`, `fixed`):
+  - **Stage 1 (Structural):** Markdown documents are segmented by ATX headings (`#`–`######`) into a hierarchical `heading_path` (e.g. `Installation > Windows > PHP`). Fenced code blocks (` ``` ` / `~~~`) and Markdown tables are protected from arbitrary splits. HTML is segmented by `<h1>`–`<h6>` tags.
+  - **Stage 2 (Sentence units):** Sections exceeding `chunk_size` are split into sentence units with punctuation and CJK support.
+  - **Stage 3 (Breakpoints):** Adjacent units are evaluated via sliding-window embedding distance percentile thresholds (default 90th percentile). When embeddings are unconfigured, failing, or exceed the large-document budget (`max_embedded_units`, default 5000), pure-PHP lexical TF-IDF cosine distance is used as a zero-dependency fallback.
+  - **Stage 4 (Size enforcement):** Small segments under `min_chunk_size` are merged; oversize segments are recursively bounded.
+  - **Stage 5 (Context & vectors):** Chunks record `heading_path`, `char_start`, and `char_end`. Final embeddings are contextualized with `Document: {title}\nSection: {heading_path}\n\n{content}`. Vector generation (`chunk_vectors`) defaults to direct contextual `reembed` with optional `pooled` averaging. Identical chunks across edits or re-runs are automatically reused via content hashing without extra API calls.
 - `ingest_document` accepts raw text `content` and `filename` (up to 20 MiB). For local stdio use,
-  `ingest_document_from_path` accepts a readable `path` (up to 20 MiB). HTTP does not expose or
-  accept the path tool. Both split text at paragraph then line boundaries, greedily packing to
-  `chunk_size` (default 1000 chars, clamped 50–8000) with `chunk_overlap` (default 150)
-  characters carried across boundaries so context isn't cut off. Re-ingesting an existing id
-  replaces that document.
-- `retrieve` returns the most relevant chunks for a query with the same keyword/semantic/hybrid
-  strategies (default hybrid). `include_graph: true` also runs `search_graph` and appends the
-  matching entities under an `entities` key, so one call covers both stores.
+  `ingest_document_from_path` accepts a readable `path` (up to 20 MiB). Both support `chunking`,
+  `chunk_size`, `min_chunk_size`, `chunk_overlap`, `overlap_units`, `breakpoint_percentile`,
+  `max_embedded_units`, and `chunk_vectors`. Re-ingesting an existing id atomically replaces that document.
+- **Configuration** — Copy `config/chunking.example.php` to `config/chunking.php` to customize
+  default chunking strategies, thresholds, sentence window radii, and embedding budgets.
+- **Offline re-chunking** — `php cli/rechunk_documents.php --all` re-chunks existing stored
+  documents with atomic transactions per document, live connectivity health-checks, and dry-run preview.
+- `retrieve` returns the most relevant chunks for a query with keyword/semantic/hybrid
+  strategies (default hybrid). Chunk results include `section` (heading path), `charStart`, and `charEnd`.
+  `include_graph: true` also runs `search_graph` and appends matching entities under an `entities` key.
 - `list_documents` / `get_document` / `delete_document` list, read, and cascade-delete ingested
   documents.
 
